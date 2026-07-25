@@ -71,6 +71,6 @@ _(Pending — golden-set retrieval tests, unit and RBAC tests, mock-forced scena
 
 Every setting is environment-based and documented in [`.env.example`](.env.example). `.env` is gitignored and contains no committed values.
 
-## License
+## About
 
 Built for the AgentCare Build Challenge 2026.
