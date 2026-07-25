@@ -2,6 +2,8 @@
 
 Agentic AI for patient **administration** (registration → intent → routing → booking → documents → confirmation/reminders → follow-up). Hackathon build, 4 days, solo.
 
+**Starting a fresh session? Read [`HANDOFF.md`](HANDOFF.md) first** — where the last session stopped, what to do next, and open items. Then [`PLAN.md`](PLAN.md) for the phase checklist. Update both before ending a session.
+
 **The spec is `docs/prd-agentcare.md`.** It is the source of truth and it is detailed — read the relevant section before implementing that area rather than inferring from this file. This file holds the rules, the layout, and the traps.
 
 Where this file and the PRD disagree, the PRD wins — this file's tables (decision bins, invariants, context contract) are mirrors for speed, not authorities.
