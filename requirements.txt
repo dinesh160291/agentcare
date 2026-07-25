@@ -1,0 +1,49 @@
+# AgentCare — runtime + test dependencies
+# Tested on Python 3.11.6 (Windows). Install:  pip install -r requirements.txt
+# Direct dependencies are pinned; transitive versions are left to the resolver.
+
+# --- Agent framework ---
+google-adk==2.5.0
+
+# --- LLM clients (provider seam: mock | openai | groq) ---
+# Called directly through our own BaseLlm adapters, not via LiteLLM.
+openai==2.48.0
+groq==1.6.0
+
+# --- Backend ---
+fastapi==0.140.0
+uvicorn[standard]==0.51.0
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-dotenv==1.2.2
+
+# --- Persistence ---
+SQLAlchemy==2.0.51
+# Async SQLite driver — required by ADK's DatabaseSessionService
+# (sqlite+aiosqlite:///...); arrives transitively via google-adk but we
+# depend on it directly, so it is pinned directly.
+aiosqlite==0.22.1
+# Postgres driver (day-4 Supabase deploy; unused on the SQLite default)
+psycopg[binary]==3.3.4
+
+# --- Auth (JWT + password hashing) ---
+PyJWT==2.13.0
+bcrypt==5.0.0
+
+# --- Uploads (multipart parsing + magic-byte MIME sniffing) ---
+python-multipart==0.0.32
+filetype==1.2.0
+
+# --- Scheduler (reminder poll job) ---
+APScheduler==3.11.3
+
+# --- Frontend ---
+streamlit==1.60.0
+
+# --- HTTP client (Streamlit -> FastAPI, and test client) ---
+httpx==0.28.1
+
+# --- Tests ---
+pytest==9.1.1
+pytest-cov==7.1.0
+pytest-asyncio==1.4.0

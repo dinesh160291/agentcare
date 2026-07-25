@@ -1,0 +1,53 @@
+# --- Secrets (RULE-6: no credentials or tokens in the repo) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+
+# --- Local runtime data (RULE-6: never commit uploaded files or a live DB) ---
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/uploads/*
+!data/uploads/.gitkeep
+storage/
+
+# --- Observability (optional Phoenix dev microscope) ---
+.phoenix/
+phoenix.db
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
