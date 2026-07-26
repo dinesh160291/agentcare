@@ -183,11 +183,24 @@ class TraceWriter:
             correlation_id=correlation_id,
         )
 
-    def transition(self, *, from_status: str | None, to_status: str, reason: str = "") -> TraceEvent:
+    def transition(
+        self,
+        *,
+        from_status: str | None,
+        to_status: str,
+        reason: str = "",
+        **extra: Any,
+    ) -> TraceEvent:
+        """A state change was attempted.
+
+        Recorded whether or not it landed: a compare-and-swap that lost its
+        race is an event, and a no-op nobody can see is indistinguishable from
+        a request that never arrived.
+        """
         return self._write(
             TraceEventType.TRANSITION,
             author=TraceAuthor.SYSTEM,
-            payload={"from": from_status, "to": to_status, "reason": reason},
+            payload={"from": from_status, "to": to_status, "reason": reason, **extra},
         )
 
     def outbound(self, content: str, *, author: TraceAuthor, **extra: Any) -> TraceEvent:

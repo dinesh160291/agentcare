@@ -56,6 +56,24 @@ class InvalidTransition(AgentCareError):
         super().__init__(f"Illegal workflow transition: {from_status} -> {to_status}")
 
 
+class PlanRejected(AgentCareError):
+    """The model's proposed plan did not survive validation.
+
+    Deliberately distinct from :class:`ValidationFailed`, which is for input a
+    *human* supplied and maps to HTTP 422. A malformed plan is model output:
+    it belongs to the retry ladder, and it is never executed.
+    """
+
+
+class ClassRejected(AgentCareError):
+    """The model's proposed message→run class did not survive validation.
+
+    Kept apart from :class:`PlanRejected` because the two lead somewhere
+    different: a rejected plan is re-planned and consumes the run's re-plan
+    budget, while a rejected class is re-classified and does not.
+    """
+
+
 class BudgetExceeded(AgentCareError):
     """A bounded loop hit its cap (tool iterations, re-plans, retries)."""
 
