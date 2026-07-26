@@ -71,14 +71,46 @@ def latest_user_text(llm_request: LlmRequest) -> str:
     return ""
 
 
+def current_turn_start(llm_request: LlmRequest) -> int:
+    """Index of the content that opened the current turn.
+
+    A turn begins at the last thing the user actually *said* — not a tool
+    result (which ADK also sends with ``role="user"``) and not ADK's narration.
+
+    This boundary is load-bearing. The Coordinator's session is persistent, so
+    its history carries every previous turn's tool results, and a policy that
+    read "has classify_message been called?" across the whole conversation
+    answers yes for a turn in which it has not been called at all. The observed
+    failure: a patient said something off-topic, then abandoned the request, and
+    the withdrawal was answered with the *previous* turn's classification — so
+    the run was never cancelled and sat in ``pending_confirmation`` claiming the
+    patient was still waiting to confirm.
+    """
+    contents = llm_request.contents or []
+    for index in range(len(contents) - 1, -1, -1):
+        content = contents[index]
+        if content.role != "user":
+            continue
+        parts = content.parts or []
+        if any(getattr(part, "function_response", None) is not None for part in parts):
+            continue
+        text = " ".join(part.text for part in parts if part.text)
+        if text.strip() and not is_framing(text):
+            return index
+    return 0
+
+
 def tool_results(llm_request: LlmRequest) -> list[ToolResult]:
-    """Every tool result in the conversation so far, oldest first.
+    """Every tool result **in the current turn**, oldest first.
 
     This is the mock's evidence base. A reply templated from these is a reply
-    templated from what the database actually returned.
+    templated from what the database returned *this turn* — scoped deliberately,
+    because a fact fetched two turns ago is exactly the kind of stale certainty
+    the receipt discipline exists to prevent.
     """
+    contents = llm_request.contents or []
     results: list[ToolResult] = []
-    for content in llm_request.contents or []:
+    for content in contents[current_turn_start(llm_request) :]:
         for part in content.parts or []:
             response = getattr(part, "function_response", None)
             if response is None:

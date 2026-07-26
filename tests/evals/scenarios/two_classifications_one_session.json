@@ -1,0 +1,33 @@
+{
+  "name": "two-classifications-one-session",
+  "pins": "A turn must be classified on its own evidence. The Coordinator's session is persistent, so its history carries the previous turn's tool results; a policy reading them across the whole conversation answers with the previous turn's verdict and never classifies this one. Observed: an off-topic message followed by a withdrawal left the run in pending_confirmation, still claiming the patient was waiting to confirm - a zombie run, which is the exact failure 'withdrawal is typed state, never chat prose' exists to prevent. Phase 5's flows classify repeatedly, so this has to hold before they are built on top of it.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a cardiology appointment next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "appointments_created": 0
+      }
+    },
+    {
+      "message": "what's the weather like today?",
+      "expect": {
+        "status": "pending_confirmation",
+        "message_class": "off_topic",
+        "request_text_unchanged": true,
+        "run_state_unchanged": true
+      }
+    },
+    {
+      "message": "actually forget it",
+      "expect": {
+        "status": "cancelled",
+        "message_class": "withdrawal",
+        "cancellation_reason": "withdrawn",
+        "appointments_created": 0,
+        "reply_excludes": ["off topic"]
+      }
+    }
+  ]
+}

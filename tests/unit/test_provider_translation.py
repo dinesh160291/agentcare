@@ -24,7 +24,10 @@ from google.genai import types
 
 from app.providers.base import (
     ADK_CONTEXT_MARKERS,
+    called_tools,
+    current_turn_start,
     is_framing,
+    latest_tool_result,
     latest_user_text,
     request_snapshot,
     response_snapshot,
@@ -103,6 +106,116 @@ class TestTransferNarration:
         )
         request = LlmRequest(model="m", contents=[], config=config)
         assert transferable_agents(request) == ["department_specialist"]
+
+
+def _said(text: str) -> types.Content:
+    return types.Content(role="user", parts=[types.Part(text=text)])
+
+
+def _called(name: str) -> types.Content:
+    return types.Content(
+        role="model",
+        parts=[types.Part(function_call=types.FunctionCall(name=name, args={}))],
+    )
+
+
+def _returned(name: str, payload: dict) -> types.Content:
+    """ADK hands tool results back with role="user", same as a real message."""
+    return types.Content(
+        role="user",
+        parts=[
+            types.Part(
+                function_response=types.FunctionResponse(name=name, response=payload)
+            )
+        ],
+    )
+
+
+#: Two complete turns in one persistent session — the Coordinator's shape. Turn
+#: one classified the message; turn two has classified nothing yet.
+TWO_TURN_HISTORY = [
+    _said("what's the weather like today?"),
+    _called("classify_message"),
+    _returned("classify_message", {"accepted": True, "applied_class": "off_topic"}),
+    types.Content(role="model", parts=[types.Part(text="I can help with appointments.")]),
+    _said("actually forget it"),
+]
+
+
+class TestToolResultsAreScopedToTheCurrentTurn:
+    """The bug this pins, in full.
+
+    The Coordinator's session is persistent, so its history carries every
+    previous turn's tool results. A policy asking "has classify_message been
+    called?" across the whole conversation answered *yes* for a turn in which
+    it had not been called at all — so the mock replied with the previous
+    turn's verdict, the orchestrator saw no verdict for this turn and defaulted
+    to the harmless class, and a patient's "actually forget it" left the run in
+    ``pending_confirmation`` claiming they were still waiting to confirm.
+
+    That is a zombie run: the state row misrepresenting reality, which is the
+    exact failure "withdrawal is typed state, never chat prose" exists to stop.
+    """
+
+    def test_a_previous_turns_result_is_not_visible(self):
+        request = LlmRequest(model="m", contents=TWO_TURN_HISTORY)
+        assert latest_tool_result(request, "classify_message") is None
+
+    def test_called_tools_means_this_turn(self):
+        """The docstring said "this turn" long before the code did."""
+        request = LlmRequest(model="m", contents=TWO_TURN_HISTORY)
+        assert called_tools(request) == set()
+
+    def test_the_turn_boundary_is_the_last_thing_the_user_said(self):
+        request = LlmRequest(model="m", contents=TWO_TURN_HISTORY)
+        assert current_turn_start(request) == len(TWO_TURN_HISTORY) - 1
+
+    def test_results_from_the_current_turn_are_still_visible(self):
+        request = LlmRequest(
+            model="m",
+            contents=[
+                *TWO_TURN_HISTORY,
+                _called("classify_message"),
+                _returned("classify_message", {"applied_class": "withdrawal"}),
+            ],
+        )
+        found = latest_tool_result(request, "classify_message")
+        assert found is not None
+        assert found.payload["applied_class"] == "withdrawal"
+
+    def test_a_tool_result_does_not_open_a_turn(self):
+        """ADK sends tool results with role="user" too. Treating one as the
+        start of a turn would hide every result that preceded it."""
+        request = LlmRequest(
+            model="m",
+            contents=[
+                _said("I need a cardiology appointment"),
+                _called("resolve_department"),
+                _returned("resolve_department", {"status": "resolved"}),
+                _called("resolve_date"),
+                _returned("resolve_date", {"resolved": True}),
+            ],
+        )
+        assert called_tools(request) == {"resolve_department", "resolve_date"}
+
+    def test_a_single_turn_history_is_unaffected(self):
+        """Specialists get a fresh session holding one task, so scoping must be
+        a no-op for them."""
+        request = LlmRequest(
+            model="m",
+            contents=[
+                _said('{"step": "route"}'),
+                _called("resolve_department"),
+                _returned("resolve_department", {"status": "resolved"}),
+            ],
+        )
+        assert current_turn_start(request) == 0
+        assert called_tools(request) == {"resolve_department"}
+
+    def test_framing_does_not_open_a_turn(self):
+        """ADK's narration is not something the patient said."""
+        request = LlmRequest(model="m", contents=TRANSFER_HISTORY)
+        assert current_turn_start(request) == 0
 
 
 class TestSchemaTranslation:
