@@ -33,6 +33,7 @@ from app.models import (
     Appointment,
     AppointmentSlot,
     AppointmentStatus,
+    Department,
     Doctor,
     Reminder,
     ReminderStatus,
@@ -143,6 +144,31 @@ def _clear_proposal(session: Session, run: WorkflowRun | None) -> None:
     session.flush()
 
 
+def _refuse(
+    session: Session,
+    run: WorkflowRun | None,
+    *,
+    reason: str,
+    message: str,
+    alternatives: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Clear the proposal, **commit**, and return a refusal.
+
+    The commit is the point. Flushing alone leaves the cleared proposal inside
+    an uncommitted transaction, so any later rollback — an error handler, a
+    request teardown, a retry — restores it still pointing at the dead slot,
+    and the patient is back in the un-exitable Confirm loop this clearing
+    exists to prevent.
+
+    Committing here is safe because every refusal path reaches this function
+    having changed nothing else: the slot claim either was not attempted or
+    did not succeed.
+    """
+    _clear_proposal(session, run)
+    session.commit()
+    return _result(ok=False, reason=reason, message=message, alternatives=alternatives)
+
+
 def _retire_reminders(session: Session, appointment_id: int) -> None:
     """Cancel every pending reminder for an appointment."""
     session.query(Reminder).filter(
@@ -188,16 +214,22 @@ def book_appointment(
 
     slot = session.get(AppointmentSlot, slot_id)
     if slot is None:
-        _clear_proposal(session, run)
-        return _result(ok=False, reason="slot_not_found",
+        return _refuse(session, run, reason="slot_not_found",
                        message="That appointment time is no longer listed.")
 
     if slot.start_time <= clock.now():
-        _clear_proposal(session, run)
-        return _result(ok=False, reason="slot_in_the_past",
+        return _refuse(session, run, reason="slot_in_the_past",
                        message="That appointment time has already passed.")
 
     doctor = session.get(Doctor, slot.doctor_id)
+    department = session.get(Department, doctor.department_id)
+
+    # Availability filters these out, but a slot id can arrive here directly —
+    # from a stale proposal, a retry, or the API — and that path never passes
+    # through the availability query.
+    if not doctor.active or not department.active:
+        return _refuse(session, run, reason="doctor_unavailable",
+                       message="That appointment time is no longer available.")
 
     clash = (
         session.query(Appointment)
@@ -210,9 +242,8 @@ def book_appointment(
         .first()
     )
     if clash is not None:
-        _clear_proposal(session, run)
-        return _result(
-            ok=False,
+        return _refuse(
+            session, run,
             reason="patient_double_booked",
             alternatives=_alternatives(session, department_id=doctor.department_id,
                                        around=slot.start_time),
@@ -220,9 +251,8 @@ def book_appointment(
         )
 
     if not _claim_slot(session, slot_id):
-        _clear_proposal(session, run)
-        return _result(
-            ok=False,
+        return _refuse(
+            session, run,
             reason="slot_taken",
             alternatives=_alternatives(session, department_id=doctor.department_id,
                                        around=slot.start_time),
@@ -274,28 +304,28 @@ def reschedule_appointment(
     appointment = get_owned_or_404(session, Appointment, appointment_id, user)
 
     if appointment.status not in LIVE_STATUSES:
-        _clear_proposal(session, run)
-        return _result(ok=False, reason="not_reschedulable",
+        return _refuse(session, run, reason="not_reschedulable",
                        message="That appointment can no longer be changed.")
 
     new_slot = session.get(AppointmentSlot, new_slot_id)
     if new_slot is None:
-        _clear_proposal(session, run)
-        return _result(ok=False, reason="slot_not_found",
+        return _refuse(session, run, reason="slot_not_found",
                        message="That appointment time is no longer listed.")
 
     if new_slot.start_time <= clock.now():
-        _clear_proposal(session, run)
-        return _result(ok=False, reason="slot_in_the_past",
+        return _refuse(session, run, reason="slot_in_the_past",
                        message="That appointment time has already passed.")
 
     doctor = session.get(Doctor, new_slot.doctor_id)
+    department = session.get(Department, doctor.department_id)
+    if not doctor.active or not department.active:
+        return _refuse(session, run, reason="doctor_unavailable",
+                       message="That appointment time is no longer available.")
 
     # Claim first: if this fails, nothing has been given up.
     if not _claim_slot(session, new_slot_id):
-        _clear_proposal(session, run)
-        return _result(
-            ok=False,
+        return _refuse(
+            session, run,
             reason="slot_taken",
             alternatives=_alternatives(session, department_id=doctor.department_id,
                                        around=new_slot.start_time),
@@ -340,8 +370,7 @@ def cancel_appointment(
     appointment = get_owned_or_404(session, Appointment, appointment_id, user)
 
     if appointment.status not in LIVE_STATUSES:
-        _clear_proposal(session, run)
-        return _result(ok=False, reason="not_cancellable",
+        return _refuse(session, run, reason="not_cancellable",
                        message="That appointment is not active.")
 
     slot_id = appointment.slot_id

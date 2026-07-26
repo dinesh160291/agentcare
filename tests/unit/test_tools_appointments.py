@@ -144,6 +144,42 @@ class TestBookingRefusals:
         book_appointment(db, patient_b, slot_id=slot_id, reason="follow-up")
         assert db.query(Appointment).count() == before
 
+    def test_a_slot_whose_doctor_is_inactive_is_refused(self, db, patient_b):
+        """Availability filters inactive doctors out, but a slot id can be
+        booked directly — from a stale proposal, a retry, or the API — and that
+        path never passes through the availability filter."""
+        from app.models import Doctor
+
+        slot_id = free_slot(db)
+        db.get(Doctor, db.get(AppointmentSlot, slot_id).doctor_id).active = False
+        db.commit()
+
+        result = book_appointment(db, patient_b, slot_id=slot_id, reason="x")
+        assert result["ok"] is False
+        assert result["reason"] == "doctor_unavailable"
+
+    def test_an_inactive_doctors_slot_is_left_unclaimed(self, db, patient_b):
+        from app.models import Doctor
+
+        slot_id = free_slot(db)
+        db.get(Doctor, db.get(AppointmentSlot, slot_id).doctor_id).active = False
+        db.commit()
+
+        book_appointment(db, patient_b, slot_id=slot_id, reason="x")
+        assert db.get(AppointmentSlot, slot_id).status == SlotStatus.AVAILABLE
+
+    def test_a_slot_in_an_inactive_department_is_refused(self, db, patient_b):
+        """Same hole, one level up: deactivating a department must stop new
+        bookings immediately, not only stop them being suggested."""
+        from app.models import Department, Doctor
+
+        slot_id = free_slot(db)
+        doctor = db.get(Doctor, db.get(AppointmentSlot, slot_id).doctor_id)
+        db.get(Department, doctor.department_id).active = False
+        db.commit()
+
+        assert book_appointment(db, patient_b, slot_id=slot_id, reason="x")["ok"] is False
+
     def test_a_missing_slot_is_refused(self, db, patient_b):
         result = book_appointment(db, patient_b, slot_id=999_999, reason="x")
         assert result["ok"] is False
@@ -212,6 +248,45 @@ class TestProposalIsClearedOnFailure:
         db.refresh(run)
         assert run.proposed_slot_id is None
         assert run.proposed_action is None
+
+    def test_a_cleared_proposal_survives_a_rollback(self, db, patient_b):
+        """Clearing must be *durable*, not merely pending.
+
+        A failure path that only flushes leaves the cleared proposal inside an
+        uncommitted transaction. Anything that rolls back afterwards — an error
+        handler, a request teardown, a retry — restores the proposal pointing
+        at the dead slot, which is precisely the un-exitable loop the clearing
+        exists to prevent. Re-read through a fresh session, because the calling
+        session would show its own uncommitted state either way.
+        """
+        from app.db import SessionLocal
+        from app.models import ProposedAction
+
+        slot_id = free_slot(db)
+        run = WorkflowRun(
+            patient_id=2,
+            status=WorkflowStatus.PENDING_CONFIRMATION,
+            proposed_action=ProposedAction.BOOK,
+            proposed_slot_id=slot_id,
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+        db.get(AppointmentSlot, slot_id).status = SlotStatus.BOOKED
+        db.commit()
+
+        assert book_appointment(db, patient_b, slot_id=slot_id, reason="x", run=run)["ok"] is False
+
+        db.rollback()
+
+        fresh = SessionLocal()
+        try:
+            reloaded = fresh.get(WorkflowRun, run_id)
+            assert reloaded.proposed_action is None
+            assert reloaded.proposed_slot_id is None
+        finally:
+            fresh.close()
 
     def test_a_successful_commit_also_clears_the_proposal(self, db, patient_b):
         slot_id = free_slot(db)
@@ -324,6 +399,22 @@ class TestReschedulingRefusals:
         )
         assert result["ok"] is False
         assert result["reason"] == "slot_not_found"
+
+    def test_rescheduling_onto_an_inactive_doctors_slot_is_refused(self, db, patient_b):
+        """The same bypass as booking: a slot id supplied directly never passes
+        through the availability filter."""
+        from app.models import Doctor
+
+        booked = book_appointment(db, patient_b, slot_id=free_slot(db), reason="x")
+        target = free_slot(db, index=4)
+        db.get(Doctor, db.get(AppointmentSlot, target).doctor_id).active = False
+        db.commit()
+
+        result = reschedule_appointment(
+            db, patient_b, booked["appointment"]["appointment_id"], new_slot_id=target
+        )
+        assert result["ok"] is False
+        assert result["reason"] == "doctor_unavailable"
 
     def test_rescheduling_into_the_past_is_refused(self, db, patient_b):
         booked = book_appointment(db, patient_b, slot_id=free_slot(db), reason="x")
