@@ -328,14 +328,20 @@ class WorkflowRun(Base, TimestampMixin):
         return self.status in TERMINAL_WORKFLOW_STATUSES
 
     def clear_proposal(self) -> None:
-        """Drop the pending proposal.
+        """Drop the pending proposal, and the stall counter that belongs to it.
 
         Called on commit failure as well as on success: a proposal pointing at
         a dead slot, still confirmable, is a loop with no exit.
+
+        The non-answer count goes with it because it counts non-answers *to
+        this proposal*. Carrying it forward would make the next proposal open
+        already part-way through its patience, and a patient who stalled once
+        would meet the terse framing on their first look at a new time.
         """
         self.proposed_action = None
         self.proposed_slot_id = None
         self.proposed_appointment_id = None
+        self.non_answer_count = 0
 
 
 class Escalation(Base):

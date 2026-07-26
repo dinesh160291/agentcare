@@ -26,7 +26,8 @@ from app import clock
 
 #: Bump on every edit. The trace's window descriptor resolves against these.
 PROMPT_VERSIONS = {
-    "coordinator": 1,
+    # 2: the confirmation verdict — the model's decline-or-re-ask half.
+    "coordinator": 2,
     "routing": 1,
     "appointment": 1,
     "document": 1,
@@ -87,6 +88,18 @@ with how this new message relates to it:
   continuation  - answering or continuing the active request
 
 Judge these in that order and stop at the first that fits.
+
+If you have also been given `submit_confirmation_verdict`, the patient has been
+offered a specific time and has not answered it in words the system could read
+outright. After classifying, say how they answered:
+  decline    - they turned the time down ("not that one", "that doesn't work")
+  non_answer - anything else: a question, a hesitation, a change of subject
+
+There is no third option. **You may never confirm a booking.** Only the
+patient's own exact word, or their pressing Confirm, can do that — a reply like
+"no wait, yes, the Tuesday one" is a question wearing a yes, and treating it as
+consent would book an appointment against the patient's word at the exact step
+built to prevent it.
 """
 
 _ROUTING = """\

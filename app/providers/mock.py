@@ -60,6 +60,23 @@ REBOOK_CUES = (
     "book", "schedule", "make it", "instead", "change it to", "switch to",
     "i need a", "i want a", "can i get a",
 )
+#: Hesitation. Not a subject at all, which is what makes it a *non-answer*
+#: rather than an off-topic message: "hmm, maybe" carries no administrative
+#: noun, but a patient who has just been offered a time and says it is
+#: replying to that question, not starting a new one.
+HEDGE_CUES = (
+    "hmm", "hmmm", "maybe", "not sure", "i think", "perhaps", "possibly",
+    "let me think", "i suppose", "dunno", "don't know", "dont know", "erm",
+    "not certain", "i guess",
+)
+#: A refusal that carries no exact token. The token sets are read in code
+#: before the model is asked, so these are only ever the leftovers: "no" never
+#: reaches here, "not that one, thanks" does.
+DECLINE_CUES = (
+    "not that one", "doesn't work", "does not work", "rather not", "no thanks",
+    "not really", "can't do", "cannot do", "another time", "different time",
+    "something else", "not keen", "too early", "too late",
+)
 SIDE_QUESTION_CUES = (
     "what documents", "what docs", "which documents", "what do i have",
     "when is my", "what time is my", "do i have",
@@ -213,7 +230,7 @@ class MockLlm(AgentCareLlm):
             return function_call_response("load_patient_context", {})
 
         if "classify_message" in available:
-            return self._classify(llm_request, done, text)
+            return self._classify(llm_request, available, done, text)
         return self._plan(llm_request, done, text)
 
     def _plan(self, llm_request: LlmRequest, done: set[str], text: str) -> LlmResponse:
@@ -249,29 +266,88 @@ class MockLlm(AgentCareLlm):
         return steps
 
     def _classify(
-        self, llm_request: LlmRequest, done: set[str], text: str
+        self, llm_request: LlmRequest, available: set[str], done: set[str], text: str
     ) -> LlmResponse:
-        classified = latest_tool_result(llm_request, "classify_message")
-        if classified is not None:
-            return self._from_classification(classified.payload)
+        settled = latest_tool_result(llm_request, "submit_confirmation_verdict")
+        if settled is not None:
+            return self._from_confirmation_verdict(settled.payload)
 
-        message_class, steps = self._class_for(text)
-        return function_call_response(
-            "classify_message",
-            {"message_class": message_class, "incoming_steps": steps},
+        awaiting = "submit_confirmation_verdict" in available
+        classified = latest_tool_result(llm_request, "classify_message")
+        if classified is None:
+            message_class, steps = self._class_for(text, awaiting_confirmation=awaiting)
+            return function_call_response(
+                "classify_message",
+                {"message_class": message_class, "incoming_steps": steps},
+            )
+
+        # A run waiting on a confirmation asks a second question: how did the
+        # patient answer? Only where the tool was actually handed over — the
+        # toolset is what says the question is live — and only for the classes
+        # that leave the run still waiting. A withdrawal or a supersede has
+        # already decided the run's fate; answering "how did they answer?"
+        # about it would be answering a question nobody is asking any more.
+        if awaiting and classified.payload.get("applied_class") in (
+            "continuation",
+            "side_question",
+            "complementary",
+        ):
+            verdict, reason = self._confirmation_verdict(text)
+            return function_call_response(
+                "submit_confirmation_verdict", {"verdict": verdict, "reason": reason}
+            )
+
+        return self._from_classification(classified.payload)
+
+    @staticmethod
+    def _confirmation_verdict(text: str) -> tuple[str, str]:
+        """Read a decline the exact tokens could not.
+
+        Exact tokens ("no", "cancel") never arrive here — code has already read
+        those and this branch is only reached for what it could not. So the
+        cues are the phrasings that carry a refusal without carrying a token,
+        and everything else is a non-answer. Note what is missing: there is no
+        branch that returns a confirmation, because the tool would reject one.
+        """
+        if _has(text, DECLINE_CUES):
+            return "decline", "the patient turned the offered time down"
+        return "non_answer", "the patient did not answer the question"
+
+    @staticmethod
+    def _from_confirmation_verdict(payload: dict[str, Any]) -> LlmResponse:
+        if not payload.get("accepted"):
+            return text_response(str(payload.get("problem", "Let me ask again.")))
+        if payload.get("verdict") == "decline":
+            return text_response(
+                "Understood — I won't book that one. Let me find another time."
+            )
+        return text_response(
+            "I still need a yes or a no on the time I offered before I can book it."
         )
 
     @staticmethod
-    def _class_for(text: str) -> tuple[str, list[str]]:
+    def _class_for(text: str, *, awaiting_confirmation: bool = False) -> tuple[str, list[str]]:
         """Classify in the pinned order, stopping at the first that fits.
 
         The order is not an implementation detail: off-topic sits above
         continuation precisely so an off-topic message cannot fall through and
         be appended to the run's request text.
+
+        **A pending question changes what "off topic" means.** Off-topic means
+        nothing to do with hospital administration — but a patient who has just
+        been offered a time and answers "hmm, maybe" or "not that one" is
+        replying to *our* question, and carries no administrative noun only
+        because the noun is already on the table. Reading those as off-topic
+        costs more than a wrong label: it routes them to the scope reply and
+        past the decline path, so a refusal the exact tokens could not read
+        would never be heard at all.
         """
         if _has(text, WITHDRAWAL_CUES):
             return "withdrawal", []
-        if not _has(text, ADMIN_CUES):
+        answering = awaiting_confirmation and (
+            _has(text, HEDGE_CUES) or _has(text, DECLINE_CUES)
+        )
+        if not answering and not _has(text, ADMIN_CUES):
             return "off_topic", []
         if _has(text, SIDE_QUESTION_CUES):
             return "side_question", []

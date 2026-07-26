@@ -58,6 +58,11 @@ from app.workflow.mapping import ClassVerdict, validate_class
 from app.workflow.plan import validate_plan
 from app.workflow.state_machine import transition
 
+#: The closed set the model may answer a proposal with. ``confirm`` is
+#: deliberately absent: commitment requires a click or an exact token, and the
+#: model's only permitted verdicts are decline or non-answer.
+CONFIRMATION_VERDICTS = ("decline", "non_answer")
+
 
 @dataclass
 class TurnProposals:
@@ -69,6 +74,8 @@ class TurnProposals:
 
     plan: list[PlanStep] | None = None
     class_verdict: ClassVerdict | None = None
+    #: "decline" or "non_answer" — never "confirm". See ``CONFIRMATION_VERDICTS``.
+    confirmation_verdict: str | None = None
     incoming_steps: list[PlanStep] = field(default_factory=list)
     department_id: int | None = None
     department_name: str | None = None
@@ -192,12 +199,61 @@ class Toolbelt:
                 "reason": verdict.reason,
             }
 
+        def submit_confirmation_verdict(verdict: str, reason: str = "") -> dict:
+            """Say how the patient answered the time you offered them.
+            `verdict` must be "decline" or "non_answer". There is no third
+            option: you may never confirm a booking. Only the patient's own
+            exact word, or the Confirm button, can do that."""
+            return self._submit_confirmation_verdict(verdict, reason)
+
         # The toolset itself says which decision is wanted. A Coordinator with
         # no active run cannot classify against one, and a Coordinator with a
         # live run must not quietly start a second — so the wrong tool is
         # absent rather than merely discouraged.
         decision = classify_message if self.run is not None else submit_plan
-        return [load_patient_context, decision]
+        tools = [load_patient_context, decision]
+
+        # The model's half of the confirmation read, and only where it applies.
+        # Handing it out permanently would invite it to answer a question
+        # nobody asked.
+        if (
+            self.run is not None
+            and self.run.status is WorkflowStatus.PENDING_CONFIRMATION
+        ):
+            tools.append(submit_confirmation_verdict)
+        return tools
+
+    def _submit_confirmation_verdict(self, verdict: str, reason: str) -> dict:
+        """Validate the model's read of a confirmation answer.
+
+        The asymmetry, restated as code: a wrongly re-asked "yes" costs one
+        tap; a wrongly committed "no" books an appointment against the
+        patient's word at the exact step built to prevent that. So the enum has
+        two members and ``confirm`` is not one of them — the refusal is
+        structural rather than a matter of the prompt holding.
+        """
+        proposed = str(verdict or "").strip().lower()
+
+        if proposed not in CONFIRMATION_VERDICTS:
+            problem = (
+                "You cannot confirm a booking. Only the patient's exact word or "
+                "the Confirm button can. Use 'decline' or 'non_answer'."
+                if proposed in ("confirm", "confirmed", "yes")
+                else f"Not a verdict. Use one of: {', '.join(CONFIRMATION_VERDICTS)}."
+            )
+            self.writer.validation(
+                "confirmation_verdict",
+                accepted=False,
+                detail={"proposed": verdict, "problem": problem},
+            )
+            self.proposals.rejections.append(problem)
+            return {"accepted": False, "problem": problem}
+
+        self.writer.validation(
+            "confirmation_verdict", accepted=True, detail={"verdict": proposed}
+        )
+        self.proposals.confirmation_verdict = proposed
+        return {"accepted": True, "verdict": proposed, "reason": reason}
 
     # --- Department Routing ----------------------------------------------
 
@@ -463,4 +519,4 @@ class Toolbelt:
         return [list_patient_reminders_tool, list_open_tasks_tool]
 
 
-__all__ = ["Toolbelt", "TurnProposals"]
+__all__ = ["CONFIRMATION_VERDICTS", "Toolbelt", "TurnProposals"]

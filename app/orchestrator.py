@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
@@ -38,7 +39,7 @@ from app.agents.base import run_agent
 from app.audit import write_audit
 from app.config import get_settings
 from app.db import SessionLocal
-from app.errors import BudgetExceeded
+from app.errors import BudgetExceeded, ValidationFailed
 from app.models import (
     EscalationKind,
     MessageClass,
@@ -83,6 +84,18 @@ DECLINED_REPLY = (
 NO_PLAN_REPLY = (
     "I want to make sure I get this right — could you tell me a little more about "
     "what you need help with?"
+)
+NOTHING_TO_CONFIRM_REPLY = (
+    "There's nothing waiting for your confirmation just now. Tell me what you'd "
+    "like to do and I'll pick it up from there."
+)
+#: The bounded end of the re-ask loop. Explicit framing, code-authored, and
+#: identical in mock and live: once the wording has failed three times, more
+#: wording is not the answer.
+STALLED_REASK_REPLY = (
+    "Just to be clear about the time I offered: press ✅ Confirm or reply 'yes' "
+    "and I'll book it — reply 'no' and I'll look for another. Nothing is booked "
+    "until you say so."
 )
 
 
@@ -211,6 +224,100 @@ async def _screen(
     return verdict
 
 
+def _decline_proposal(
+    session: Session,
+    *,
+    run: WorkflowRun,
+    writer: TraceWriter,
+    user: User,
+    trigger: str,
+    base: dict,
+) -> TurnResult:
+    """The patient said no. Back to slot selection, proposal cleared.
+
+    One function for all three ways of declining — an exact token, a button, or
+    the model's read of "not that one" — because a proposal left confirmable
+    after a decline is the same bug however the decline arrived.
+    """
+    run.clear_proposal()
+    transition(
+        session,
+        run,
+        to=WorkflowStatus.IN_PROGRESS,
+        trigger=trigger,
+        writer=writer,
+        actor=user,
+    )
+    return TurnResult(
+        reply=DECLINED_REPLY,
+        author=TraceAuthor.TEMPLATE,
+        run_id=run.id,
+        status=run.status.value,
+        message_class=MessageClass.CONTINUATION,
+        **base,
+    )
+
+
+def _settle_confirmation(
+    session: Session,
+    *,
+    run: WorkflowRun,
+    belt: Toolbelt,
+    writer: TraceWriter,
+    user: User,
+    coordinator_reply: str,
+    outcome,
+    base: dict,
+) -> TurnResult:
+    """The model's half of the confirmation read: decline, or re-ask.
+
+    It reaches here only for text the exact tokens could not read. Its verdict
+    is one of two, and code enforces which two — see
+    :data:`app.agents.toolbelt.CONFIRMATION_VERDICTS`.
+
+    A stall never resolves implicitly in either direction. There is no
+    auto-commit and no auto-decline: the run stays in ``pending_confirmation``
+    until an explicit answer, a withdrawal, or a supersede. What the cap bounds
+    is the *wording* spend, not the patient's time.
+    """
+    settings = get_settings()
+
+    if belt.proposals.confirmation_verdict == "decline":
+        return _decline_proposal(
+            session, run=run, writer=writer, user=user,
+            trigger="model_read_decline", base=base,
+        )
+
+    cap = settings.max_confirmation_non_answers
+    stalled = run.non_answer_count >= cap
+    writer.guard_verdict(
+        "confirmation_stall",
+        passed=not stalled,
+        detail={"non_answers": run.non_answer_count, "cap": cap},
+    )
+
+    if stalled:
+        # Code takes the wording from here: zero further model turns spent on
+        # re-phrasing a question that has already been asked three times.
+        return TurnResult(
+            reply=STALLED_REASK_REPLY,
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            message_class=outcome.message_class,
+            **base,
+        )
+
+    return TurnResult(
+        reply=coordinator_reply or STALLED_REASK_REPLY,
+        author=TraceAuthor.LLM if coordinator_reply else TraceAuthor.TEMPLATE,
+        run_id=run.id,
+        status=run.status.value,
+        message_class=outcome.message_class,
+        **base,
+    )
+
+
 def _budget_failure(
     session: Session,
     *,
@@ -255,18 +362,40 @@ def _budget_failure(
 # --- the turn ------------------------------------------------------------
 
 
-async def run_workflow(
-    user: User,
-    message: str,
-    session_id: str | None = None,
-    *,
-    provider: str | None = None,
-) -> TurnResult:
-    """Run one conversational turn to completion.
+@dataclass
+class _Envelope:
+    """What a turn is handed, and where it puts what it produced."""
 
-    Owns its own database session, because the turn *is* the transaction: the
-    state change, its audit row, and its trace rows commit together or not at
-    all.
+    session: Session
+    writer: TraceWriter
+    callbacks: TurnCallbacks
+    user: User
+    conversation_id: str
+    result: TurnResult | None = None
+
+
+@asynccontextmanager
+async def _turn_envelope(
+    user: User,
+    *,
+    content: str,
+    author: TraceAuthor,
+    session_id: str | None,
+):
+    """The bracket every turn shares, whichever front door it came through.
+
+    **The system has two front doors** — a chat message and a typed action —
+    and the turn grammar recognises both. Sharing this envelope is what keeps
+    that true: one place opens a turn with an inbound event, one place closes
+    it with an outbound event, and one place commits. A second copy would be a
+    second place for a typed-action turn to end up unbracketed, which is
+    exactly the shape of hole the well-formedness checker exists to catch and
+    the easiest one to introduce by writing the button path separately.
+
+    The turn *is* the transaction: the state change, its audit row, and its
+    trace rows commit together or not at all. An unexpected exception writes
+    its trace and **commits** before propagating — a turn that vanished is
+    worse than a turn that failed.
     """
     settings = get_settings()
     session = SessionLocal()
@@ -280,7 +409,7 @@ async def run_workflow(
         raise ValueError(f"No such user: {user.id}")
     if acting.role is not UserRole.PATIENT:
         session.close()
-        raise ValueError("run_workflow is the patient path; staff act by typed action.")
+        raise ValueError("This is the patient path; staff act by typed action.")
 
     writer = TraceWriter(session, session_id=conversation_id)
     callbacks = TurnCallbacks(
@@ -288,21 +417,21 @@ async def run_workflow(
         max_tool_iterations=settings.max_tool_iterations,
         history_window_turns=settings.history_window_turns,
     )
-    writer.inbound(message, author=TraceAuthor.PATIENT_MESSAGE)
+    writer.inbound(content, author=author)
 
+    envelope = _Envelope(
+        session=session,
+        writer=writer,
+        callbacks=callbacks,
+        user=acting,
+        conversation_id=conversation_id,
+    )
     try:
-        result = await _turn(
-            session,
-            writer=writer,
-            callbacks=callbacks,
-            user=acting,
-            message=message,
-            conversation_id=conversation_id,
-            provider=provider,
-        )
-        writer.outbound(result.reply, author=result.author)
+        yield envelope
+        if envelope.result is None:  # pragma: no cover - a caller bug
+            raise RuntimeError("A turn ended without producing a result.")
+        writer.outbound(envelope.result.reply, author=envelope.result.author)
         session.commit()
-        return result
     except Exception as exc:  # noqa: BLE001 - recorded and committed, then re-raised
         callbacks.fail_pending_request(f"{type(exc).__name__}: {exc}")
         writer.outbound(FAILED_REPLY, author=TraceAuthor.TEMPLATE, error=str(exc))
@@ -318,6 +447,135 @@ async def run_workflow(
         raise
     finally:
         session.close()
+
+
+async def run_workflow(
+    user: User,
+    message: str,
+    session_id: str | None = None,
+    *,
+    provider: str | None = None,
+) -> TurnResult:
+    """Run one conversational turn to completion.
+
+    The seam. Everything above it — the API, the UI, the evals — knows about a
+    function that takes a user and a message and returns a reply.
+    """
+    async with _turn_envelope(
+        user,
+        content=message,
+        author=TraceAuthor.PATIENT_MESSAGE,
+        session_id=session_id,
+    ) as envelope:
+        envelope.result = await _turn(
+            envelope.session,
+            writer=envelope.writer,
+            callbacks=envelope.callbacks,
+            user=envelope.user,
+            message=message,
+            conversation_id=envelope.conversation_id,
+            provider=provider,
+        )
+    return envelope.result
+
+
+async def apply_patient_action(
+    user: User,
+    action: str,
+    session_id: str,
+    *,
+    provider: str | None = None,
+) -> TurnResult:
+    """A ✅ Confirm or ❌ Decline click. **Zero interpretation.**
+
+    The buttons render with the *first* proposal, not as a fallback after the
+    patient has already been misunderstood once — so this is the ordinary path
+    to a booking rather than the exceptional one. A click carries no free text,
+    so nothing here reads language: the action is matched against a closed set
+    and applied. No model is consulted about what the patient meant, because
+    there is nothing to be uncertain about.
+
+    A stale click is a no-op, not an error. The motivating trace is the
+    double-clicked Confirm: the second request finds the proposal already
+    committed and must say so calmly.
+    """
+    chosen = str(action or "").strip().lower()
+
+    async with _turn_envelope(
+        user,
+        content=chosen,
+        author=TraceAuthor.PATIENT_ACTION,
+        session_id=session_id,
+    ) as envelope:
+        session, writer, user_row = envelope.session, envelope.writer, envelope.user
+        base = dict(turn_id=writer.turn_id, session_id=envelope.conversation_id)
+
+        # A button press has no free text, so there is nothing for the safety
+        # screen to read. Recorded rather than silently absent: "did not run"
+        # and "was not applicable" must stay different facts.
+        writer.guard_verdict(
+            "safety_keyword_screen",
+            passed=True,
+            detail={"skipped": "typed_action", "source": "keyword"},
+        )
+
+        if chosen not in ("confirm", "decline"):
+            raise ValidationFailed(
+                f"{action!r} is not a patient action. Use 'confirm' or 'decline'."
+            )
+
+        profile = _patient_profile(session, user_row)
+        run = active_run(session, profile.id)
+        if run is None or run.status is not WorkflowStatus.PENDING_CONFIRMATION:
+            writer.guard_verdict(
+                "typed_action_applicable",
+                passed=False,
+                detail={"action": chosen, "status": run.status.value if run else None},
+            )
+            write_audit(
+                session,
+                action="patient_action_stale",
+                entity_type="workflow_run",
+                entity_id=run.id if run else None,
+                actor=user_row,
+                metadata={"action": chosen},
+            )
+            envelope.result = TurnResult(
+                reply=NOTHING_TO_CONFIRM_REPLY,
+                author=TraceAuthor.TEMPLATE,
+                run_id=run.id if run else None,
+                status=run.status.value if run else None,
+                **base,
+            )
+            return envelope.result
+
+        writer.bind_run(run.id)
+        writer.guard_verdict(
+            "typed_action_applicable", passed=True, detail={"action": chosen}
+        )
+
+        if chosen == "decline":
+            envelope.result = _decline_proposal(
+                session, run=run, writer=writer, user=user_row,
+                trigger="patient_declined_action", base=base,
+            )
+            return envelope.result
+
+        belt = Toolbelt(
+            session, user=user_row, patient_id=profile.id, writer=writer, run=run
+        )
+        envelope.result = await _commit_proposal(
+            session,
+            run=run,
+            belt=belt,
+            writer=writer,
+            callbacks=envelope.callbacks,
+            user=user_row,
+            conversation_id=envelope.conversation_id,
+            provider=provider,
+            base=base,
+        )
+    return envelope.result
 
 
 async def _turn(
@@ -393,22 +651,9 @@ async def _turn(
                 base=base,
             )
         if answer is ConfirmationAnswer.DECLINE:
-            run.clear_proposal()
-            transition(
-                session,
-                run,
-                to=WorkflowStatus.IN_PROGRESS,
-                trigger="patient_declined",
-                writer=writer,
-                actor=user,
-            )
-            return TurnResult(
-                reply=DECLINED_REPLY,
-                author=TraceAuthor.TEMPLATE,
-                run_id=run.id,
-                status=run.status.value,
-                message_class=MessageClass.CONTINUATION,
-                **base,
+            return _decline_proposal(
+                session, run=run, writer=writer, user=user,
+                trigger="patient_declined", base=base,
             )
         # UNREAD falls through: the model may re-ask or decline, never confirm.
 
@@ -521,6 +766,8 @@ async def _continue_run(
 ) -> TurnResult:
     """Apply the message→run class, then carry on where it leaves the run."""
     settings = get_settings()
+    #: Read before the mapping, which may move the run off this state.
+    awaiting_confirmation = run.status is WorkflowStatus.PENDING_CONFIRMATION
     verdict = belt.proposals.class_verdict
     if verdict is None:
         # The Coordinator did not classify. Default to the class that changes
@@ -556,6 +803,16 @@ async def _continue_run(
         detail={"class": outcome.message_class.value},
     )
 
+    # Stall containment, counted **independently of the class**. Deliberately
+    # so: a message that leaves the run waiting is a non-answer whatever it was
+    # classified as, and tying the counter to one class would let a
+    # misclassification — an "hmm, maybe" read as off-topic — quietly make the
+    # re-ask loop unbounded again. The bound must not be reachable only through
+    # the paths that were classified correctly.
+    if awaiting_confirmation and run.status is WorkflowStatus.PENDING_CONFIRMATION:
+        run.non_answer_count += 1
+        session.flush()
+
     if outcome.consequence is Consequence.WITHDRAW:
         return TurnResult(
             reply=WITHDRAWN_REPLY,
@@ -574,6 +831,21 @@ async def _continue_run(
             status=run.status.value,
             message_class=outcome.message_class,
             **base,
+        )
+
+    # Text the exact tokens could not read, on a run that is still waiting.
+    # This is the third and last step of the reading order, and the only one
+    # the model takes part in.
+    if awaiting_confirmation and run.status is WorkflowStatus.PENDING_CONFIRMATION:
+        return _settle_confirmation(
+            session,
+            run=run,
+            belt=belt,
+            writer=writer,
+            user=user,
+            coordinator_reply=coordinator_reply,
+            outcome=outcome,
+            base=base,
         )
 
     if outcome.consequence is Consequence.ANSWER_AND_STAY:
