@@ -78,13 +78,28 @@ def audit_denied_access(
     entity_id: object,
     reason: str = "ownership",
 ) -> AuditEvent:
-    """Record a denied access attempt.
+    """Record a denied access attempt, durably.
 
     Called on the ownership path before raising ``RecordNotFound``. The caller
     sees a 404 and learns nothing; the audit log records precisely what was
     probed and by whom.
+
+    Unlike every other audit write, this one **commits**. The rest of the
+    module deliberately does not, because an audit row describing a change must
+    roll back with that change. A denial describes no change: it happens on a
+    request that is about to fail, and a request-scoped session is closed
+    without committing — so a denial left in that transaction is rolled back,
+    and the system audits nothing while appearing to audit everything.
+
+    Committing on a *separate* session would isolate this better, but SQLite
+    permits one writer at a time: the request session may already hold the
+    write lock, and the second connection would block until it timed out.
+
+    Consequence for callers: run ownership guards **before** mutations, which
+    is where a guard belongs anyway. Pending writes in the same session would
+    be committed by this call.
     """
-    return write_audit(
+    event = write_audit(
         session,
         action="access_denied",
         entity_type=entity_type,
@@ -92,3 +107,5 @@ def audit_denied_access(
         actor=actor,
         metadata={"reason": reason, "requested_id": str(entity_id)},
     )
+    session.commit()
+    return event
