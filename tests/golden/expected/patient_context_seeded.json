@@ -1,0 +1,66 @@
+{
+  "active_run": null,
+  "date_of_birth": "1986-04-12",
+  "documents": [
+    {
+      "checksum": "<checksum>",
+      "declared_type": "ECG report",
+      "detected_type": null,
+      "document_date": "2026-05-05",
+      "document_id": 3,
+      "document_type": "ECG report",
+      "original_filename": "x-ray_report.pdf",
+      "status": "pending_verification"
+    },
+    {
+      "checksum": "<checksum>",
+      "declared_type": "Blood test report",
+      "detected_type": null,
+      "document_date": "2026-06-04",
+      "document_id": 2,
+      "document_type": "Blood test report",
+      "original_filename": "blood_test_report.pdf",
+      "status": "pending_verification"
+    },
+    {
+      "checksum": "<checksum>",
+      "declared_type": "ECG report",
+      "detected_type": null,
+      "document_date": "2026-07-04",
+      "document_id": 1,
+      "document_type": "ECG report",
+      "original_filename": "ecg_report.pdf",
+      "status": "pending_verification"
+    }
+  ],
+  "name": "Asha Menon",
+  "open_tasks": [],
+  "patient_id": 1,
+  "pending_reminders": [
+    {
+      "appointment_id": 1,
+      "attempts": 0,
+      "message": "Reminder: appointment with Dr. Anita Rao on Thursday 06 August at 09:00.",
+      "patient_id": 1,
+      "reminder_id": 1,
+      "reminder_type": "appointment",
+      "scheduled_at": "2026-08-05T09:00:00",
+      "status": "pending"
+    }
+  ],
+  "phone": "+1-555-0100",
+  "preferred_language": "English",
+  "upcoming_appointments": [
+    {
+      "appointment_id": 1,
+      "department_id": 1,
+      "department_name": "Cardiology",
+      "doctor_name": "Dr. Anita Rao",
+      "end": "2026-08-06T09:30:00",
+      "reason": "Follow-up appointment requested by patient",
+      "reference_code": "AC-000001",
+      "start": "2026-08-06T09:00:00",
+      "status": "confirmed"
+    }
+  ]
+}

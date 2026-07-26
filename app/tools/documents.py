@@ -14,11 +14,18 @@ scope here.
 from __future__ import annotations
 
 import hashlib
+import uuid
+from datetime import date
+from pathlib import Path
 from typing import Any
 
+import filetype
 from sqlalchemy.orm import Session
 
-from app.models import DepartmentRequiredDocument, PatientDocument
+from app.audit import write_audit
+from app.auth.ownership import patient_profile_for
+from app.config import get_settings
+from app.models import DepartmentRequiredDocument, PatientDocument, User
 from app.models.enums import DocumentStatus
 
 #: Document statuses that count as "the patient has supplied this".
@@ -109,6 +116,124 @@ def find_duplicate(
         "is_duplicate": existing is not None,
         "existing_document_id": existing.id if existing else None,
         "existing_document_type": existing.document_type if existing else None,
+    }
+
+
+def _stored_filename(checksum: str, extension: str) -> str:
+    """Build a filename the server chose.
+
+    The client-supplied name is never used on disk. It is an attacker-controlled
+    string that reaches a filesystem call, and "../../etc/passwd" is a filename
+    as far as an upload form is concerned. The original is kept in the database
+    as a display label only.
+    """
+    return f"doc-{uuid.uuid4().hex}-{checksum[:12]}{extension}"
+
+
+def ingest_document(
+    session: Session,
+    user: User,
+    *,
+    content: bytes,
+    declared_type: str,
+    original_filename: str | None = None,
+    document_date: date | None = None,
+) -> dict[str, Any]:
+    """Store an uploaded document for the acting patient.
+
+    Hardened on three axes, each closing a way an upload endpoint gets abused:
+    a size cap, a MIME allowlist checked against **magic bytes** rather than the
+    declared content type or the file extension (both of which the client
+    chooses), and a server-generated filename.
+
+    Duplicates are detected before anything is written to disk, so re-uploading
+    the same file does not leave orphaned copies accumulating.
+    """
+    settings = get_settings()
+    profile = patient_profile_for(session, user)
+
+    def refuse(reason: str, message: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "reason": reason,
+            "message": message,
+            "document": None,
+            "duplicate_of": None,
+        }
+
+    if not content:
+        return refuse("empty_file", "That file is empty.")
+
+    if len(content) > settings.max_upload_bytes:
+        limit_mb = settings.max_upload_bytes / (1024 * 1024)
+        return refuse("too_large", f"Files must be smaller than {limit_mb:.0f} MB.")
+
+    if not (declared_type or "").strip():
+        return refuse("missing_declared_type", "Please say what kind of document this is.")
+
+    # Magic bytes, not the extension and not the client's content-type header.
+    kind = filetype.guess(content)
+    mime = kind.mime if kind else None
+    if mime not in settings.allowed_upload_mime_list:
+        allowed = ", ".join(settings.allowed_upload_mime_list)
+        return refuse("unsupported_type", f"Only these file types are accepted: {allowed}.")
+
+    checksum = checksum_bytes(content)
+    duplicate = find_duplicate(session, patient_id=profile.id, checksum=checksum)
+    if duplicate["is_duplicate"]:
+        return {
+            "ok": False,
+            "reason": "duplicate",
+            "message": "You have already uploaded this file.",
+            "document": None,
+            "duplicate_of": duplicate["existing_document_id"],
+        }
+
+    upload_dir = Path(settings.upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    stored_name = _stored_filename(checksum, f".{kind.extension}")
+    (upload_dir / stored_name).write_bytes(content)
+
+    document = PatientDocument(
+        patient_id=profile.id,
+        declared_type=declared_type.strip(),
+        document_type=declared_type.strip(),
+        detected_type=None,
+        storage_path=str(upload_dir / stored_name),
+        original_filename=original_filename,
+        mime_type=mime,
+        size_bytes=len(content),
+        document_date=document_date,
+        checksum=checksum,
+        # Verification is Phase 5's job; the file is on record either way.
+        status=DocumentStatus.PENDING_VERIFICATION,
+    )
+    session.add(document)
+    session.flush()
+
+    write_audit(
+        session,
+        action="document_uploaded",
+        entity_type="PatientDocument",
+        entity_id=document.id,
+        actor=user,
+        metadata={"declared_type": document.declared_type, "mime_type": mime},
+    )
+
+    return {
+        "ok": True,
+        "reason": None,
+        "message": "Document received.",
+        "document": {
+            "document_id": document.id,
+            "document_type": document.document_type,
+            "declared_type": document.declared_type,
+            "status": document.status.value,
+            "checksum": checksum,
+            "size_bytes": len(content),
+            "mime_type": mime,
+        },
+        "duplicate_of": None,
     }
 
 

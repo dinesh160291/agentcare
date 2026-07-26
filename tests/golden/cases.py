@@ -189,7 +189,28 @@ def reminders_due_after_reschedule(session: Session) -> Any:
     }
 
 
+def patient_context_seeded(session: Session) -> Any:
+    """Everything the Coordinator knows about the seeded patient."""
+    from app.tools.patients import get_patient_context
+
+    patient = session.query(User).filter(User.id == 1).one()
+    return get_patient_context(session, patient)
+
+
+def confirmation_for_seeded_appointment(session: Session) -> Any:
+    """The consequential-wording seam, pinned exactly.
+
+    Live evals grade these fact fields against the database; this golden is
+    what "correct" means for them.
+    """
+    from app.tools.confirmations import render_confirmation
+
+    return render_confirmation(session, 1)
+
+
 CASES: dict[str, GoldenCase] = {
+    "patient_context_seeded": patient_context_seeded,
+    "confirmation_for_seeded_appointment": confirmation_for_seeded_appointment,
     "departments_all": departments_all,
     "department_resolve_by_name": department_resolve_by_name,
     "department_resolve_by_synonym": department_resolve_by_synonym,

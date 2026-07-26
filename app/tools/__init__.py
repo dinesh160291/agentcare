@@ -21,6 +21,7 @@ from app.tools.appointments import (
     reschedule_appointment,
 )
 from app.tools.availability import find_available_slots, get_slot
+from app.tools.confirmations import render_confirmation
 from app.tools.dates import resolve_date
 from app.tools.departments import (
     list_departments,
@@ -31,24 +32,41 @@ from app.tools.documents import (
     checksum_bytes,
     diff_required_documents,
     find_duplicate,
+    ingest_document,
     list_patient_documents,
 )
+from app.tools.patients import get_patient_context
 from app.tools.reminders import list_due_reminders, list_patient_reminders
+from app.tools.tasks import (
+    close_followup_tasks,
+    create_escalation,
+    list_open_escalations,
+    list_open_tasks,
+    upsert_followup_task,
+)
 
 __all__ = [
     "book_appointment",
     "cancel_appointment",
     "checksum_bytes",
+    "close_followup_tasks",
+    "create_escalation",
     "diff_required_documents",
     "find_available_slots",
     "find_duplicate",
+    "get_patient_context",
     "get_slot",
+    "ingest_document",
     "list_departments",
     "list_due_reminders",
+    "list_open_escalations",
+    "list_open_tasks",
     "list_patient_documents",
     "list_patient_reminders",
+    "render_confirmation",
     "reschedule_appointment",
     "resolve_date",
     "resolve_department",
+    "upsert_followup_task",
     "validate_department",
 ]
