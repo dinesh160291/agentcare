@@ -1,0 +1,29 @@
+{
+  "name": "ambiguous-confirmation",
+  "pins": "The cost asymmetry: a wrongly re-asked yes costs one tap, a wrongly committed no books an appointment against the patient's word at the exact step built to prevent that. Only an exact token commits. A stall never resolves itself in either direction.",
+  "patient": "fatima.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a neurology appointment next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "appointments_created": 0
+      }
+    },
+    {
+      "message": "no wait - yes, the Tuesday one",
+      "expect": {
+        "status": "pending_confirmation",
+        "appointments_created": 0
+      }
+    },
+    {
+      "message": "yes",
+      "expect": {
+        "status": "completed",
+        "appointments_created": 1,
+        "reply_contains": ["confirmed"]
+      }
+    }
+  ]
+}

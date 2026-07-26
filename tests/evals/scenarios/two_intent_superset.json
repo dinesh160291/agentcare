@@ -1,0 +1,15 @@
+{
+  "name": "two-intent-superset",
+  "pins": "The canonical hackathon request carries two intents at once. Intent detection must never take whichever matched first: a documents-only plan would succeed cheerfully while the appointment the patient asked for never happened. The plan must contain route AND book.",
+  "patient": "daniel.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a cardiology appointment next week. I also want to attach my previous ECG report.",
+      "expect": {
+        "plan": ["route", "book", "documents", "follow_up"],
+        "status": "pending_confirmation",
+        "reply_contains": ["Cardiology"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,659 @@
+"""The orchestrator seam — ``run_workflow``, driven end to end under mock.
+
+These run the *whole* system: five agents, real tools, real database writes,
+real state transitions, real trace rows. Under ``LLM_PROVIDER=mock`` the only
+thing standing in is the judgement about what to do next. If something works
+live but not here, it is not done.
+
+Two checks in this file are the ones the mock has to survive to be a provider
+rather than a fixture:
+
+* **Fact diffing.** Every fact in a booking reply — doctor, weekday, date,
+  time, reference — is compared against the row it claims to describe, on two
+  different bookings. Identical replies for different inputs, or facts absent
+  from the database, both fail.
+* **The budget cap.** A stub provider that calls a tool forever must produce a
+  ``failed`` run at exactly the cap, never an unbounded loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+from typing import AsyncGenerator
+
+import pytest
+from google.adk.models import LlmRequest, LlmResponse
+
+from app import clock
+from app.db import SessionLocal
+from app.models import (
+    Appointment,
+    AppointmentSlot,
+    AppointmentStatus,
+    AuditEvent,
+    Escalation,
+    MessageClass,
+    SlotStatus,
+    TraceEvent,
+    TraceEventType,
+    User,
+    WorkflowRun,
+    WorkflowStatus,
+)
+from app.orchestrator import active_run, run_workflow
+from app.providers.base import AgentCareLlm, function_call_response
+from app.trace import assert_well_formed
+
+PATIENT_EMAIL = "asha.patient@example.invalid"
+OTHER_EMAIL = "rohan.patient@example.invalid"
+BOOKING = "I need a cardiology appointment next week"
+
+
+@pytest.fixture
+def patient(seeded_db):
+    seeded_db.commit()
+    return seeded_db.query(User).filter(User.email == PATIENT_EMAIL).one()
+
+
+@pytest.fixture
+def other_patient(seeded_db):
+    return seeded_db.query(User).filter(User.email == OTHER_EMAIL).one()
+
+
+def turn(user, message, session_id):
+    """One turn, run to completion."""
+    return asyncio.run(run_workflow(user, message, session_id))
+
+
+def fresh():
+    """A session that has seen none of the objects the turn wrote."""
+    return SessionLocal()
+
+
+def appointments_for(session, run_id: int) -> list[Appointment]:
+    """This run's appointments.
+
+    Absolute counts would be wrong: the seed ships one booked appointment on
+    purpose, so that a reschedule/cancel flow has something to act on.
+    """
+    run = session.get(WorkflowRun, run_id)
+    return (
+        session.query(Appointment)
+        .filter(Appointment.patient_id == run.patient_id)
+        .filter(Appointment.id != SEEDED_APPOINTMENT_ID)
+        .all()
+    )
+
+
+#: The seed's one pre-existing appointment.
+SEEDED_APPOINTMENT_ID = 1
+
+
+class TestBookingHappyPath:
+    def test_the_first_turn_proposes_and_pauses(self, patient):
+        result = turn(patient, BOOKING, "s-happy-1")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert result.plan == ["route", "book", "documents", "follow_up"]
+        assert result.steps_run == ["route", "book"]
+
+    def test_nothing_is_booked_before_confirmation(self, patient):
+        """Confirm-before-commit. The proposal exists; the appointment does not."""
+        result = turn(patient, BOOKING, "s-happy-2")
+
+        session = fresh()
+        try:
+            assert appointments_for(session, result.run_id) == []
+            run = session.get(WorkflowRun, result.run_id)
+            assert run.proposed_slot_id is not None
+        finally:
+            session.close()
+
+    def test_confirming_books_and_completes_the_plan(self, patient):
+        turn(patient, BOOKING, "s-happy-3")
+        result = turn(patient, "yes", "s-happy-3")
+
+        assert result.status == WorkflowStatus.COMPLETED.value
+        assert result.steps_run == ["book", "documents", "follow_up"]
+
+        session = fresh()
+        try:
+            booked = appointments_for(session, result.run_id)
+            assert len(booked) == 1
+            assert booked[0].status is AppointmentStatus.CONFIRMED
+        finally:
+            session.close()
+
+    def test_the_proposal_is_cleared_after_commit(self, patient):
+        """A proposal that survives its own commit is confirmable twice."""
+        turn(patient, BOOKING, "s-happy-4")
+        turn(patient, "yes", "s-happy-4")
+
+        session = fresh()
+        try:
+            run = session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+            assert run.proposed_slot_id is None
+            assert run.proposed_action is None
+        finally:
+            session.close()
+
+    def test_the_department_is_recorded_on_the_run(self, patient):
+        turn(patient, BOOKING, "s-happy-5")
+        session = fresh()
+        try:
+            run = session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+            assert run.state["department_name"] == "Cardiology"
+        finally:
+            session.close()
+
+    def test_the_trace_is_well_formed(self, patient):
+        turn(patient, BOOKING, "s-happy-6")
+        turn(patient, "yes", "s-happy-6")
+
+        session = fresh()
+        try:
+            assert_well_formed(session)
+        finally:
+            session.close()
+
+    def test_both_ledgers_record_the_booking(self, patient):
+        turn(patient, BOOKING, "s-happy-7")
+        turn(patient, "yes", "s-happy-7")
+
+        session = fresh()
+        try:
+            transitions = [
+                event
+                for event in session.query(TraceEvent).all()
+                if event.event_type is TraceEventType.TRANSITION
+            ]
+            audits = [
+                event
+                for event in session.query(AuditEvent).all()
+                if event.action == "workflow_transition"
+            ]
+            assert transitions and audits
+        finally:
+            session.close()
+
+
+class TestRepliesAreTemplatedFromTheDatabase:
+    """Rule 6, checked rather than asserted.
+
+    A tool that returns a fixed value regardless of input scores zero, and the
+    mock provider is bound by that rule as much as any other provider.
+    """
+
+    def _book(self, user, session_id, message=BOOKING):
+        turn(user, message, session_id)
+        return turn(user, "yes", session_id)
+
+    def test_every_fact_in_the_reply_is_in_the_row(self, patient):
+        result = self._book(patient, "s-facts-1")
+        reply = result.reply
+
+        session = fresh()
+        try:
+            appointment = appointments_for(session, result.run_id)[0]
+            slot = appointment.slot
+            doctor = appointment.doctor
+            start = slot.start_time
+        finally:
+            session.close()
+
+        assert doctor.name in reply
+        assert start.strftime("%A") in reply
+        assert start.strftime("%H:%M") in reply
+        assert str(start.year) in reply
+        assert f"AC-{appointment.id:06d}" in reply
+
+    def test_two_different_bookings_produce_different_replies(
+        self, patient, other_patient
+    ):
+        """The check a canned string cannot pass."""
+        first = self._book(patient, "s-facts-2").reply
+        second = self._book(
+            other_patient, "s-facts-3", "I would like a dermatology appointment"
+        ).reply
+
+        assert first != second
+
+    def test_the_reply_names_the_department_that_was_booked(
+        self, patient, other_patient
+    ):
+        self._book(patient, "s-facts-4")
+        second = self._book(
+            other_patient, "s-facts-5", "I would like a dermatology appointment"
+        )
+        assert "Dermatology" in second.reply
+
+    def test_a_reference_code_matches_its_own_appointment(
+        self, patient, other_patient
+    ):
+        """Two bookings, two references. A reply carrying the other patient's
+        reference would pass a "looks right" reading and fail here."""
+        first = self._book(patient, "s-facts-6")
+        second = self._book(
+            other_patient, "s-facts-7", "I would like a dermatology appointment"
+        )
+
+        session = fresh()
+        try:
+            runs = {
+                run.id: run.state.get("appointment_id")
+                for run in session.query(WorkflowRun).all()
+            }
+        finally:
+            session.close()
+
+        assert f"AC-{runs[first.run_id]:06d}" in first.reply
+        assert f"AC-{runs[second.run_id]:06d}" in second.reply
+
+
+class TestWithdrawal:
+    def test_withdrawing_mid_booking_cancels_the_run(self, patient):
+        turn(patient, BOOKING, "s-withdraw-1")
+        result = turn(patient, "actually never mind, forget it", "s-withdraw-1")
+
+        assert result.message_class is MessageClass.WITHDRAWAL
+        assert result.status == WorkflowStatus.CANCELLED.value
+
+    def test_the_reason_is_recorded(self, patient):
+        turn(patient, BOOKING, "s-withdraw-2")
+        turn(patient, "never mind", "s-withdraw-2")
+
+        session = fresh()
+        try:
+            run = session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+            assert run.cancellation_reason == "withdrawn"
+        finally:
+            session.close()
+
+    def test_nothing_is_booked(self, patient):
+        result = turn(patient, BOOKING, "s-withdraw-3")
+        turn(patient, "never mind", "s-withdraw-3")
+
+        session = fresh()
+        try:
+            assert appointments_for(session, result.run_id) == []
+        finally:
+            session.close()
+
+    def test_the_patient_has_no_active_run_afterwards(self, patient):
+        turn(patient, BOOKING, "s-withdraw-4")
+        turn(patient, "forget it", "s-withdraw-4")
+
+        session = fresh()
+        try:
+            profile_id = (
+                session.query(WorkflowRun)
+                .order_by(WorkflowRun.id.desc())
+                .first()
+                .patient_id
+            )
+            assert active_run(session, profile_id) is None
+        finally:
+            session.close()
+
+
+class TestOffTopicDuringARun:
+    """The PRD's named Layer-1 scenario, run through the real orchestrator."""
+
+    def test_state_and_request_text_are_byte_identical(self, patient):
+        turn(patient, BOOKING, "s-offtopic-1")
+
+        session = fresh()
+        try:
+            run = session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+            before = (run.status, run.request_text, json.dumps(run.state, sort_keys=True))
+        finally:
+            session.close()
+
+        turn(patient, "what's the weather like today?", "s-offtopic-1")
+
+        session = fresh()
+        try:
+            run = session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+            after = (run.status, run.request_text, json.dumps(run.state, sort_keys=True))
+        finally:
+            session.close()
+
+        assert before == after
+
+    def test_the_reply_is_a_scope_template(self, patient):
+        turn(patient, BOOKING, "s-offtopic-2")
+        result = turn(patient, "who won the football last night?", "s-offtopic-2")
+
+        assert result.message_class is MessageClass.OFF_TOPIC
+        assert "appointments" in result.reply.lower()
+
+    def test_no_escalation_is_created(self, patient):
+        """Off-topic is noise, not a human-review case. The staff queue stays
+        as clean of it as of panic-repeats."""
+        turn(patient, BOOKING, "s-offtopic-3")
+        turn(patient, "what's on television?", "s-offtopic-3")
+
+        session = fresh()
+        try:
+            assert session.query(Escalation).count() == 0
+        finally:
+            session.close()
+
+    def test_the_turn_is_still_traced(self, patient):
+        """No run spawned, but the turn is bracketed like any other."""
+        turn(patient, BOOKING, "s-offtopic-4")
+        result = turn(patient, "what's the weather?", "s-offtopic-4")
+
+        session = fresh()
+        try:
+            events = (
+                session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+            )
+            kinds = {event.event_type for event in events}
+            assert TraceEventType.INBOUND in kinds
+            assert TraceEventType.OUTBOUND in kinds
+        finally:
+            session.close()
+
+
+class TestOffTopicWithNoRun:
+    def test_no_run_is_spawned(self, patient):
+        turn(patient, "what's the weather like?", "s-noscope-1")
+
+        session = fresh()
+        try:
+            assert session.query(WorkflowRun).count() == 0
+        finally:
+            session.close()
+
+    def test_the_turn_is_traced_with_a_null_run_id(self, patient):
+        result = turn(patient, "tell me a joke", "s-noscope-2")
+
+        session = fresh()
+        try:
+            events = (
+                session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+            )
+            assert events
+            assert all(event.workflow_run_id is None for event in events)
+        finally:
+            session.close()
+
+
+class TestAmbiguousConfirmation:
+    def test_an_unreadable_answer_does_not_commit(self, patient):
+        """"no wait — yes, the Tuesday one" can decline or trigger a re-ask.
+        It can never book."""
+        result = turn(patient, BOOKING, "s-ambig-1")
+        turn(patient, "no wait - yes, the Tuesday one", "s-ambig-1")
+
+        session = fresh()
+        try:
+            assert appointments_for(session, result.run_id) == []
+        finally:
+            session.close()
+
+    def test_the_run_stays_in_pending_confirmation(self, patient):
+        """A stall never resolves implicitly in either direction."""
+        turn(patient, BOOKING, "s-ambig-2")
+        turn(patient, "hmm, maybe", "s-ambig-2")
+
+        session = fresh()
+        try:
+            run = session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+            assert run.status is WorkflowStatus.PENDING_CONFIRMATION
+            assert run.proposed_slot_id is not None
+        finally:
+            session.close()
+
+    def test_declining_clears_the_proposal(self, patient):
+        turn(patient, BOOKING, "s-ambig-3")
+        result = turn(patient, "no", "s-ambig-3")
+
+        assert result.status == WorkflowStatus.IN_PROGRESS.value
+        session = fresh()
+        try:
+            run = session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+            assert run.proposed_slot_id is None
+        finally:
+            session.close()
+
+    def test_a_confirmation_is_read_before_any_model_call(self, patient):
+        """The reader is code. Its verdict is a guard verdict, and it is
+        recorded whether it fired or passed."""
+        turn(patient, BOOKING, "s-ambig-4")
+        result = turn(patient, "yes", "s-ambig-4")
+
+        session = fresh()
+        try:
+            guards = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.GUARD_VERDICT
+            ]
+            assert any(g.payload["guard"] == "confirmation_reader" for g in guards)
+        finally:
+            session.close()
+
+
+class TestSlotSabotagedBetweenProposalAndConfirm:
+    """Every commit-time failure exits the same way: clear the proposal, return
+    to selection, offer alternatives.
+
+    A failure path may never leave a stale proposal confirmable. A proposal
+    pointing at a dead slot plus a patient pressing Confirm is a loop with no
+    exit, which is the boundedness invariant applied to the unhappy path.
+    """
+
+    def _sabotage(self, run_id: int) -> None:
+        """Somebody else takes the proposed slot before the patient answers."""
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            slot = session.get(AppointmentSlot, run.proposed_slot_id)
+            slot.status = SlotStatus.BOOKED
+            session.commit()
+        finally:
+            session.close()
+
+    def test_the_booking_does_not_happen(self, patient):
+        proposal = turn(patient, BOOKING, "s-sabotage-1")
+        self._sabotage(proposal.run_id)
+        turn(patient, "yes", "s-sabotage-1")
+
+        session = fresh()
+        try:
+            assert appointments_for(session, proposal.run_id) == []
+        finally:
+            session.close()
+
+    def test_the_proposal_is_cleared(self, patient):
+        proposal = turn(patient, BOOKING, "s-sabotage-2")
+        self._sabotage(proposal.run_id)
+        turn(patient, "yes", "s-sabotage-2")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, proposal.run_id)
+            assert run.proposed_slot_id is None
+            assert run.proposed_action is None
+        finally:
+            session.close()
+
+    def test_a_second_confirm_click_no_ops(self, patient):
+        """The double-click that would otherwise book against a dead proposal."""
+        proposal = turn(patient, BOOKING, "s-sabotage-3")
+        self._sabotage(proposal.run_id)
+        turn(patient, "yes", "s-sabotage-3")
+        turn(patient, "yes", "s-sabotage-3")
+
+        session = fresh()
+        try:
+            assert appointments_for(session, proposal.run_id) == []
+        finally:
+            session.close()
+
+    def test_the_run_returns_to_selection(self, patient):
+        proposal = turn(patient, BOOKING, "s-sabotage-4")
+        self._sabotage(proposal.run_id)
+        result = turn(patient, "yes", "s-sabotage-4")
+
+        assert result.status != WorkflowStatus.PENDING_CONFIRMATION.value
+        assert result.status != WorkflowStatus.COMPLETED.value
+
+
+class LoopingLlm(AgentCareLlm):
+    """A provider that always wants one more tool call.
+
+    Every call it makes succeeds, so no retry ladder is ever tripped. That is
+    precisely the loop the iteration budget exists for.
+    """
+
+    model: str = "looping-stub"
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        yield function_call_response("load_patient_context", {})
+
+
+class TestIterationBudget:
+    @pytest.fixture(autouse=True)
+    def _loop_forever(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: LoopingLlm()
+        )
+
+    def test_the_run_fails_rather_than_looping(self, patient, settings):
+        result = turn(patient, BOOKING, "s-budget-1")
+        assert result.budget_exhausted is True
+
+    def test_the_cap_is_the_configured_one(self, patient, settings):
+        """Exactly the cap — not "eventually", not "about"."""
+        result = turn(patient, BOOKING, "s-budget-2")
+
+        session = fresh()
+        try:
+            calls = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.TOOL_CALL
+            ]
+        finally:
+            session.close()
+        assert len(calls) == settings.max_tool_iterations
+
+    def test_the_exhaustion_is_recorded(self, patient):
+        result = turn(patient, BOOKING, "s-budget-3")
+
+        session = fresh()
+        try:
+            rejections = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.VALIDATION
+                and event.payload["what"] == "tool_iteration_budget"
+            ]
+            assert rejections
+        finally:
+            session.close()
+
+    def test_the_patient_gets_a_graceful_message(self, patient):
+        result = turn(patient, BOOKING, "s-budget-4")
+        assert "staff" in result.reply.lower()
+
+
+RESTART_SCRIPT = """
+import asyncio, os, sys
+sys.path.insert(0, {root!r})
+from app.db import SessionLocal
+from app.models import User
+from app.orchestrator import run_workflow
+
+session = SessionLocal()
+user = session.query(User).filter(User.email == {email!r}).one()
+session.close()
+result = asyncio.run(run_workflow(user, {message!r}, {session_id!r}))
+print("PID:" + str(os.getpid()))
+print("STATUS:" + str(result.status))
+print("REPLY:" + " ".join(result.reply.split())[:100])
+"""
+
+
+class TestTier1MemorySurvivesARestart:
+    """PRD story 12. A conversation continues after the process that started
+    it is gone — which is only provable in a second interpreter, because
+    imports, engines, and caches all survive anything smaller."""
+
+    def _run_in_new_process(self, message, session_id, tmp_root):
+        script = RESTART_SCRIPT.format(
+            root=str(os.getcwd()),
+            email=PATIENT_EMAIL,
+            message=message,
+            session_id=session_id,
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONUTF8": "1"},
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        return {
+            line.split(":", 1)[0]: line.split(":", 1)[1]
+            for line in completed.stdout.splitlines()
+            if ":" in line
+        }
+
+    def test_a_confirmation_lands_on_a_run_started_by_a_dead_process(
+        self, patient, tmp_root
+    ):
+        first = self._run_in_new_process(BOOKING, "s-restart-1", tmp_root)
+        assert first["STATUS"] == WorkflowStatus.PENDING_CONFIRMATION.value
+
+        second = self._run_in_new_process("yes", "s-restart-1", tmp_root)
+        assert second["PID"] != first["PID"], "not a real restart"
+        assert second["STATUS"] == WorkflowStatus.COMPLETED.value
+
+    def test_the_appointment_exists_afterwards(self, patient, tmp_root):
+        self._run_in_new_process(BOOKING, "s-restart-2", tmp_root)
+        self._run_in_new_process("yes", "s-restart-2", tmp_root)
+
+        session = fresh()
+        try:
+            run = session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+            assert appointments_for(session, run.id)
+        finally:
+            session.close()
+
+
+class TestTheRowWinsOverSessionState:
+    def test_a_second_conversation_sees_the_same_active_run(self, patient):
+        """Sessions are cheap and disposable; continuity lives in the database.
+        A patient opening a fresh conversation still has their live request."""
+        turn(patient, BOOKING, "s-authority-1")
+        result = turn(patient, "yes", "s-authority-2")
+
+        assert result.status == WorkflowStatus.COMPLETED.value
+
+    def test_the_clock_reaches_the_prompt(self, patient):
+        """A frozen clock has to reach the prompt as well as the tools, or a
+        golden run and the model disagree about what day it is."""
+        from app.agents import prompts
+
+        clock.freeze(clock.today())
+        assert clock.today().isoformat() in prompts.instruction("coordinator")

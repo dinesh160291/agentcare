@@ -1,0 +1,24 @@
+{
+  "name": "off-topic-during-run",
+  "pins": "The scope gate runs inside the message mapping, not only at run creation. An off-topic message that fell through to continuation would be appended to the run's stored request text and contaminate what routing and slot matching read later. Run state and request text must be byte-identical before and after.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a cardiology appointment next week",
+      "expect": {
+        "status": "pending_confirmation"
+      }
+    },
+    {
+      "message": "what's the weather like today?",
+      "expect": {
+        "status": "pending_confirmation",
+        "message_class": "off_topic",
+        "request_text_unchanged": true,
+        "run_state_unchanged": true,
+        "escalations": 0,
+        "appointments_created": 0
+      }
+    }
+  ]
+}

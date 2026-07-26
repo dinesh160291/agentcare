@@ -1,0 +1,26 @@
+{
+  "name": "booking-happy-path",
+  "pins": "The spine of the whole system: route, propose, confirm, commit, follow through. Nothing is booked until the patient says yes, and the receipt states facts re-read from the row rather than remembered from the write.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a cardiology appointment next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "plan": ["route", "book", "documents", "follow_up"],
+        "steps_run": ["route", "book"],
+        "reply_contains": ["Cardiology", "confirm"],
+        "appointments_created": 0
+      }
+    },
+    {
+      "message": "yes",
+      "expect": {
+        "status": "completed",
+        "steps_run": ["book", "documents", "follow_up"],
+        "reply_contains": ["Cardiology", "confirmed", "AC-"],
+        "appointments_created": 1
+      }
+    }
+  ]
+}

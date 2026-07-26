@@ -1,0 +1,23 @@
+{
+  "name": "withdrawal-mid-booking",
+  "pins": "Withdrawal is typed state, never chat prose. A withdrawal that lived only in the transcript would leave the row claiming the patient is still waiting to confirm - and staff would act on a request that no longer exists.",
+  "patient": "rohan.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a dermatology appointment next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "appointments_created": 0
+      }
+    },
+    {
+      "message": "actually never mind, forget it",
+      "expect": {
+        "status": "cancelled",
+        "message_class": "withdrawal",
+        "cancellation_reason": "withdrawn",
+        "appointments_created": 0
+      }
+    }
+  ]
+}

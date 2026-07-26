@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     # --- Agent limits (boundedness invariant) ----------------------------
     max_tool_iterations: int = 8
     max_replans_per_run: int = 1
+    # History windowing: persist everything, send the model the last N turns.
+    history_window_turns: int = 15
     max_confirmation_non_answers: int = 3
     max_reminder_attempts: int = 3
 

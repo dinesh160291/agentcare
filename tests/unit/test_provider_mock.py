@@ -3,11 +3,24 @@
 The point of these tests is rule 6: a reply that does not vary with its input,
 or that states a fact not present in the database, is a hardcoded final
 response. Both are checked here against real rows produced by the real tools.
+
+They drive the provider directly with hand-built ``LlmRequest`` objects, which
+is what ADK hands it. The toolset in each request is the real one that agent
+receives, because the mock dispatches on the toolset — a model may only call
+what it was given, and the understudy is held to the same rule.
+
+**What moved in Phase 4.** Booking used to be a tool the model could call; it
+is now code, triggered by a confirmation that code read. The properties that
+mattered did not move — the receipt is still re-read from the row, an ambiguous
+answer still never commits, a refused proposal still reports its refusal — but
+the seam they are checked at did. Their end-to-end versions are in
+``test_orchestrator.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import date, datetime
 
 import pytest
@@ -15,14 +28,33 @@ from google.adk.models import LlmRequest
 from google.genai import types
 
 from app import clock
-from app.models import User
 from app.providers.mock import MockLlm, reads_as_confirmation, reads_as_decline
 from app.tools.appointments import book_appointment
 from app.tools.availability import find_available_slots
 from app.tools.confirmations import render_confirmation
+from app.tools.dates import resolve_date
 from app.tools.departments import resolve_department
 
 MONDAY = date(2026, 8, 3)
+
+# The real toolsets, per agent. If ``Toolbelt`` renames a tool the mock's
+# dispatch changes with it and these fixtures must change too — which is the
+# point: a mock built against tools nobody has proves nothing.
+COORDINATOR_NEW = ("load_patient_context", "submit_plan")
+COORDINATOR_ACTIVE = ("load_patient_context", "classify_message")
+ROUTING = ("resolve_department", "list_departments", "submit_routing")
+APPOINTMENT = (
+    "resolve_date",
+    "find_available_slots",
+    "propose_appointment",
+    "render_confirmation",
+)
+DOCUMENTS = (
+    "list_patient_documents",
+    "diff_required_documents",
+    "record_missing_documents",
+)
+FOLLOWUP = ("list_patient_reminders", "list_open_tasks")
 
 
 @pytest.fixture(autouse=True)
@@ -35,24 +67,13 @@ def world(db):
     return db
 
 
-#: The tools a specialist agent holds. The request has to advertise them: a
-#: model may only call what it was given, and the mock is held to the same rule.
-SPECIALIST_TOOLS = (
-    "resolve_department",
-    "resolve_date",
-    "find_available_slots",
-    "book_appointment",
-    "render_confirmation",
-    "list_patient_documents",
-)
-
-
 def _tools_dict(names):
-    """Build a tools_dict of real FunctionTools with the given names."""
+    """A tools_dict of real FunctionTools with the given names."""
     from google.adk.tools import FunctionTool
 
     tools = {}
     for name in names:
+
         def stub(**kwargs) -> dict:
             """Stub tool used only to advertise availability."""
             return {}
@@ -62,10 +83,14 @@ def _tools_dict(names):
     return tools
 
 
-def build_request(
-    user_text: str, *tool_results: tuple[str, dict], tools=SPECIALIST_TOOLS
-) -> LlmRequest:
-    """An LlmRequest shaped the way ADK hands one to a provider."""
+def build_request(user_text, *tool_results, tools) -> LlmRequest:
+    """An LlmRequest shaped the way ADK hands one to a provider.
+
+    A dict ``user_text`` is serialised as a specialist's typed task, which is
+    the only thing a specialist ever receives.
+    """
+    if isinstance(user_text, dict):
+        user_text = json.dumps(user_text, sort_keys=True)
     contents = [types.Content(role="user", parts=[types.Part(text=user_text)])]
     for name, payload in tool_results:
         contents.append(
@@ -73,7 +98,9 @@ def build_request(
                 role="user",
                 parts=[
                     types.Part(
-                        function_response=types.FunctionResponse(name=name, response=payload)
+                        function_response=types.FunctionResponse(
+                            name=name, response=payload
+                        )
                     )
                 ],
             )
@@ -103,40 +130,323 @@ def calls(response) -> list[str]:
     ]
 
 
-class TestRealToolCalls:
-    def test_a_booking_request_calls_a_tool_rather_than_answering(self):
+def call_args(response) -> dict:
+    return response.content.parts[0].function_call.args
+
+
+class TestTheCoordinatorPlans:
+    def test_it_loads_patient_context_first(self):
+        """Tier-2 memory: a returning patient re-explains nothing, because the
+        first thing the Coordinator does is read the database."""
+        response = ask(
+            build_request("I need a cardiology appointment", tools=COORDINATOR_NEW)
+        )
+        assert calls(response) == ["load_patient_context"]
+
+    def test_a_booking_request_produces_a_booking_plan(self):
         """A mock that replied straight away would prove nothing works."""
-        response = ask(build_request("I need a cardiology appointment next week"))
-        assert calls(response) == ["resolve_department"]
+        response = ask(
+            build_request(
+                "I need a cardiology appointment next week",
+                ("load_patient_context", {"profile": {}}),
+                tools=COORDINATOR_NEW,
+            )
+        )
+        assert calls(response) == ["submit_plan"]
+        assert "book" in call_args(response)["steps"]
 
-    def test_it_progresses_through_the_tool_chain(self, db):
-        text = "I need a cardiology appointment next week"
-        department = resolve_department(db, text)
+    def test_a_two_intent_message_proposes_both(self):
+        """Intent extraction must not stop at whichever matched first."""
+        response = ask(
+            build_request(
+                "I need a cardiology appointment next week. I'll attach my ECG report.",
+                ("load_patient_context", {"profile": {}}),
+                tools=COORDINATOR_NEW,
+            )
+        )
+        steps = call_args(response)["steps"]
+        assert "book" in steps and "documents" in steps
 
-        response = ask(build_request(text, ("resolve_department", department)))
-        assert calls(response) == ["resolve_date"]
+    def test_a_document_only_message_does_not_ask_for_a_booking(self):
+        response = ask(
+            build_request(
+                "I want to upload my blood test report",
+                ("load_patient_context", {"profile": {}}),
+                tools=COORDINATOR_NEW,
+            )
+        )
+        steps = call_args(response)["steps"]
+        assert "documents" in steps and "book" not in steps
 
-    def test_a_confirmation_triggers_the_booking_tool(self, db):
-        slots = find_available_slots(db, department_id=1, limit=3)
-        response = ask(build_request("yes", ("find_available_slots", slots)))
-        assert calls(response) == ["book_appointment"]
-        assert response.content.parts[0].function_call.args["slot_id"] == (
-            slots["slots"][0]["slot_id"]
+    def test_the_acknowledgement_is_built_from_the_accepted_plan(self):
+        """From what code accepted, not from what the mock asked for."""
+        response = ask(
+            build_request(
+                "I need an appointment",
+                ("load_patient_context", {"profile": {}}),
+                ("submit_plan", {"accepted": True, "plan": ["route", "book"]}),
+                tools=COORDINATOR_NEW,
+            )
+        )
+        text = reply_text(response).lower()
+        assert "department" in text and "appointment" in text
+
+    def test_a_rejected_plan_is_not_reported_as_success(self):
+        response = ask(
+            build_request(
+                "I need an appointment",
+                ("load_patient_context", {"profile": {}}),
+                ("submit_plan", {"accepted": False, "problem": "Unknown plan step"}),
+                tools=COORDINATOR_NEW,
+            )
+        )
+        assert "Unknown plan step" in reply_text(response)
+
+
+class TestTheCoordinatorClassifies:
+    def _classify(self, text) -> dict:
+        response = ask(
+            build_request(
+                text,
+                ("load_patient_context", {"profile": {}}),
+                tools=COORDINATOR_ACTIVE,
+            )
+        )
+        assert calls(response) == ["classify_message"]
+        return call_args(response)
+
+    def test_a_withdrawal_outranks_everything(self):
+        assert self._classify("actually never mind, forget it")["message_class"] == (
+            "withdrawal"
         )
 
-    def test_after_booking_it_re_reads_the_row(self, db):
-        """It does not trust its own write: the confirmation is rendered from
-        the persisted row, not from the booking tool's return value."""
-        patient = db.query(User).filter(User.id == 2).one()
-        slot_id = find_available_slots(db, department_id=1, limit=1)["slots"][0]["slot_id"]
-        booked = book_appointment(db, patient, slot_id=slot_id, reason="x")
+    def test_an_off_topic_message_is_not_a_continuation(self):
+        """The ordering that stops an off-topic message being appended to the
+        run's request text and read later by routing."""
+        assert self._classify("what's the weather like?")["message_class"] == "off_topic"
 
-        response = ask(build_request("yes", ("book_appointment", booked)))
-        assert calls(response) == ["render_confirmation"]
+    def test_a_document_mention_is_complementary(self):
+        args = self._classify("also, here's my old ECG report")
+        assert args["message_class"] == "complementary"
+        assert args["incoming_steps"] == ["documents"]
+
+    def test_a_second_booking_request_is_conflicting(self):
+        assert (
+            self._classify("actually book a dermatology appointment instead")[
+                "message_class"
+            ]
+            == "conflicting"
+        )
+
+    def test_a_read_only_question_stays_a_side_question(self):
+        assert self._classify("what documents do I have on file?")["message_class"] == (
+            "side_question"
+        )
+
+    def test_an_ordinary_answer_is_a_continuation(self):
+        assert self._classify("Tuesday works for the appointment")["message_class"] == (
+            "continuation"
+        )
 
 
-class TestRepliesAreTemplatedFromPersistedResults:
-    def _confirmation_reply(self, db, patient_id: int, slot_index: int) -> tuple[str, dict]:
+class TestRoutingUsesRealResolution:
+    def test_it_reads_the_request_text_from_its_typed_task(self):
+        """Routing is the one specialist whose task carries the patient's
+        words, because classifying them is its job."""
+        response = ask(
+            build_request(
+                {"step": "route", "request_text": "my heart has been bothering me"},
+                tools=ROUTING,
+            )
+        )
+        assert calls(response) == ["resolve_department"]
+        assert "heart" in call_args(response)["text"]
+
+    def test_a_resolved_department_is_submitted_with_high_confidence(self, db):
+        resolved = resolve_department(db, "I need a cardiology appointment")
+        response = ask(
+            build_request(
+                {"step": "route", "request_text": "cardiology please"},
+                ("resolve_department", resolved),
+                tools=ROUTING,
+            )
+        )
+        args = call_args(response)
+        assert args["department_name"] == "Cardiology"
+        assert args["confidence"] == "high"
+
+    def test_ambiguity_hands_over_rather_than_guessing_confidently(self, db):
+        """The seeded ambiguous case exists to demonstrate this path. Guessing
+        confidently to avoid the handover is the failure being refused, and the
+        candidate submitted has to be one the resolver actually returned."""
+        ambiguous = resolve_department(db, "my kid has ear pain")
+        assert ambiguous["status"] == "ambiguous"
+
+        response = ask(
+            build_request(
+                {"step": "route", "request_text": "my kid has ear pain"},
+                ("resolve_department", ambiguous),
+                tools=ROUTING,
+            )
+        )
+        args = call_args(response)
+        assert args["confidence"] == "low"
+        assert args["department_name"] in [c["name"] for c in ambiguous["candidates"]]
+
+    def test_an_unsupported_request_submits_nothing(self, db):
+        unsupported = resolve_department(db, "qqqq zzzz")
+        response = ask(
+            build_request(
+                {"step": "route", "request_text": "qqqq zzzz"},
+                ("resolve_department", unsupported),
+                tools=ROUTING,
+            )
+        )
+        assert calls(response) == []
+        assert "department" in reply_text(response).lower()
+
+    def test_the_reply_names_the_department_code_accepted(self):
+        response = ask(
+            build_request(
+                {"step": "route"},
+                ("resolve_department", {"status": "resolved"}),
+                (
+                    "submit_routing",
+                    {
+                        "accepted": True,
+                        "department": {"id": 1, "name": "Cardiology"},
+                        "confidence": "high",
+                    },
+                ),
+                tools=ROUTING,
+            )
+        )
+        assert "Cardiology" in reply_text(response)
+
+    def test_a_rejected_department_is_not_reported_as_routed(self):
+        response = ask(
+            build_request(
+                {"step": "route"},
+                ("resolve_department", {"status": "resolved"}),
+                (
+                    "submit_routing",
+                    {
+                        "accepted": False,
+                        "problem": "'Cardiology Unit' is not a department",
+                    },
+                ),
+                tools=ROUTING,
+            )
+        )
+        assert "not a department" in reply_text(response)
+
+    def test_a_low_confidence_reply_promises_a_human(self):
+        response = ask(
+            build_request(
+                {"step": "route"},
+                ("resolve_department", {"status": "ambiguous"}),
+                (
+                    "submit_routing",
+                    {
+                        "accepted": True,
+                        "department": {"id": 5, "name": "Pediatrics"},
+                        "confidence": "low",
+                    },
+                ),
+                tools=ROUTING,
+            )
+        )
+        text = reply_text(response).lower()
+        assert "staff" in text and "pediatrics" in text
+
+
+class TestAppointmentProposesButNeverBooks:
+    def test_the_appointment_toolset_has_no_booking_tool(self):
+        """The commit is code's, triggered by a confirmation code read. The
+        model is never handed the tool that books."""
+        assert "book_appointment" not in APPOINTMENT
+
+    def test_it_resolves_dates_rather_than_working_them_out(self):
+        response = ask(
+            build_request(
+                {"step": "book", "request_text": "next week please", "department_id": 1},
+                tools=APPOINTMENT,
+            )
+        )
+        assert calls(response) == ["resolve_date"]
+
+    def test_it_searches_with_the_resolved_window(self):
+        window = resolve_date("next week", today=MONDAY)
+        response = ask(
+            build_request(
+                {"step": "book", "request_text": "next week", "department_id": 1},
+                ("resolve_date", window),
+                tools=APPOINTMENT,
+            )
+        )
+        assert calls(response) == ["find_available_slots"]
+        assert call_args(response)["start"] == window["start"]
+
+    def test_it_proposes_a_slot_from_the_availability_result(self, db):
+        window = resolve_date("next week", today=MONDAY)
+        slots = find_available_slots(db, department_id=1)
+        response = ask(
+            build_request(
+                {"step": "book", "department_id": 1},
+                ("resolve_date", window),
+                ("find_available_slots", slots),
+                tools=APPOINTMENT,
+            )
+        )
+        assert calls(response) == ["propose_appointment"]
+        assert call_args(response)["slot_id"] == slots["slots"][0]["slot_id"]
+
+    def test_the_offer_states_the_slot_code_accepted(self, db):
+        first = find_available_slots(db, department_id=1)["slots"][0]
+        response = ask(
+            build_request(
+                {"step": "book", "department_id": 1},
+                ("propose_appointment", {"accepted": True, "proposed": first}),
+                tools=APPOINTMENT,
+            )
+        )
+        text = reply_text(response)
+        assert first["doctor_name"] in text
+        assert first["start"][:10] in text
+        assert first["start"][11:16] in text
+
+    def test_an_empty_availability_result_is_not_dressed_up_as_success(self):
+        response = ask(
+            build_request(
+                {"step": "book", "department_id": 1},
+                ("resolve_date", {"resolved": False}),
+                ("find_available_slots", {"slots": [], "total_matching": 0}),
+                tools=APPOINTMENT,
+            )
+        )
+        assert calls(response) == []
+        assert "find" in reply_text(response).lower()
+
+    def test_a_refused_proposal_reports_the_refusal(self):
+        """The commit-time failure path in miniature: a proposal pointing at a
+        slot somebody else took must not be reported as an offer."""
+        response = ask(
+            build_request(
+                {"step": "book", "department_id": 1},
+                (
+                    "propose_appointment",
+                    {"accepted": False, "problem": "That time has just been taken."},
+                ),
+                tools=APPOINTMENT,
+            )
+        )
+        assert "just been taken" in reply_text(response)
+
+
+class TestTheReceiptIsReadBackFromTheRow:
+    def _receipt(self, db, patient_id: int, slot_index: int) -> tuple[str, dict]:
+        from app.models import User
+
         patient = db.query(User).filter(User.id == patient_id).one()
         slots = find_available_slots(db, department_id=1, limit=6)["slots"]
         booked = book_appointment(
@@ -144,19 +454,37 @@ class TestRepliesAreTemplatedFromPersistedResults:
         )
         appointment_id = booked["appointment"]["appointment_id"]
         rendered = render_confirmation(db, appointment_id)
-        response = ask(build_request("yes", ("render_confirmation", rendered)))
+        response = ask(
+            build_request(
+                {"step": "book", "appointment_id": appointment_id},
+                ("render_confirmation", rendered),
+                tools=APPOINTMENT,
+            )
+        )
         return reply_text(response), rendered["facts"]
 
+    def test_a_booked_appointment_triggers_a_re_read(self):
+        """The mock does not template from what the booking returned — it calls
+        the seam whose whole job is to re-read the row."""
+        response = ask(
+            build_request(
+                {"step": "book", "appointment_id": 1, "department_id": 1},
+                tools=APPOINTMENT,
+            )
+        )
+        assert calls(response) == ["render_confirmation"]
+        assert call_args(response)["appointment_id"] == 1
+
     def test_every_fact_in_the_reply_comes_from_the_row(self, db):
-        reply, facts = self._confirmation_reply(db, 2, 0)
+        reply, facts = self._receipt(db, 2, 0)
         for key in ("doctor_name", "weekday", "date", "time", "reference_code"):
             assert str(facts[key]) in reply, f"{key} missing from the reply"
 
     def test_different_bookings_produce_different_replies(self, db):
         """The rule-6 check: identical replies for different inputs is a
         hardcoded response wearing a template's clothes."""
-        first, first_facts = self._confirmation_reply(db, 2, 0)
-        second, second_facts = self._confirmation_reply(db, 3, 4)
+        first, first_facts = self._receipt(db, 2, 0)
+        second, second_facts = self._receipt(db, 3, 4)
 
         assert first != second
         assert first_facts["time"] != second_facts["time"] or (
@@ -168,99 +496,158 @@ class TestRepliesAreTemplatedFromPersistedResults:
         appear in its confirmation."""
         from app.models import Doctor
 
-        reply, facts = self._confirmation_reply(db, 2, 0)
+        reply, facts = self._receipt(db, 2, 0)
         others = [
-            d.name
-            for d in db.query(Doctor).all()
-            if d.name != facts["doctor_name"]
+            doctor.name
+            for doctor in db.query(Doctor).all()
+            if doctor.name != facts["doctor_name"]
         ]
         assert not [name for name in others if name in reply]
 
-    def test_slot_offers_are_built_from_the_availability_result(self, db):
-        text = "I need a cardiology appointment next week"
-        department = resolve_department(db, text)
-        slots = find_available_slots(db, department_id=1, limit=3)
 
-        reply = reply_text(
-            ask(
-                build_request(
-                    text,
-                    ("resolve_department", department),
-                    ("resolve_date", {"resolved": True, "start": "2026-08-10",
-                                      "end": "2026-08-16", "part_of_day": None}),
-                    ("find_available_slots", slots),
-                )
+class TestDocumentsAndFollowUp:
+    def test_documents_are_listed_before_anything_is_diffed(self):
+        response = ask(
+            build_request({"step": "documents", "department_id": 1}, tools=DOCUMENTS)
+        )
+        assert calls(response) == ["list_patient_documents"]
+
+    def test_the_diff_runs_once_a_department_is_known(self):
+        response = ask(
+            build_request(
+                {"step": "documents", "department_id": 1},
+                ("list_patient_documents", {"documents": []}),
+                tools=DOCUMENTS,
             )
         )
-        for slot in slots["slots"][:3]:
-            assert slot["doctor_name"] in reply
+        assert calls(response) == ["diff_required_documents"]
 
-    def test_an_empty_availability_result_is_not_dressed_up_as_success(self, db):
-        empty = {"slots": [], "total_matching": 0}
-        department = resolve_department(db, "cardiology")
-        reply = reply_text(
-            ask(
-                build_request(
-                    "cardiology next week",
-                    ("resolve_department", department),
-                    ("resolve_date", {"resolved": True, "start": "2027-01-01",
-                                      "end": "2027-01-07", "part_of_day": None}),
-                    ("find_available_slots", empty),
-                )
+    def test_the_diff_is_skipped_when_no_department_is_known(self):
+        """The required-documents rules are per department; diffing without one
+        would compare against nothing and report everything satisfied."""
+        response = ask(
+            build_request(
+                {"step": "documents"},
+                ("list_patient_documents", {"documents": []}),
+                tools=DOCUMENTS,
             )
         )
-        assert "could not find" in reply.lower()
+        assert calls(response) == []
 
-    def test_a_failed_booking_reports_the_failure_and_the_alternatives(self, db):
-        slots = find_available_slots(db, department_id=1, limit=3)["slots"]
-        failed = {
-            "ok": False,
-            "reason": "slot_taken",
-            "message": "That time was taken while you were confirming.",
-            "appointment": None,
-            "alternatives": slots,
-        }
-        reply = reply_text(ask(build_request("yes", ("book_appointment", failed))))
-        assert "taken" in reply.lower()
-        assert slots[0]["doctor_name"] in reply
-
-    def test_ambiguity_is_reported_with_the_real_candidates(self, db):
-        ambiguous = resolve_department(db, "my kid has ear pain")
-        reply = reply_text(
-            ask(build_request("my kid has ear pain", ("resolve_department", ambiguous)))
+    def test_missing_documents_are_recorded_not_just_mentioned(self):
+        """A missing-documents list that lives only in a reply is lost the
+        moment the conversation ends."""
+        response = ask(
+            build_request(
+                {"step": "documents", "department_id": 1},
+                ("list_patient_documents", {"documents": []}),
+                ("diff_required_documents", {"missing": ["ECG report"]}),
+                tools=DOCUMENTS,
+            )
         )
-        assert "Pediatrics" in reply and "ENT" in reply
+        assert calls(response) == ["record_missing_documents"]
+
+    def test_the_document_reply_counts_what_the_tool_returned(self):
+        documents = [
+            {"document_type": "ECG report", "status": "verified"},
+            {"document_type": "Blood test report", "status": "pending_verification"},
+        ]
+        response = ask(
+            build_request(
+                {"step": "documents"},
+                ("list_patient_documents", {"documents": documents}),
+                tools=DOCUMENTS,
+            )
+        )
+        text = reply_text(response)
+        assert "2 document" in text
+        assert "ECG report" in text
+
+    def test_follow_up_summarises_only_what_it_was_given(self):
+        response = ask(
+            build_request(
+                {"step": "follow_up"},
+                ("list_patient_reminders", {"reminders": []}),
+                ("list_open_tasks", {"tasks": []}),
+                tools=FOLLOWUP,
+            )
+        )
+        assert "nothing is outstanding" in reply_text(response).lower()
+
+    def test_follow_up_counts_what_the_tools_returned(self):
+        response = ask(
+            build_request(
+                {"step": "follow_up"},
+                (
+                    "list_patient_reminders",
+                    {"reminders": [{"scheduled_at": "2026-08-09T09:00:00"}]},
+                ),
+                ("list_open_tasks", {"tasks": [{"task_type": "missing_documents"}]}),
+                tools=FOLLOWUP,
+            )
+        )
+        text = reply_text(response)
+        assert "1 reminder" in text and "2026-08-09" in text
+        assert "missing documents" in text
 
 
-class TestConfirmationReading:
+class TestConfirmationReadingIsDelegated:
+    """The mock is not permitted to be cleverer than the real reader."""
+
     @pytest.mark.parametrize("text", ["yes", "Yes", " confirm ", "book it", "OK"])
     def test_exact_tokens_confirm(self, text):
         assert reads_as_confirmation(text) is True
 
-    @pytest.mark.parametrize("text", ["no wait — yes, the Tuesday one", "maybe", "yes but later"])
+    @pytest.mark.parametrize(
+        "text", ["no wait — yes, the Tuesday one", "maybe", "yes but later"]
+    )
     def test_ambiguous_text_never_confirms(self, text):
-        """The mock is not permitted to be cleverer than the deterministic
-        reader it stands in for."""
         assert reads_as_confirmation(text) is False
 
     @pytest.mark.parametrize("text", ["no", "cancel", "Decline"])
     def test_declines_are_read(self, text):
         assert reads_as_decline(text) is True
 
-    def test_an_ambiguous_reply_does_not_reach_the_booking_tool(self, db):
-        slots = find_available_slots(db, department_id=1, limit=3)
-        response = ask(
-            build_request("no wait — yes, the Tuesday one", ("find_available_slots", slots))
+    def test_it_uses_the_workflow_token_set_rather_than_its_own(self):
+        """Two copies of a token list are two lists that drift apart."""
+        from app.workflow.confirmation import (
+            CONFIRM_TOKENS,
+            ConfirmationAnswer,
+            read_confirmation,
         )
-        assert "book_appointment" not in calls(response)
+
+        for token in CONFIRM_TOKENS:
+            assert reads_as_confirmation(token) is True
+            assert read_confirmation(token) is ConfirmationAnswer.CONFIRM
 
 
 class TestScopeReply:
     def test_unrecognised_input_gets_the_scope_template(self):
-        reply = reply_text(ask(build_request("what's the weather like?")))
-        assert "appointments" in reply.lower()
+        response = ask(
+            build_request(
+                "what's the weather like?",
+                ("load_patient_context", {"profile": {}}),
+                tools=COORDINATOR_NEW,
+            )
+        )
+        assert calls(response) == []
+        assert "appointments" in reply_text(response).lower()
+
+    def test_off_topic_input_submits_no_plan(self):
+        """No plan submitted means no run created and no tools fired.
+        Off-topic is noise, not a human-review case."""
+        response = ask(
+            build_request(
+                "tell me a joke",
+                ("load_patient_context", {"profile": {}}),
+                tools=COORDINATOR_NEW,
+            )
+        )
+        assert "submit_plan" not in calls(response)
 
     def test_the_scope_reply_carries_no_clinical_language(self):
-        reply = reply_text(ask(build_request("what's the weather like?"))).lower()
-        for word in ("diagnos", "prescrib", "dosage", "symptom"):
-            assert word not in reply
+        from app.providers.mock import SCOPE_TEXT
+
+        lowered = SCOPE_TEXT.lower()
+        for word in ("diagnos", "prescrib", "dosage", "symptom", "treatment"):
+            assert word not in lowered
