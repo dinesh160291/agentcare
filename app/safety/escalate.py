@@ -1,0 +1,168 @@
+"""Turning a safety verdict into state a human owns.
+
+Three rules live here, and each one exists because the obvious implementation
+gets it wrong.
+
+**The run is born escalated when there is nothing else to key to.** An
+emergency on a session's opening message has no workflow run — and every
+``Escalation`` points at one, with a non-nullable foreign key, so that the
+staff queue and the trace timeline have no orphan special-case. Rather than
+making the column nullable for one path, the run is created directly in
+``escalated``. This is the only door into that initial state, and it opens for
+safety alone.
+
+**Repeats attach; they never multiply.** A frightened patient types "chest
+pain" five times. The naive path creates five runs, because the first one is
+already terminal and so no longer the *active* run — five queue items, five
+things for a human to reconcile, for one person in trouble. So before creating
+anything, this module looks for the escalated run this session already
+produced, and attaches to it. Five triggers become one queue item with an
+occurrence count of five, each trigger separately audited.
+
+**A withdrawal cannot close it.** That is enforced by the state machine —
+``escalated`` is terminal for automation — but the reason belongs here: the
+patient saying "actually forget it" after a chest-pain message is exactly the
+moment the system must *not* be helpful.
+"""
+
+from __future__ import annotations
+
+from sqlalchemy.orm import Session
+
+from app.audit import write_audit
+from app.models import (
+    Escalation,
+    EscalationKind,
+    TraceAuthor,
+    User,
+    WorkflowRun,
+    WorkflowStatus,
+)
+from app.safety.screen import SafetyCategory, SafetyVerdict
+from app.tools.tasks import OPEN_ESCALATION_STATUSES, create_escalation
+from app.trace import TraceWriter
+from app.workflow.state_machine import create_run, transition
+
+#: Code-authored, identical in mock and live. It directs the patient to urgent
+#: care and says nothing about what may be wrong with them: naming a cause
+#: would be the clinical claim this whole layer exists to prevent.
+EMERGENCY_REPLY = (
+    "This needs urgent help rather than an appointment booking. Please call your "
+    "local emergency number now, or go to your nearest emergency department. "
+    "I've flagged this to our staff straight away."
+)
+
+CLINICAL_REPLY = (
+    "I'm sorry — I can't help with that one. I handle hospital administration "
+    "only: appointments, documents, reminders, and follow-ups. I've passed this "
+    "to our staff so that someone who can answer it will get back to you."
+)
+
+
+def reply_for(verdict: SafetyVerdict) -> str:
+    """The template that answers a fired verdict."""
+    if verdict.category is SafetyCategory.EMERGENCY:
+        return EMERGENCY_REPLY
+    return CLINICAL_REPLY
+
+
+def _open_escalated_run(
+    session: Session, *, patient_id: int, session_id: str | None
+) -> WorkflowRun | None:
+    """This session's already-escalated run, if it still has an open escalation.
+
+    Scoped to the session because a new conversation is a new request. Scoped
+    to *open* escalations because one a human has resolved should not silently
+    collect a sixth trigger under a closed record.
+    """
+    return (
+        session.query(WorkflowRun)
+        .join(Escalation, Escalation.workflow_run_id == WorkflowRun.id)
+        .filter(
+            WorkflowRun.patient_id == patient_id,
+            WorkflowRun.session_id == session_id,
+            WorkflowRun.status == WorkflowStatus.ESCALATED,
+            Escalation.status.in_(OPEN_ESCALATION_STATUSES),
+        )
+        .order_by(WorkflowRun.id.desc())
+        .first()
+    )
+
+
+def escalate(
+    session: Session,
+    *,
+    verdict: SafetyVerdict,
+    user: User,
+    patient_id: int,
+    message: str,
+    writer: TraceWriter,
+    session_id: str,
+    run: WorkflowRun | None,
+) -> tuple[WorkflowRun, str, TraceAuthor]:
+    """Put a run in front of a human and keep it there.
+
+    Returns the run the escalation is keyed to, the reply, and its author.
+    Does not commit — the transition, the escalation row, the audit rows, and
+    the trace rows all belong to the turn's one transaction.
+    """
+    category = verdict.category or SafetyCategory.CLINICAL_ADVICE
+    reason = (
+        f"Safety screen ({verdict.source}) matched {verdict.rule!r}: "
+        f"{category.value.replace('_', ' ')}."
+    )
+
+    if run is None:
+        run = _open_escalated_run(
+            session, patient_id=patient_id, session_id=session_id
+        )
+
+    if run is None:
+        # Nothing to key to. The one case where a run is born terminal.
+        run = create_run(
+            session,
+            patient_id=patient_id,
+            status=WorkflowStatus.ESCALATED,
+            trigger=f"safety_screen_{category.value}",
+            writer=writer,
+            request_text=message,
+            plan=[],
+            session_id=session_id,
+            actor=user,
+        )
+    elif run.status is not WorkflowStatus.ESCALATED:
+        writer.bind_run(run.id)
+        transition(
+            session,
+            run,
+            to=WorkflowStatus.ESCALATED,
+            trigger=f"safety_screen_{category.value}",
+            writer=writer,
+            actor=user,
+            detail=verdict.as_trace_detail(),
+        )
+    else:
+        # Already escalated in this session: the repeat attaches below.
+        writer.bind_run(run.id)
+
+    create_escalation(
+        session,
+        workflow_run_id=run.id,
+        kind=EscalationKind.SAFETY,
+        reason=reason,
+        message=message,
+        actor=user,
+    )
+    write_audit(
+        session,
+        action="safety_screen_fired",
+        entity_type="workflow_run",
+        entity_id=run.id,
+        actor=user,
+        metadata=verdict.as_trace_detail(),
+    )
+
+    return run, reply_for(verdict), TraceAuthor.GUARD
+
+
+__all__ = ["CLINICAL_REPLY", "EMERGENCY_REPLY", "escalate", "reply_for"]

@@ -66,6 +66,30 @@ SIDE_QUESTION_CUES = (
 )
 ADMIN_CUES = BOOKING_CUES + DOCUMENT_CUES + ROUTING_CUES + FOLLOWUP_CUES
 
+#: The mock's safety judgement, and it is deliberately *not* a copy of the
+#: deterministic phrase list. A second opinion that repeats the first is a
+#: check that cannot fail, and the whole point of the LLM pass is the wording
+#: the phrase list cannot hold: "a lot of pressure across my chest since this
+#: morning" contains no listed phrase and is the same emergency. So the mock
+#: reasons by co-occurrence instead — a body term anywhere near a severity
+#: term — which catches a different set and can disagree with layer one.
+BODY_TERMS = (
+    "chest", "breath", "breathing", "heart", "bleed", "bleeding", "conscious",
+    "swallow", "pulse",
+)
+SEVERITY_TERMS = (
+    "pain", "pressure", "tight", "severe", "struggling", "can't", "cannot",
+    "heavy", "sudden", "crushing", "worse", "agony",
+)
+ADVICE_TERMS = (
+    "should i", "what should", "is it ok to", "is it safe to", "recommend",
+    "advise", "what do i do about",
+)
+CLINICAL_TERMS = (
+    "take", "medicine", "medication", "tablet", "tablets", "dose", "pill",
+    "pills", "treat", "treatment", "antibiotic", "antibiotics",
+)
+
 #: The reply used when nothing in the message is recognisable as hospital
 #: administration. It is a *guard's* output, carries no facts about anybody,
 #: and is identical in mock and live mode by design — the same words the scope
@@ -127,6 +151,8 @@ class MockLlm(AgentCareLlm):
         text = latest_user_text(llm_request)
         task = parse_task(text)
 
+        if "submit_safety_verdict" in available:
+            return self._safety(llm_request, text)
         if "submit_plan" in available or "classify_message" in available:
             return self._coordinate(llm_request, available, done, text)
         if "submit_routing" in available:
@@ -138,6 +164,45 @@ class MockLlm(AgentCareLlm):
         if "list_open_tasks" in available:
             return self._followup(llm_request, done)
         return text_response(SCOPE_TEXT)
+
+    # --- Safety screen (the guardrail's second opinion) --------------------
+
+    def _safety(self, llm_request: LlmRequest, text: str) -> LlmResponse:
+        submitted = latest_tool_result(llm_request, "submit_safety_verdict")
+        if submitted is not None:
+            return self._from_safety(submitted.payload)
+
+        category, rationale = self._safety_class(text)
+        return function_call_response(
+            "submit_safety_verdict", {"category": category, "rationale": rationale}
+        )
+
+    @staticmethod
+    def _safety_class(text: str) -> tuple[str, str]:
+        """Judge by co-occurrence, not by phrase.
+
+        Emergency is decided before clinical advice for the same reason the
+        deterministic screen does it: a message can be both, and only one of
+        the two replies is the one that has to reach the patient.
+        """
+        lowered = (text or "").lower()
+        body = [term for term in BODY_TERMS if term in lowered]
+        severity = [term for term in SEVERITY_TERMS if term in lowered]
+        if body and severity:
+            return "emergency", f"{body[0]} mentioned with {severity[0]}"
+
+        advice = [term for term in ADVICE_TERMS if term in lowered]
+        clinical = [term for term in CLINICAL_TERMS if term in lowered]
+        if advice and clinical:
+            return "clinical_advice", f"asks {advice[0]} about {clinical[0]}"
+
+        return "safe", "nothing clinical in this message"
+
+    @staticmethod
+    def _from_safety(payload: dict[str, Any]) -> LlmResponse:
+        if not payload.get("accepted"):
+            return text_response(str(payload.get("problem", "Screening again.")))
+        return text_response(f"Screened as {payload.get('category')}.")
 
     # --- Coordinator ------------------------------------------------------
 

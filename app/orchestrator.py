@@ -30,16 +30,15 @@ import json
 import uuid
 from dataclasses import dataclass, field
 
-from google.adk.runners import Runner
-from google.genai import types
 from sqlalchemy.orm import Session
 
 from app import clock
 from app.agents import SPECIALIST_FOR_STEP, Toolbelt, TurnCallbacks, coordinator, memory
+from app.agents.base import run_agent
 from app.audit import write_audit
 from app.config import get_settings
 from app.db import SessionLocal
-from app.errors import BudgetExceeded, ProviderError
+from app.errors import BudgetExceeded
 from app.models import (
     EscalationKind,
     MessageClass,
@@ -52,6 +51,7 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
+from app.safety import SafetyVerdict, escalate, keyword_screen, llm_screen
 from app.tools import book_appointment, create_escalation
 from app.trace import TraceWriter
 from app.workflow.confirmation import ConfirmationAnswer, read_confirmation
@@ -157,49 +157,99 @@ def _task_for(step: PlanStep, run: WorkflowRun, *, message: str, extra: dict) ->
     return json.dumps({k: v for k, v in task.items() if v is not None}, sort_keys=True)
 
 
-async def _run_agent(
-    agent,
+async def _screen(
+    message: str,
     *,
-    task_text: str,
     callbacks: TurnCallbacks,
-    session_service,
-    session_id: str,
+    writer: TraceWriter,
     user_id: str,
-    create: bool,
-) -> str:
-    """Drive one agent for one task and return whatever text it produced.
+    provider: str | None,
+) -> SafetyVerdict:
+    """Both safety layers, in the one order they are allowed to run in.
 
-    A provider failure is paired into the trace before it propagates: a request
-    with no terminal partner is supposed to mean the process died mid-call, and
-    that diagnosis is only worth anything if nothing else can produce it.
+    The deterministic screen goes first and always. Only if it passes does the
+    model get asked — so nothing the model says can unblock a message the
+    phrase list already stopped, which is what makes prompt injection a
+    non-event here rather than a debate.
+
+    The second layer is skipped for an answer the confirmation reader can read
+    outright. "yes" and "no" are the two most common messages this system
+    receives and neither can be a subtle emergency; spending a model call on
+    them would be a cost with no possible finding. The skip is *recorded* —
+    "the screen passed" and "the screen did not run" have to stay different
+    facts in the trace.
     """
-    if create:
-        await session_service.create_session(
-            app_name=memory.APP_NAME, user_id=user_id, session_id=session_id
-        )
-
-    callbacks.start_agent()
-    runner = Runner(
-        agent=agent, app_name=memory.APP_NAME, session_service=session_service
+    verdict = keyword_screen(message)
+    writer.guard_verdict(
+        "safety_keyword_screen",
+        passed=not verdict.fired,
+        detail=verdict.as_trace_detail(),
     )
-    message = types.Content(role="user", parts=[types.Part(text=task_text)])
+    if verdict.fired:
+        return verdict
 
-    reply = ""
-    try:
-        async for event in runner.run_async(
-            user_id=user_id, session_id=session_id, new_message=message
-        ):
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if part.text:
-                        reply += part.text
-    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
-        callbacks.fail_pending_request(
-            f"{type(exc).__name__}: {exc}",
-            kind="rate_limit" if isinstance(exc, ProviderError) else "error",
+    if read_confirmation(message) is not ConfirmationAnswer.UNREAD:
+        writer.guard_verdict(
+            "safety_llm_screen",
+            passed=True,
+            detail={"skipped": "exact_token_answer", "source": "llm"},
         )
-        raise
-    return reply.strip()
+        return verdict
+
+    verdict = await llm_screen(
+        message,
+        callbacks=callbacks,
+        writer=writer,
+        user_id=user_id,
+        provider=provider,
+    )
+    writer.guard_verdict(
+        "safety_llm_screen",
+        passed=not verdict.fired,
+        detail=verdict.as_trace_detail(),
+    )
+    return verdict
+
+
+def _budget_failure(
+    session: Session,
+    *,
+    run: WorkflowRun | None,
+    writer: TraceWriter,
+    user: User,
+    base: dict,
+    stage: str,
+) -> TurnResult:
+    """A budget blew. Report it — never pass the stub's last words off as an answer.
+
+    It can blow before a run exists (in the safety screen, or in the
+    Coordinator on a first message), and there is then nothing to transition to
+    ``failed``. The turn still has to say so.
+    """
+    if run is None:
+        write_audit(
+            session,
+            action="turn_budget_exhausted",
+            entity_type="workflow_run",
+            actor=user,
+            metadata={"stage": stage},
+        )
+        return TurnResult(
+            reply=FAILED_REPLY,
+            author=TraceAuthor.TEMPLATE,
+            budget_exhausted=True,
+            **base,
+        )
+    return _fail_run(
+        session,
+        run=run,
+        writer=writer,
+        user=user,
+        reason="tool_iteration_budget",
+        base=base,
+        plan=list(run.plan or []),
+        steps_run=[],
+    )
 
 
 # --- the turn ------------------------------------------------------------
@@ -291,6 +341,37 @@ async def _turn(
     )
     base = dict(turn_id=writer.turn_id, session_id=conversation_id)
 
+    # --- 0. the safety screen: first, always, whatever the run's state ---
+    verdict = await _screen(
+        message,
+        callbacks=callbacks,
+        writer=writer,
+        user_id=str(user.id),
+        provider=provider,
+    )
+    if callbacks.budget_exhausted:
+        return _budget_failure(
+            session, run=run, writer=writer, user=user, base=base, stage="safety_screen"
+        )
+    if verdict.fired:
+        escalated, reply, author = escalate(
+            session,
+            verdict=verdict,
+            user=user,
+            patient_id=profile.id,
+            message=message,
+            writer=writer,
+            session_id=conversation_id,
+            run=run,
+        )
+        return TurnResult(
+            reply=reply,
+            author=author,
+            run_id=escalated.id,
+            status=escalated.status.value,
+            **base,
+        )
+
     # --- 1. a pending confirmation is read in code, before any model call ---
     if run is not None and run.status is WorkflowStatus.PENDING_CONFIRMATION:
         answer = read_confirmation(message)
@@ -338,7 +419,7 @@ async def _turn(
     existing = await conversation.get_session(
         app_name=memory.APP_NAME, user_id=str(user.id), session_id=conversation_id
     )
-    coordinator_reply = await _run_agent(
+    coordinator_reply = await run_agent(
         coordinator.build_agent(belt, callbacks, provider=provider),
         task_text=message,
         callbacks=callbacks,
@@ -348,33 +429,9 @@ async def _turn(
         create=existing is None,
     )
 
-    # The budget can blow here, before a run exists. There is then nothing to
-    # transition to `failed`, but the turn still has to report the exhaustion
-    # rather than passing the stub's last words off as an answer.
     if callbacks.budget_exhausted:
-        if run is None:
-            write_audit(
-                session,
-                action="turn_budget_exhausted",
-                entity_type="workflow_run",
-                actor=user,
-                metadata={"stage": "coordinator"},
-            )
-            return TurnResult(
-                reply=FAILED_REPLY,
-                author=TraceAuthor.TEMPLATE,
-                budget_exhausted=True,
-                **base,
-            )
-        return _fail_run(
-            session,
-            run=run,
-            writer=writer,
-            user=user,
-            reason="tool_iteration_budget",
-            base=base,
-            plan=list(run.plan or []),
-            steps_run=[],
+        return _budget_failure(
+            session, run=run, writer=writer, user=user, base=base, stage="coordinator"
         )
 
     if run is not None:
@@ -393,17 +450,32 @@ async def _turn(
             base=base,
         )
 
+    # --- 3. the scope gate ------------------------------------------------
+    # The Coordinator classifies three ways: supported intent, unsafe, or
+    # off-topic. Safety has already had its turn, so a message that produced no
+    # plan is off-topic — and only a supported intent may spawn a workflow.
     plan = belt.proposals.plan
+    writer.guard_verdict(
+        "scope_gate",
+        passed=plan is not None,
+        detail={"steps": [step.value for step in plan] if plan else []},
+    )
     if plan is None:
-        # The Coordinator produced no plan. Nothing is spawned on a guess: no
-        # run, no tools fired, no escalation — an unreadable request is noise
-        # until the patient says more.
-        writer.guard_verdict("plan_produced", passed=False, detail={"message": message})
-        return TurnResult(
-            reply=coordinator_reply or NO_PLAN_REPLY,
-            author=TraceAuthor.LLM if coordinator_reply else TraceAuthor.TEMPLATE,
-            **base,
+        # No run, no tools fired, no escalation. Off-topic is noise, not a
+        # human-review case, and a queue full of noise is a queue nobody reads.
+        #
+        # The refusal is a **template**, not the model's words. It must read
+        # identically under mock and under a live provider, and it must state
+        # nothing about the patient — which is exactly what freeform prose
+        # cannot promise.
+        write_audit(
+            session,
+            action="scope_gate_refused",
+            entity_type="workflow_run",
+            actor=user,
+            metadata={"reason": "no supported administrative intent"},
         )
+        return TurnResult(reply=SCOPE_REPLY, author=TraceAuthor.GUARD, **base)
 
     run = create_run(
         session,
@@ -472,6 +544,16 @@ async def _continue_run(
         message=message,
         incoming_steps=belt.proposals.incoming_steps,
         actor=user,
+    )
+
+    # The scope gate runs inside the mapping too, not only at run creation.
+    # An off-topic message that fell through to continuation would be appended
+    # to the run's stored request text, contaminating what routing and slot
+    # matching read later.
+    writer.guard_verdict(
+        "scope_gate",
+        passed=outcome.consequence is not Consequence.SCOPE_REPLY,
+        detail={"class": outcome.message_class.value},
     )
 
     if outcome.consequence is Consequence.WITHDRAW:
@@ -596,7 +678,7 @@ async def _execute_plan(
 
         specialist = SPECIALIST_FOR_STEP[step.value]
         task = _task_for(step, run, message=message, extra={})
-        step_reply = await _run_agent(
+        step_reply = await run_agent(
             specialist.build_agent(belt, callbacks, provider=provider),
             task_text=task,
             callbacks=callbacks,
@@ -693,10 +775,14 @@ def _settle_step(
             # guess dressed up as one.
             create_escalation(
                 session,
-                run=run,
+                workflow_run_id=run.id,
                 kind=EscalationKind.LOW_CONFIDENCE_ROUTING,
+                reason=(
+                    "Routing was ambiguous; best candidate "
+                    f"{proposals.department_name!r}. A person should decide."
+                ),
                 message=run.request_text or "",
-                details={"proposed_department": proposals.department_name},
+                actor=user,
             )
             transition(
                 session,

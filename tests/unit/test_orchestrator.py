@@ -23,6 +23,7 @@ import json
 import os
 import subprocess
 import sys
+from collections import Counter
 from typing import AsyncGenerator
 
 import pytest
@@ -36,16 +37,25 @@ from app.models import (
     AppointmentStatus,
     AuditEvent,
     Escalation,
+    EscalationKind,
+    EscalationStatus,
     MessageClass,
     SlotStatus,
+    TraceAuthor,
     TraceEvent,
     TraceEventType,
     User,
     WorkflowRun,
     WorkflowStatus,
 )
-from app.orchestrator import active_run, run_workflow
-from app.providers.base import AgentCareLlm, function_call_response
+from app.orchestrator import SCOPE_REPLY, active_run, run_workflow
+from app.providers.base import (
+    AgentCareLlm,
+    available_tool_names,
+    called_tools,
+    function_call_response,
+    text_response,
+)
 from app.trace import assert_well_formed
 
 PATIENT_EMAIL = "asha.patient@example.invalid"
@@ -91,6 +101,20 @@ def appointments_for(session, run_id: int) -> list[Appointment]:
 
 #: The seed's one pre-existing appointment.
 SEEDED_APPOINTMENT_ID = 1
+
+
+def _guard(session, turn_id: str, name: str) -> dict:
+    """The payload of one named guard verdict in a turn."""
+    for event in (
+        session.query(TraceEvent)
+        .filter(TraceEvent.turn_id == turn_id)
+        .order_by(TraceEvent.seq)
+        .all()
+    ):
+        if event.event_type is TraceEventType.GUARD_VERDICT:
+            if (event.payload or {}).get("guard") == name:
+                return event.payload
+    raise AssertionError(f"no {name!r} guard verdict in turn {turn_id}")
 
 
 class TestBookingHappyPath:
@@ -387,6 +411,93 @@ class TestOffTopicWithNoRun:
         finally:
             session.close()
 
+    def test_the_refusal_is_a_template_and_says_so(self, patient):
+        """The scope reply is code-authored. It has to read identically under
+        mock and live, and the timeline must not imply a model wrote it."""
+        result = turn(patient, "tell me a joke", "s-noscope-3")
+
+        assert result.reply == SCOPE_REPLY
+        assert result.author is TraceAuthor.GUARD
+
+    def test_the_gate_records_a_verdict(self, patient):
+        result = turn(patient, "who won the football last night?", "s-noscope-4")
+
+        session = fresh()
+        try:
+            gate = _guard(session, result.turn_id, "scope_gate")
+        finally:
+            session.close()
+        assert gate["passed"] is False
+
+    def test_the_gate_records_its_passes_too(self, patient):
+        """A guard that logs only its firings is half an instrument: the
+        expensive question is always "why did it not fire?"."""
+        result = turn(patient, BOOKING, "s-noscope-5")
+
+        session = fresh()
+        try:
+            gate = _guard(session, result.turn_id, "scope_gate")
+        finally:
+            session.close()
+        assert gate["passed"] is True
+        assert "book" in gate["detail"]["steps"]
+
+    def test_an_off_topic_message_is_audited(self, patient):
+        """Off-topic spawns no run, but the turn still happened."""
+        turn(patient, "what's the weather like?", "s-noscope-6")
+
+        session = fresh()
+        try:
+            assert (
+                session.query(AuditEvent)
+                .filter(AuditEvent.action == "scope_gate_refused")
+                .count()
+                == 1
+            )
+        finally:
+            session.close()
+
+
+class TestLowConfidenceRouting:
+    """The second staff-approval trigger: routing that a human should decide.
+
+    The seed carries an ambiguous case on purpose ("my kid has ear pain" —
+    Pediatrics or ENT). Guessing confidently to avoid the handover is the
+    failure this path exists to refuse.
+    """
+
+    AMBIGUOUS = "book an appointment, my kid has ear pain"
+
+    def test_the_run_pauses_for_a_human(self, patient):
+        result = turn(patient, self.AMBIGUOUS, "s-lowconf-1")
+
+        assert result.status == WorkflowStatus.PENDING_REVIEW.value
+
+    def test_an_escalation_is_opened_for_the_run(self, patient):
+        result = turn(patient, self.AMBIGUOUS, "s-lowconf-2")
+
+        session = fresh()
+        try:
+            escalations = (
+                session.query(Escalation)
+                .filter(Escalation.workflow_run_id == result.run_id)
+                .all()
+            )
+            assert len(escalations) == 1
+            assert escalations[0].kind is EscalationKind.LOW_CONFIDENCE_ROUTING
+            assert escalations[0].status is EscalationStatus.OPEN
+        finally:
+            session.close()
+
+    def test_nothing_is_booked_while_review_is_pending(self, patient):
+        result = turn(patient, self.AMBIGUOUS, "s-lowconf-3")
+
+        session = fresh()
+        try:
+            assert appointments_for(session, result.run_id) == []
+        finally:
+            session.close()
+
 
 class TestAmbiguousConfirmation:
     def test_an_unreadable_answer_does_not_commit(self, patient):
@@ -517,6 +628,11 @@ class LoopingLlm(AgentCareLlm):
 
     Every call it makes succeeds, so no retry ladder is ever tripped. That is
     precisely the loop the iteration budget exists for.
+
+    It answers the safety screen honestly and loops everywhere else. The
+    behaviour under test is a budget blowing *inside the workflow* — a stub
+    that stalled the guard instead would stop the turn one layer earlier and
+    quietly test something else.
     """
 
     model: str = "looping-stub"
@@ -524,6 +640,15 @@ class LoopingLlm(AgentCareLlm):
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
+        if "submit_safety_verdict" in available_tool_names(llm_request):
+            if "submit_safety_verdict" in called_tools(llm_request):
+                yield text_response("screened")
+            else:
+                yield function_call_response(
+                    "submit_safety_verdict",
+                    {"category": "safe", "rationale": "stub: nothing clinical"},
+                )
+            return
         yield function_call_response("load_patient_context", {})
 
 
@@ -539,7 +664,14 @@ class TestIterationBudget:
         assert result.budget_exhausted is True
 
     def test_the_cap_is_the_configured_one(self, patient, settings):
-        """Exactly the cap — not "eventually", not "about"."""
+        """Exactly the cap — not "eventually", not "about".
+
+        Counted per agent, because that is what the budget is: a booking turn
+        legitimately spends calls in the Coordinator, in Routing, and in
+        Appointment, and one shared counter would put an ordinary request
+        within a call of its own budget. So the looping agent must stop at
+        exactly the cap while the guard that ran before it spends exactly one.
+        """
         result = turn(patient, BOOKING, "s-budget-2")
 
         session = fresh()
@@ -553,7 +685,10 @@ class TestIterationBudget:
             ]
         finally:
             session.close()
-        assert len(calls) == settings.max_tool_iterations
+
+        per_agent = Counter(event.agent_name for event in calls)
+        assert per_agent["coordinator"] == settings.max_tool_iterations
+        assert per_agent["safety_screen"] == 1
 
     def test_the_exhaustion_is_recorded(self, patient):
         result = turn(patient, BOOKING, "s-budget-3")

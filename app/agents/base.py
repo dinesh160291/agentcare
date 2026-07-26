@@ -11,10 +11,13 @@ from __future__ import annotations
 from typing import Callable, Sequence
 
 from google.adk.agents import LlmAgent
+from google.adk.runners import Runner
 from google.adk.tools import FunctionTool
+from google.genai import types
 
-from app.agents import prompts
+from app.agents import memory, prompts
 from app.agents.callbacks import TurnCallbacks
+from app.errors import ProviderError
 from app.providers import get_provider
 
 
@@ -50,4 +53,54 @@ def build(
     )
 
 
-__all__ = ["build"]
+async def run_agent(
+    agent: LlmAgent,
+    *,
+    task_text: str,
+    callbacks: TurnCallbacks,
+    session_service,
+    session_id: str,
+    user_id: str,
+    create: bool,
+) -> str:
+    """Drive one agent for one task and return whatever text it produced.
+
+    Lives here rather than in the orchestrator because the safety guard drives
+    an agent too, and it must do so through exactly the same plumbing — same
+    capture points, same budget, same provider seam. A second copy of this loop
+    would be a second place for a capture point to go missing.
+
+    A provider failure is paired into the trace before it propagates: a request
+    with no terminal partner is supposed to mean the process died mid-call, and
+    that diagnosis is only worth anything if nothing else can produce it.
+    """
+    if create:
+        await session_service.create_session(
+            app_name=memory.APP_NAME, user_id=user_id, session_id=session_id
+        )
+
+    callbacks.start_agent()
+    runner = Runner(
+        agent=agent, app_name=memory.APP_NAME, session_service=session_service
+    )
+    message = types.Content(role="user", parts=[types.Part(text=task_text)])
+
+    reply = ""
+    try:
+        async for event in runner.run_async(
+            user_id=user_id, session_id=session_id, new_message=message
+        ):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        reply += part.text
+    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
+        callbacks.fail_pending_request(
+            f"{type(exc).__name__}: {exc}",
+            kind="rate_limit" if isinstance(exc, ProviderError) else "error",
+        )
+        raise
+    return reply.strip()
+
+
+__all__ = ["build", "run_agent"]
