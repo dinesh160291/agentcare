@@ -1,0 +1,13 @@
+{
+  "candidates": [],
+  "department": {
+    "description": "Handles heart and circulatory appointments and follow-ups.",
+    "id": 1,
+    "name": "Cardiology"
+  },
+  "matched_terms": [
+    "heart"
+  ],
+  "status": "resolved",
+  "text": "something to do with my heart"
+}

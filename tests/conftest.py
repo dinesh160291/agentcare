@@ -37,6 +37,21 @@ from app.config import get_settings  # noqa: E402
 from app.db import SessionLocal, create_all, drop_all  # noqa: E402
 
 
+def pytest_addoption(parser) -> None:  # noqa: ANN001
+    """``--update-golden`` re-blesses golden files instead of asserting.
+
+    Deliberately a flag rather than an environment variable or an auto-update:
+    re-blessing has to be a decision someone makes, and its result has to land
+    as a reviewable git diff.
+    """
+    parser.addoption(
+        "--update-golden",
+        action="store_true",
+        default=False,
+        help="rewrite golden expectation files from current behaviour",
+    )
+
+
 def pytest_sessionfinish(session, exitstatus) -> None:  # noqa: ANN001, ARG001
     """Remove the temporary database and uploads at the end of the run."""
     shutil.rmtree(_TMP_ROOT, ignore_errors=True)

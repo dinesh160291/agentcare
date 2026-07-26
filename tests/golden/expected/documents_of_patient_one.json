@@ -1,0 +1,32 @@
+[
+  {
+    "checksum": "<checksum>",
+    "declared_type": "ECG report",
+    "detected_type": null,
+    "document_date": "2026-05-05",
+    "document_id": 3,
+    "document_type": "ECG report",
+    "original_filename": "x-ray_report.pdf",
+    "status": "pending_verification"
+  },
+  {
+    "checksum": "<checksum>",
+    "declared_type": "Blood test report",
+    "detected_type": null,
+    "document_date": "2026-06-04",
+    "document_id": 2,
+    "document_type": "Blood test report",
+    "original_filename": "blood_test_report.pdf",
+    "status": "pending_verification"
+  },
+  {
+    "checksum": "<checksum>",
+    "declared_type": "ECG report",
+    "detected_type": null,
+    "document_date": "2026-07-04",
+    "document_id": 1,
+    "document_type": "ECG report",
+    "original_filename": "ecg_report.pdf",
+    "status": "pending_verification"
+  }
+]

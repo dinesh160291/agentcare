@@ -1,0 +1,21 @@
+{
+  "complete": false,
+  "department_id": 1,
+  "missing_mandatory": [
+    "Blood test report",
+    "ECG report"
+  ],
+  "missing_optional": [],
+  "patient_id": 2,
+  "required": [
+    {
+      "document_type": "Blood test report",
+      "mandatory": true
+    },
+    {
+      "document_type": "ECG report",
+      "mandatory": true
+    }
+  ],
+  "satisfied": []
+}

@@ -1,0 +1,46 @@
+{
+  "department_id": 1,
+  "doctor_id": null,
+  "end": null,
+  "part_of_day": "morning",
+  "slots": [
+    {
+      "department_id": 1,
+      "department_name": "Cardiology",
+      "doctor_id": 1,
+      "doctor_name": "Dr. Anita Rao",
+      "end": "2026-08-03T09:30:00",
+      "slot_id": 1,
+      "start": "2026-08-03T09:00:00"
+    },
+    {
+      "department_id": 1,
+      "department_name": "Cardiology",
+      "doctor_id": 2,
+      "doctor_name": "Dr. Vikram Nair",
+      "end": "2026-08-03T09:30:00",
+      "slot_id": 73,
+      "start": "2026-08-03T09:00:00"
+    },
+    {
+      "department_id": 1,
+      "department_name": "Cardiology",
+      "doctor_id": 3,
+      "doctor_name": "Dr. Leena Fernandes",
+      "end": "2026-08-03T09:30:00",
+      "slot_id": 145,
+      "start": "2026-08-03T09:00:00"
+    },
+    {
+      "department_id": 1,
+      "department_name": "Cardiology",
+      "doctor_id": 1,
+      "doctor_name": "Dr. Anita Rao",
+      "end": "2026-08-03T10:30:00",
+      "slot_id": 2,
+      "start": "2026-08-03T10:00:00"
+    }
+  ],
+  "start": null,
+  "total_matching": 107
+}

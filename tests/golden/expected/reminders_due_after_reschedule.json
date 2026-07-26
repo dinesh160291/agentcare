@@ -1,0 +1,25 @@
+{
+  "due_after_new_reminder_time": [
+    {
+      "appointment_id": 1,
+      "attempts": 0,
+      "message": "Reminder: appointment with Dr. Anita Rao on Thursday 06 August at 09:00.",
+      "patient_id": 1,
+      "reminder_id": 1,
+      "reminder_type": "appointment",
+      "scheduled_at": "2026-08-05T09:00:00",
+      "status": "pending"
+    },
+    {
+      "appointment_id": 2,
+      "attempts": 0,
+      "message": "Reminder: appointment with Dr. Anita Rao on Monday 10 August at 09:00.",
+      "patient_id": 2,
+      "reminder_id": 3,
+      "reminder_type": "appointment",
+      "scheduled_at": "2026-08-09T09:00:00",
+      "status": "pending"
+    }
+  ],
+  "due_at_original_reminder_time": []
+}

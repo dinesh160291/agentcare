@@ -1,0 +1,21 @@
+{
+  "candidates": [
+    {
+      "description": "Handles ear, nose, and throat appointments.",
+      "id": 7,
+      "name": "ENT"
+    },
+    {
+      "description": "Handles appointments for children and adolescents.",
+      "id": 5,
+      "name": "Pediatrics"
+    }
+  ],
+  "department": null,
+  "matched_terms": [
+    "ear",
+    "kid"
+  ],
+  "status": "ambiguous",
+  "text": "my kid has ear pain"
+}

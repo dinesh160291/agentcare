@@ -1,0 +1,54 @@
+"""Tool functions — plain Python, framework-agnostic.
+
+Nothing here imports FastAPI or the agent framework. Tools take a session, the
+acting user where a mutation is involved, and primitives; they return
+JSON-serialisable dicts. That keeps two promises at once: the golden set can
+diff their output directly, and swapping ADK for LangGraph touches the
+orchestrator rather than every tool.
+
+Every result dict is shape-stable — a refusal carries the same keys as a
+success, with ``ok``/``resolved``/``status`` saying which it is — so callers
+never branch on which keys happen to be present.
+
+Mutating tools take the acting user and enforce **role and ownership** through
+``app.auth.ownership``, which audits a denial before raising. Ownership guards
+run before any mutation, because that audit commits the acting session.
+"""
+
+from app.tools.appointments import (
+    book_appointment,
+    cancel_appointment,
+    reschedule_appointment,
+)
+from app.tools.availability import find_available_slots, get_slot
+from app.tools.dates import resolve_date
+from app.tools.departments import (
+    list_departments,
+    resolve_department,
+    validate_department,
+)
+from app.tools.documents import (
+    checksum_bytes,
+    diff_required_documents,
+    find_duplicate,
+    list_patient_documents,
+)
+from app.tools.reminders import list_due_reminders, list_patient_reminders
+
+__all__ = [
+    "book_appointment",
+    "cancel_appointment",
+    "checksum_bytes",
+    "diff_required_documents",
+    "find_available_slots",
+    "find_duplicate",
+    "get_slot",
+    "list_departments",
+    "list_due_reminders",
+    "list_patient_documents",
+    "list_patient_reminders",
+    "reschedule_appointment",
+    "resolve_date",
+    "resolve_department",
+    "validate_department",
+]

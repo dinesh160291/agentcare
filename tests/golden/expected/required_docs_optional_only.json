@@ -1,0 +1,16 @@
+{
+  "complete": true,
+  "department_id": 7,
+  "missing_mandatory": [],
+  "missing_optional": [
+    "Previous audiometry report"
+  ],
+  "patient_id": 2,
+  "required": [
+    {
+      "document_type": "Previous audiometry report",
+      "mandatory": false
+    }
+  ],
+  "satisfied": []
+}
