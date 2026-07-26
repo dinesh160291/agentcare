@@ -14,6 +14,7 @@ differ.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,10 +31,22 @@ class ToolResult:
 
 
 def latest_user_text(llm_request: LlmRequest) -> str:
-    """The most recent thing the user actually typed."""
+    """The most recent thing the user actually typed.
+
+    After a transfer to a sub-agent, ADK hands the specialist a history whose
+    user turns may not carry a ``user`` role — the request arrives wrapped in
+    transfer machinery. Falling back to the earliest text in the conversation
+    recovers the original request, which is what a specialist needs: the
+    patient's own words are the input where language is the job.
+    """
     for content in reversed(llm_request.contents or []):
         if content.role != "user":
             continue
+        text = " ".join(part.text for part in (content.parts or []) if part.text)
+        if text.strip():
+            return text.strip()
+
+    for content in llm_request.contents or []:
         text = " ".join(part.text for part in (content.parts or []) if part.text)
         if text.strip():
             return text.strip()
@@ -75,6 +88,28 @@ def called_tools(llm_request: LlmRequest) -> set[str]:
 def available_tool_names(llm_request: LlmRequest) -> set[str]:
     """Tools the agent has been given, from the request's tool dictionary."""
     return set((llm_request.tools_dict or {}).keys())
+
+
+def system_instruction_text(llm_request: LlmRequest) -> str:
+    """The system instruction as plain text, however it was supplied."""
+    instruction = getattr(llm_request.config, "system_instruction", None)
+    if instruction is None:
+        return ""
+    if isinstance(instruction, str):
+        return instruction
+    parts = getattr(instruction, "parts", None) or []
+    return " ".join(part.text for part in parts if getattr(part, "text", None))
+
+
+#: ADK advertises delegation targets in the system instruction it builds, in
+#: the form "Agent name: <name>". Reading them from there is exactly how a real
+#: model learns which agents exist — there is no enum on the tool declaration.
+_AGENT_NAME = re.compile(r"Agent name:\s*(\S+)")
+
+
+def transferable_agents(llm_request: LlmRequest) -> list[str]:
+    """Sub-agent names this agent is allowed to transfer to."""
+    return _AGENT_NAME.findall(system_instruction_text(llm_request))
 
 
 def text_response(text: str) -> LlmResponse:

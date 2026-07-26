@@ -35,7 +35,36 @@ def world(db):
     return db
 
 
-def build_request(user_text: str, *tool_results: tuple[str, dict]) -> LlmRequest:
+#: The tools a specialist agent holds. The request has to advertise them: a
+#: model may only call what it was given, and the mock is held to the same rule.
+SPECIALIST_TOOLS = (
+    "resolve_department",
+    "resolve_date",
+    "find_available_slots",
+    "book_appointment",
+    "render_confirmation",
+    "list_patient_documents",
+)
+
+
+def _tools_dict(names):
+    """Build a tools_dict of real FunctionTools with the given names."""
+    from google.adk.tools import FunctionTool
+
+    tools = {}
+    for name in names:
+        def stub(**kwargs) -> dict:
+            """Stub tool used only to advertise availability."""
+            return {}
+
+        stub.__name__ = name
+        tools[name] = FunctionTool(stub)
+    return tools
+
+
+def build_request(
+    user_text: str, *tool_results: tuple[str, dict], tools=SPECIALIST_TOOLS
+) -> LlmRequest:
     """An LlmRequest shaped the way ADK hands one to a provider."""
     contents = [types.Content(role="user", parts=[types.Part(text=user_text)])]
     for name, payload in tool_results:
@@ -49,7 +78,9 @@ def build_request(user_text: str, *tool_results: tuple[str, dict]) -> LlmRequest
                 ],
             )
         )
-    return LlmRequest(model="mock-understudy", contents=contents)
+    return LlmRequest(
+        model="mock-understudy", contents=contents, tools_dict=_tools_dict(tools)
+    )
 
 
 def ask(request: LlmRequest):

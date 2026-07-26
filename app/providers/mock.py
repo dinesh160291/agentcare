@@ -32,11 +32,13 @@ from google.adk.models import LlmRequest, LlmResponse
 
 from app.providers.base import (
     AgentCareLlm,
+    available_tool_names,
     called_tools,
     function_call_response,
     latest_tool_result,
     latest_user_text,
     text_response,
+    transferable_agents,
 )
 
 CONFIRM_TOKENS = {"yes", "y", "confirm", "confirmed", "ok", "okay", "book it", "go ahead"}
@@ -85,7 +87,48 @@ class MockLlm(AgentCareLlm):
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
-        yield self._decide(llm_request)
+        yield self._within_toolset(llm_request, self._decide(llm_request))
+
+    @staticmethod
+    def _within_toolset(llm_request: LlmRequest, response: LlmResponse) -> LlmResponse:
+        """Never call a tool this agent does not have.
+
+        A real model is constrained the same way: it can only call what it was
+        given. In a hub-and-spoke the coordinator holds `transfer_to_agent` and
+        the specialists hold the real tools, so a coordinator that wants
+        `find_available_slots` should delegate rather than invent a call — which
+        is what a live model does, and what ADK raises on if it does not.
+        """
+        parts = (response.content.parts if response.content else None) or []
+        call = next((getattr(p, "function_call", None) for p in parts), None)
+        if call is None:
+            return response
+
+        available = available_tool_names(llm_request)
+        if call.name in available:
+            return response
+
+        if "transfer_to_agent" in available:
+            candidates = [
+                name for name in transferable_agents(llm_request) if name != "transfer_to_agent"
+            ]
+            if candidates:
+                return function_call_response(
+                    "transfer_to_agent", {"agent_name": candidates[0]}
+                )
+
+        # No tool and nowhere to delegate: answer from what is already known
+        # rather than calling something that does not exist.
+        latest = latest_tool_result(llm_request)
+        if latest is not None:
+            return text_response(
+                "Here is what I found: "
+                + ", ".join(f"{key}: {value}" for key, value in list(latest.payload.items())[:4])
+            )
+        return text_response(
+            "I can help with appointments, documents, reminders, and follow-ups. "
+            "What would you like to do?"
+        )
 
     # --- policy ----------------------------------------------------------
 
