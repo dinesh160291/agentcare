@@ -22,7 +22,7 @@ Where this file and the PRD disagree, the PRD wins — this file's tables (decis
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload      # API  :8000
 .\.venv\Scripts\python.exe -m streamlit run ui/app.py            # UI   :8501
 .\.venv\Scripts\python.exe -m pytest -q                          # tests
-.\.venv\Scripts\python.exe -m pytest --cov=app --cov-report=term-missing
+.\.venv\Scripts\python.exe -m pytest --cov=app --cov-branch --cov-report=term-missing
 .\.venv\Scripts\python.exe scripts/seed.py                       # reset + seed DB
 ```
 
@@ -127,6 +127,29 @@ Tools stay plain functions and prompts stay in their own module **so the LangGra
 - Trace events record author: `llm` | `template` | `guard`. Code-authored replies are not invisible.
 - Redact PII at the three choke points before anything is persisted or logged.
 - Keep replies free of clinical language even when the model is only summarizing.
+- Deterministic-bin code is written test-first — the test transcribes the PRD's pinned behavior before the implementation exists. Everything else ships with tests in the same commit, tested through the seams, never through internals.
+
+---
+
+## Change discipline
+
+- **Smallest diff that fixes the problem.** No drive-by refactors, renames, or cleanups
+  of code you weren't asked to touch. If you see something worth improving, note it in
+  HANDOFF.md — don't fold it into an unrelated change.
+- **Diagnose before changing.** When a test fails, first verify the test delivered the
+  input you think it did; the suspected layer is often innocent. Name the root cause
+  before writing the fix.
+- **Never make a test pass by weakening it.** No deleted tests, no loosened assertions,
+  no broadened matchers to get green. A red test is information; killing the messenger
+  is the one forbidden move.
+- **Fail loud.** No broad try/except that swallows errors to keep things running.
+  Catch specifically, or let it raise.
+- **No speculative structure.** Don't add abstractions, options, or generality for
+  futures nobody asked for. Three concrete uses before an abstraction.
+- **Match the neighborhood.** Follow the file's existing style, naming, and idioms —
+  and prefer editing in place over rewriting whole files.
+- **Stop-and-ask thresholds**: a fix that wants to touch >3 files, add a dependency,
+  or change a public seam gets explained first, not done first.
 
 ---
 
@@ -135,5 +158,4 @@ Tools stay plain functions and prompts stay in their own module **so the LangGra
 - Never write to `.env` or echo secrets into the transcript, logs, or trace rows.
 - Never commit a `.db` file, uploaded documents, or anything under `data/uploads/`.
 - Never let the model apply a state change, confirm a booking, or invent a date.
-- Never reference the author's prior personal voice-agent project in any committed file — the design ideas are ours to keep, the attributions stay out.
 - Never add `.github/workflows/agentcare-checks.yml` from memory — it must be the organizer's file, downloaded from their URL.
