@@ -1045,6 +1045,17 @@ def _settle_step(
         if proposals.routing_confidence == "low":
             # Low-confidence routing is a human's decision, not a confident
             # guess dressed up as one.
+            #
+            # The candidate is recorded on the run, not only in the escalation's
+            # prose: staff approving this decision need a department *id* to
+            # apply, and re-deriving one from a sentence would put the model's
+            # words back in the consequential path at the exact moment a human
+            # was brought in to keep them out of it.
+            state = dict(run.state or {})
+            state["proposed_department_id"] = proposals.department_id
+            state["proposed_department_name"] = proposals.department_name
+            run.state = state
+
             create_escalation(
                 session,
                 workflow_run_id=run.id,
