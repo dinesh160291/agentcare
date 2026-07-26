@@ -142,6 +142,10 @@ Tools stay plain functions and prompts stay in their own module **so the LangGra
 - **Never make a test pass by weakening it.** No deleted tests, no loosened assertions,
   no broadened matchers to get green. A red test is information; killing the messenger
   is the one forbidden move.
+- **Distrust green.** A passing check is evidence only if it could have failed:
+  before trusting a PASS, ask what the check would have shown had the claim been
+  false. A query that counts stale rows, or a key every process writes, passes
+  regardless — that's a check vouching for nothing. 
 - **Fail loud.** No broad try/except that swallows errors to keep things running.
   Catch specifically, or let it raise.
 - **No speculative structure.** Don't add abstractions, options, or generality for

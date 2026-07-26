@@ -30,25 +30,43 @@ class ToolResult:
     payload: dict[str, Any]
 
 
+#: After a transfer, ADK does not hand the sub-agent a function_response. It
+#: injects narration with role="user" — "For context: [coordinator] called tool
+#: `transfer_to_agent`..." — which is framing about the conversation, not a turn
+#: in it. Reading that as the patient's message is how a specialist ends up
+#: classifying the delegation machinery instead of the request.
+ADK_CONTEXT_MARKERS = (
+    "For context:",
+    "called tool `",
+    "tool returned result:",
+)
+
+
+def is_framing(text: str) -> bool:
+    """True when a text block is ADK narration rather than something said."""
+    return any(marker in text for marker in ADK_CONTEXT_MARKERS)
+
+
 def latest_user_text(llm_request: LlmRequest) -> str:
     """The most recent thing the user actually typed.
 
-    After a transfer to a sub-agent, ADK hands the specialist a history whose
-    user turns may not carry a ``user`` role — the request arrives wrapped in
-    transfer machinery. Falling back to the earliest text in the conversation
-    recovers the original request, which is what a specialist needs: the
-    patient's own words are the input where language is the job.
+    Skips ADK's transfer narration. This matters most for the specialist that
+    delegation lands on: where language *is* the job — routing classifies the
+    patient's words — the specialist has to receive those words, not a summary
+    of how it came to be asked.
     """
     for content in reversed(llm_request.contents or []):
         if content.role != "user":
             continue
         text = " ".join(part.text for part in (content.parts or []) if part.text)
-        if text.strip():
+        if text.strip() and not is_framing(text):
             return text.strip()
 
+    # Nothing but framing: fall back to the earliest real text in the history,
+    # which is the request that started the conversation.
     for content in llm_request.contents or []:
         text = " ".join(part.text for part in (content.parts or []) if part.text)
-        if text.strip():
+        if text.strip() and not is_framing(text):
             return text.strip()
     return ""
 

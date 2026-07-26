@@ -36,6 +36,7 @@ from app.providers.base import (
     called_tools,
     function_call_response,
     latest_tool_result,
+    is_framing,
     latest_user_text,
     text_response,
     transferable_agents,
@@ -108,7 +109,15 @@ class MockLlm(AgentCareLlm):
         if call.name in available:
             return response
 
-        if "transfer_to_agent" in available:
+        # Delegate at most once per turn. A specialist that was itself
+        # delegated to must do the work or answer — bouncing it onward is an
+        # unbounded loop, and ADK's session store fails loudly when two
+        # branches race to append to it.
+        already_delegated = any(
+            is_framing(" ".join(part.text for part in (content.parts or []) if part.text))
+            for content in (llm_request.contents or [])
+        )
+        if "transfer_to_agent" in available and not already_delegated:
             candidates = [
                 name for name in transferable_agents(llm_request) if name != "transfer_to_agent"
             ]
