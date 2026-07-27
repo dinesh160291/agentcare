@@ -46,6 +46,7 @@ from app.providers.base import (
     text_response,
 )
 from app.workflow.confirmation import normalise
+from app.workflow.replies import when_words
 
 BOOKING_CUES = (
     "appointment", "book", "booking", "schedule", "see a doctor", "consult", "slot",
@@ -177,6 +178,65 @@ _OPTION_WORDS = re.compile(
     r"\b(first|second|third|1st|2nd|3rd|option\s*[123]|number\s*[123])\b"
 )
 _OPTION_TIME = re.compile(r"\b(\d{1,2}\s*(?:am|pm)|\d{1,2}[:.]\d{2})\b")
+
+
+#: Words that scope a question to a period. The mock hands the *phrase* on to
+#: ``resolve_date`` rather than parsing it — this only decides that the patient
+#: said something about when, which is a different and much easier judgement.
+_PERIOD_WORDS = re.compile(
+    r"\b(week|weeks|month|monday|tuesday|wednesday|thursday|friday|saturday|"
+    r"sunday|today|tomorrow|january|february|march|april|may|june|july|august|"
+    r"september|october|november|december|\d{1,2}(st|nd|rd|th))\b"
+)
+
+
+#: Words that carry no subject of their own — the scaffolding a date phrase is
+#: built from. What is left after removing these and the period words is the
+#: message's actual topic, if it has one.
+_SCAFFOLD = frozenset(
+    {
+        "a", "about", "after", "all", "and", "any", "anything", "are", "around",
+        "at", "available", "before", "between", "book", "can", "could", "do",
+        "else", "for", "free", "from", "got", "have", "how", "i", "in", "is",
+        "it", "later", "like", "me", "more", "next", "of", "on", "one", "or",
+        "other", "others", "please", "show", "slot", "slots", "some", "something",
+        "that", "the", "then", "there", "these", "this", "those", "time", "times",
+        "to", "up", "us", "we", "what", "whats", "when", "which", "would", "you",
+    }
+)
+
+
+def _names_a_period(text: str) -> bool:
+    """Is this message *only* about when?
+
+    A period word alone is not enough, and assuming it was is a bug this file
+    has now grown twice. "What's the weather like today?" contains "today" and
+    is off-topic; reading it as an availability question routed a chat about
+    the weather into the slot search and wrote to the run's state, which the
+    off-topic scenario exists to forbid.
+
+    So the test is subtractive: take out the period words and the scaffolding
+    a date phrase is made of, and see whether any subject is left. "Between
+    august 5th and 10th" leaves nothing — it is a date and nothing else.
+    "What's the weather like today" leaves "weather", which is what it is
+    actually about.
+    """
+    lowered = (text or "").lower()
+    if not _PERIOD_WORDS.search(lowered):
+        return False
+    remainder = _PERIOD_WORDS.sub(" ", lowered)
+    words = [word for word in re.findall(r"[a-z]+", remainder) if word not in _SCAFFOLD]
+    return not words
+
+
+def _timing_words(text: str) -> str:
+    """The patient's own words about when, handed on untouched.
+
+    Returned whole rather than extracted: ``resolve_date`` is the only thing
+    permitted to turn words into dates, and a mock that pre-chewed the phrase
+    would be testing its own parser instead of that one.
+    """
+    return text if _names_a_period(text) else ""
 
 
 def _names_an_option(text: str) -> bool:
@@ -465,7 +525,11 @@ class MockLlm(AgentCareLlm):
         self, llm_request: LlmRequest, available: set[str], done: set[str], text: str
     ) -> LlmResponse:
         settled = latest_tool_result(llm_request, "submit_confirmation_verdict")
-        if settled is not None:
+        if settled is not None and settled.payload.get("verdict") != "slot_question":
+            # A slot_question is not settled by being submitted: the times came
+            # back with it, and the patient may have named one of them. Falling
+            # through here is what lets "lets go with 4pm slot" reach
+            # `propose_another_slot` in the same turn.
             return self._from_confirmation_verdict(settled.payload)
 
         awaiting = "submit_confirmation_verdict" in available
@@ -483,18 +547,22 @@ class MockLlm(AgentCareLlm):
         # that leave the run still waiting. A withdrawal or a supersede has
         # already decided the run's fate; answering "how did they answer?"
         # about it would be answering a question nobody is asking any more.
-        if awaiting and classified.payload.get("applied_class") in (
+        settleable = classified.payload.get("applied_class") in (
             "continuation",
             "side_question",
             "complementary",
-        ):
-            # Before answering "how did they answer?", check whether they asked
-            # something instead. A patient who wants to see the other times has
-            # not answered at all, and reading them as a non-answer is what
-            # produced the same nag twice.
+        )
+        if settleable:
+            # Before anything else, check whether they asked about times rather
+            # than answered. Not gated on a proposal being outstanding: the
+            # same question at `in_progress` — after a decline, say — was met
+            # with "noted as a side question, I will continue... please hold
+            # on", twice, with nothing following either time.
             asked = self._other_times(llm_request, available, done, text)
             if asked is not None:
                 return asked
+
+        if awaiting and settleable:
             verdict, reason = self._confirmation_verdict(text)
             return function_call_response(
                 "submit_confirmation_verdict", {"verdict": verdict, "reason": reason}
@@ -517,20 +585,38 @@ class MockLlm(AgentCareLlm):
         turn are not visible this turn — and re-reading them is right anyway:
         a slot can be taken between being shown and being chosen.
         """
-        if "list_other_slots" not in available:
-            return None
-        if not (_has(text, SLOT_QUESTION_CUES) or _names_an_option(text)):
+        asking = _has(text, SLOT_QUESTION_CUES) or _names_a_period(text)
+        if not (asking or _names_an_option(text)):
             return None
 
         if latest_tool_result(llm_request, "propose_another_slot") is not None:
             return text_response("")
 
-        listed = latest_tool_result(llm_request, "list_other_slots")
-        if listed is None:
-            return function_call_response("list_other_slots", {})
+        # Two doors, one per state, and the toolset says which. While a
+        # proposal stands the answer *is* the confirmation read, so it goes
+        # through the verdict; everywhere else there is no verdict to give.
+        if "submit_confirmation_verdict" in available:
+            listed = latest_tool_result(llm_request, "submit_confirmation_verdict")
+            if listed is None:
+                return function_call_response(
+                    "submit_confirmation_verdict",
+                    {
+                        "verdict": "slot_question",
+                        "reason": "the patient asked to see other times",
+                        "phrase": _timing_words(text),
+                    },
+                )
+        elif "list_other_slots" in available:
+            listed = latest_tool_result(llm_request, "list_other_slots")
+            if listed is None:
+                return function_call_response(
+                    "list_other_slots", {"phrase": _timing_words(text)}
+                )
+        else:
+            return None
 
         picked = _pick_offered(text, listed.payload.get("slots") or [])
-        if picked is None:
+        if picked is None or "propose_another_slot" not in available:
             # They asked to see the times, or named one that is not on the
             # list. Either way the reply is the code-assembled shortlist.
             return text_response("")
@@ -588,6 +674,7 @@ class MockLlm(AgentCareLlm):
             or _has(text, DECLINE_CUES)
             or _has(text, ASSENT_CUES)
             or _names_an_option(text)
+            or _names_a_period(text)
         )
         if not answering and not _has(text, ADMIN_CUES):
             return "off_topic", []
@@ -604,6 +691,14 @@ class MockLlm(AgentCareLlm):
             return "conflicting", ["reschedule"]
         if wants_cancellation(text):
             return "conflicting", ["cancel"]
+        # A period named while a time is being held is a question about *that*
+        # period - "between august 5th and 10th", "week after next" - and the
+        # answer is the times in it. Read as non-answers, four of these in one
+        # live conversation got the same frozen re-ask four times. Below the
+        # two other verbs, so "cancel my appointment on the 5th" is still a
+        # cancellation rather than a request to browse the 5th.
+        if awaiting_confirmation and _names_a_period(text):
+            return "side_question", []
         # Someone answering the question they were asked is not making a new
         # request, whatever verbs they reached for. "Looks good, lets book that
         # time" contains "book" and reads as a fresh booking to the rule below
@@ -697,7 +792,7 @@ class MockLlm(AgentCareLlm):
                 f"This looks like it may be {name}, but I'd like a member of staff "
                 "to confirm before I book anything."
             )
-        return text_response(f"{name} handles this. Let me find you a time.")
+        return text_response(f"{name} handles this.")
 
     # --- Appointment ------------------------------------------------------
 
@@ -843,22 +938,22 @@ class MockLlm(AgentCareLlm):
         )
         if step == "cancel":
             return text_response(
-                f"I can cancel your {facts['department_name']} appointment with "
+                f"I found your {facts['department_name']} appointment with "
                 f"{facts['doctor_name']} on {when} (reference "
-                f"{facts['reference_code']}). Shall I? Reply 'yes' to confirm — "
-                "nothing is cancelled until you do."
+                f"{facts['reference_code']}). Would you like me to cancel it? "
+                "Reply 'yes' to confirm — nothing is cancelled until you do."
             )
         new_slot = payload.get("new_slot") or {}
-        moving_to = (
-            f"{new_slot['start'][:10]} at {new_slot['start'][11:16]} "
-            f"with {new_slot['doctor_name']}"
-            if new_slot.get("start")
-            else "the new time"
-        )
+        if new_slot.get("start"):
+            day, time = when_words(new_slot["start"])
+            moving_to = f"{day} at {time} with {new_slot['doctor_name']}"
+        else:
+            moving_to = "the new time"
         return text_response(
-            f"I can move your {facts['department_name']} appointment "
-            f"(reference {facts['reference_code']}) from {when} to "
-            f"{moving_to}. Reply 'yes' to confirm — nothing moves until you do."
+            f"I found your {facts['department_name']} appointment "
+            f"(reference {facts['reference_code']}) on {when}. I can move it to "
+            f"{moving_to} — would you like me to? Reply 'yes' to confirm; "
+            "nothing moves until you do."
         )
 
     @staticmethod
@@ -878,9 +973,10 @@ class MockLlm(AgentCareLlm):
                 str(payload.get("problem", "That time is no longer available."))
             )
         slot = payload["proposed"]
+        day, time = when_words(slot["start"])
         return text_response(
-            f"I can offer {slot['doctor_name']} on {slot['start'][:10]} at "
-            f"{slot['start'][11:16]}. Shall I book it? Reply 'yes' to confirm."
+            f"I found a time with {slot['doctor_name']} on {day} at {time}. "
+            "Would you like me to book it? Reply 'yes' to confirm."
         )
 
     @staticmethod

@@ -30,9 +30,13 @@ from typing import Any, Iterable, Sequence
 
 from sqlalchemy.orm import Session
 
+from app import clock
 from app.models import (
     Appointment,
     AppointmentSlot,
+    FollowUpTask,
+    FollowUpTaskStatus,
+    FollowUpTaskType,
     Reminder,
     ReminderStatus,
     WorkflowRun,
@@ -135,6 +139,23 @@ def was_offered(run: WorkflowRun, slot_id: int) -> bool:
 # --- rendering ------------------------------------------------------------
 
 
+def clock_time(moment: datetime) -> str:
+    """A time as a patient says it: 9:00 AM, 3:00 PM.
+
+    24-hour is how the rows are stored and how staff read a schedule; it is not
+    how anyone answers "what time is my appointment". The card said 15:00 while
+    the chat beside it said 3:00 PM, about the same slot, which reads as two
+    appointments rather than as two notations. So there is one formatter and
+    everything patient-facing goes through it — card, option list, re-ask,
+    receipt.
+
+    ``%-I`` is not portable to Windows and ``%#I`` is not portable off it, so
+    the hour is done by hand.
+    """
+    hour = moment.hour % 12 or 12
+    return f"{hour}:{moment:%M} {'AM' if moment.hour < 12 else 'PM'}"
+
+
 def when_words(start: str | datetime) -> tuple[str, str]:
     """(day, time) as the patient reads them.
 
@@ -143,7 +164,7 @@ def when_words(start: str | datetime) -> tuple[str, str]:
     patient reads as two different appointments.
     """
     moment = start if isinstance(start, datetime) else datetime.fromisoformat(start)
-    return f"{moment:%A} {moment.day} {moment:%B}", f"{moment:%H:%M}"
+    return f"{moment:%A} {moment.day} {moment:%B}", clock_time(moment)
 
 
 _when = when_words
@@ -162,12 +183,22 @@ def render_options(
         return ""
 
     lines = []
+    previous: str | None = None
     for index, slot in enumerate(shortlist, start=1):
         day, time = _when(slot["start"])
-        line = f"{index}. {day} at {time} with {slot['doctor_name']}"
+        when = f"{day} at {time}"
+        # Two doctors free at the same moment is ordinary — Neurology has two —
+        # but a list repeating the identical day and time on consecutive lines
+        # reads as a data error rather than as a choice of clinician. Saying so
+        # explicitly is the difference between "the system is broken" and "you
+        # can see either of them".
+        if when == previous:
+            lines.append(f"{index}. same time with {slot['doctor_name']}")
+        else:
+            lines.append(f"{index}. {when} with {slot['doctor_name']}")
+        previous = when
         if slot.get("slot_id") == proposed_slot_id:
-            line += " — I'm holding this one for you"
-        lines.append(line)
+            lines[-1] += " — I'm holding this one for you"
     return "\n".join(lines)
 
 
@@ -185,16 +216,29 @@ def _shortlist(slots: Sequence[dict], *, held: int | None, first: bool) -> list[
     ordered = (mine + others) if first else others
 
     shortlist: list[dict] = []
+    duplicates: list[dict] = []
     seen_times: set[str] = set()
     for slot in ordered:
         start = str(slot.get("start"))
         if start in seen_times:
+            duplicates.append(slot)
             continue
         seen_times.add(start)
         shortlist.append(slot)
         if len(shortlist) == MAX_OPTIONS:
+            return shortlist
+
+    # Distinct times are the choice worth offering, and they come first. Only
+    # when the department has fewer than three of them is a same-moment
+    # alternative worth a line — at that point it is a choice of clinician,
+    # which is a real thing to offer, rather than the same appointment padding
+    # the list out. ``render_options`` labels those "same time with Dr X" so a
+    # repeated day and time reads as two doctors and not as a broken query.
+    for slot in duplicates:
+        shortlist.append(slot)
+        if len(shortlist) == MAX_OPTIONS:
             break
-    return shortlist
+    return sorted(shortlist, key=lambda s: (s.get("slot_id") != held, str(s["start"])))
 
 
 def render_proposal(session: Session, run: WorkflowRun, slots: Sequence[dict]) -> str:
@@ -331,6 +375,44 @@ def _document_lines(session: Session, run: WorkflowRun) -> list[str]:
     return lines
 
 
+def render_outstanding(session: Session, *, patient_id: int) -> str:
+    """What is still outstanding, read from the task rows themselves.
+
+    The document listing answers "what do I have on file?", and the half of
+    that answer about what is still *needed* was the model's. Live, a query run
+    that carried no department was answered with "no documents required" while
+    an open task for a missing MRI report sat in the database — and the next
+    turn said so, contradicting it.
+
+    The rows are the authority precisely because the diff is not available in
+    that situation: a listing with no department has nothing to diff against,
+    and "nothing to compare" is not the same fact as "nothing is required".
+    The open task is what survives across turns and across runs, so it is what
+    the sentence is built from.
+
+    Returns "" when nothing is outstanding — the absence of a requirement is
+    not a sentence, and asserting it is how the contradiction happened.
+    """
+    tasks = (
+        session.query(FollowUpTask)
+        .filter(
+            FollowUpTask.patient_id == patient_id,
+            FollowUpTask.task_type == FollowUpTaskType.MISSING_DOCUMENTS,
+            FollowUpTask.status == FollowUpTaskStatus.OPEN,
+        )
+        .order_by(FollowUpTask.id)
+        .all()
+    )
+    items: list[str] = []
+    for task in tasks:
+        for item in (task.details or {}).get("missing", []):
+            if item not in items:
+                items.append(item)
+    if not items:
+        return ""
+    return f"Still needed for your visit: {', '.join(items)}. {UPLOAD_POINTER}"
+
+
 def _has_pending_reminder(session: Session, appointment_id: int) -> bool:
     return (
         session.query(Reminder)
@@ -381,6 +463,15 @@ def render_receipt(session: Session, run: WorkflowRun) -> str:
 
     if _has_pending_reminder(session, appointment.id):
         parts.append(REMINDER_LINE)
+    elif appointment.slot is not None and appointment.slot.start_time.date() == clock.today():
+        # A same-day booking has no day before to be reminded on. Saying so is
+        # not a smaller version of the reminder promise — it is the fact the
+        # patient actually needs, and the old line promised a message that
+        # could never arrive for a visit only hours away.
+        parts.append(
+            f"That's today at {clock_time(appointment.slot.start_time)}, so there's "
+            "no reminder to send — please come along at that time."
+        )
 
     return "\n".join(part for part in parts if part)
 
@@ -394,9 +485,11 @@ __all__ = [
     "record_offered",
     "render_alternatives",
     "render_options",
+    "render_outstanding",
     "render_proposal",
     "render_reask",
     "render_receipt",
     "was_offered",
+    "clock_time",
     "when_words",
 ]

@@ -36,6 +36,7 @@ from app.workflow.replies import (
     record_offered,
     render_options,
     render_reask,
+    render_outstanding,
     render_receipt,
     was_offered,
 )
@@ -117,17 +118,19 @@ class TestRenderingOptions:
     def test_three_options_are_numbered_soonest_first(self):
         text = render_options(THREE, proposed_slot_id=11)
         assert "1." in text and "2." in text and "3." in text
-        assert text.index("14:00") > text.index("09:00")
+        assert text.index("2:00 PM") > text.index("9:00 AM")
 
     def test_every_option_names_its_doctor_day_and_time(self):
         text = render_options(THREE, proposed_slot_id=11)
         assert "Dr Deepa Krishnan" in text
         assert "Monday 3 August" in text
-        assert "09:00" in text
+        assert "9:00 AM" in text
+        # 24-hour is how the row is stored, not how a patient reads a time.
+        assert "09:00" not in text
 
     def test_the_proposed_one_is_marked(self):
         text = render_options(THREE, proposed_slot_id=12)
-        marked = [line for line in text.splitlines() if "14:00" in line]
+        marked = [line for line in text.splitlines() if "2:00 PM" in line]
         assert marked and "holding" in marked[0]
 
     def test_at_most_three_are_shown(self):
@@ -335,3 +338,82 @@ class TestTheReAsk:
         falls back to has to survive the guard."""
         session, run, _ = pending
         assert promises_action(render_reask(session, run)) is False
+
+
+class TestTheTwoClockFormattersAgree:
+    """``replies.clock_time`` and ``tools.confirmations._clock_time`` are the
+    same four lines in two places, on purpose: ``replies`` imports
+    ``confirmations``, so importing back would invert the dependency the whole
+    ``tools`` package rests on. Duplication is the cheaper of the two, but only
+    while something notices when they drift.
+    """
+
+    @pytest.mark.parametrize(
+        "hour,minute",
+        [(0, 0), (0, 30), (9, 0), (11, 59), (12, 0), (12, 30), (15, 0), (23, 45)],
+    )
+    def test_they_produce_the_same_string(self, hour, minute):
+        from datetime import datetime as dt
+
+        from app.tools.confirmations import _clock_time
+        from app.workflow.replies import clock_time
+
+        moment = dt(2026, 8, 3, hour, minute)
+        assert clock_time(moment) == _clock_time(moment)
+
+    def test_midnight_and_noon_are_not_zero_oclock(self):
+        """The off-by-twelve both formatters would share if `% 12` were used
+        without the `or 12`."""
+        from datetime import datetime as dt
+
+        from app.workflow.replies import clock_time
+
+        assert clock_time(dt(2026, 8, 3, 0, 5)) == "12:05 AM"
+        assert clock_time(dt(2026, 8, 3, 12, 5)) == "12:05 PM"
+
+
+class TestTheOutstandingLine:
+    """Item 6: the "what is still needed" half of a documents answer."""
+
+    def test_nothing_outstanding_is_not_a_sentence(self, seeded_db):
+        """Live, the model asserted "no documents required" from a run that had
+        nothing to diff against, and the next turn contradicted it. Silence is
+        the honest output — "nothing to compare" is not "nothing is required"."""
+        assert render_outstanding(seeded_db, patient_id=2) == ""
+
+    def test_an_open_task_is_named_with_the_pointer(self, seeded_db):
+        from app.models import FollowUpTaskType
+        from app.tools.tasks import upsert_followup_task
+
+        upsert_followup_task(
+            seeded_db,
+            patient_id=2,
+            task_type=FollowUpTaskType.MISSING_DOCUMENTS,
+            details={"missing": ["Prior MRI or CT report"]},
+            appointment_id=None,
+        )
+        seeded_db.flush()
+
+        line = render_outstanding(seeded_db, patient_id=2)
+        assert "Prior MRI or CT report" in line
+        assert UPLOAD_POINTER in line
+
+    def test_a_closed_task_says_nothing(self, seeded_db):
+        """Distrust green: reading every task regardless of status would pass
+        the test above and go on demanding a document after it arrived."""
+        from app.models import FollowUpTask, FollowUpTaskStatus, FollowUpTaskType
+        from app.tools.tasks import upsert_followup_task
+
+        upsert_followup_task(
+            seeded_db,
+            patient_id=2,
+            task_type=FollowUpTaskType.MISSING_DOCUMENTS,
+            details={"missing": ["Prior MRI or CT report"]},
+            appointment_id=None,
+        )
+        seeded_db.flush()
+        for task in seeded_db.query(FollowUpTask).all():
+            task.status = FollowUpTaskStatus.CLOSED
+        seeded_db.flush()
+
+        assert render_outstanding(seeded_db, patient_id=2) == ""

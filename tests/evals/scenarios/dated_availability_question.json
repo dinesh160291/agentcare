@@ -1,0 +1,47 @@
+{
+  "name": "dated-availability-question-then-confirm",
+  "pins": "A question about *when* is a third kind of answer to a proposal, and the confirmation verdict now has a member for it. Live, four date-scoped questions in one conversation — \"between august 5th and 10th\", \"week after next\", \"after august 3rd\", \"more slots after august 10th\" — were all filed as non-answers and met the same frozen re-ask, because the enum had nowhere else to put them. The phrase now rides to `resolve_date`, which is the only thing permitted to turn words into dates, and the times in that window come back. Nothing about the pinned rule moves: the proposal is still held, still un-answered, and still bookable only by an exact token or the button.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a cardiology appointment next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "proposed_action": "book"
+      }
+    },
+    {
+      "message": "between august 5th and 10th",
+      "expect": {
+        "status": "pending_confirmation",
+        "message_class": "side_question",
+        "proposed_action": "book",
+        "appointments_created": 0,
+        "request_text_unchanged": true,
+        "reply_author": "template",
+        "reply_contains": ["August", "holding", "Confirm"],
+        "reply_excludes": ["i've booked", "is confirmed", "hold on", "i will proceed"]
+      }
+    },
+    {
+      "message": "week after next",
+      "expect": {
+        "status": "pending_confirmation",
+        "message_class": "side_question",
+        "proposed_action": "book",
+        "appointments_created": 0,
+        "request_text_unchanged": true,
+        "reply_contains": ["holding", "Confirm"]
+      }
+    },
+    {
+      "message": "yes",
+      "expect": {
+        "status": "completed",
+        "appointments_created": 1,
+        "reply_author": "template",
+        "reply_contains": ["confirmed", "Reference", "AM"]
+      }
+    }
+  ]
+}

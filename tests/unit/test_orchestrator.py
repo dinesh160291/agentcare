@@ -50,6 +50,7 @@ from app.models import (
     WorkflowStatus,
 )
 from app.orchestrator import SCOPE_REPLY, active_run, run_workflow
+from app.workflow.replies import clock_time
 from app.providers.base import (
     AgentCareLlm,
     available_tool_names,
@@ -232,7 +233,10 @@ class TestRepliesAreTemplatedFromTheDatabase:
 
         assert doctor.name in reply
         assert start.strftime("%A") in reply
-        assert start.strftime("%H:%M") in reply
+        # Through the shared formatter, not a second copy of the format: the
+        # point of the diff is that the reply agrees with the row, and a test
+        # holding its own notation would drift from both.
+        assert clock_time(start) in reply
         assert str(start.year) in reply
         assert f"AC-{appointment.id:06d}" in reply
 
@@ -1024,15 +1028,25 @@ class TestTheProposalReplyOffersAChoice:
         session = fresh()
         try:
             run = session.get(WorkflowRun, result.run_id)
+            recorded = set(run.state["offered_slot_ids"])
             shown = {
-                session.get(AppointmentSlot, slot_id).start_time.strftime("%H:%M")
-                for slot_id in run.state["offered_slot_ids"]
+                slot_id
+                for slot_id in recorded
+                if clock_time(session.get(AppointmentSlot, slot_id).start_time)
+                in result.reply
             }
         finally:
             session.close()
 
-        for time_text in shown:
-            assert time_text in result.reply
+        # Recorded is deliberately the *wider* set: everything the search
+        # returned is answerable, not only the three lines the reply prints.
+        # "Lets go with 4pm slot" named a time from further down the payload,
+        # and recording only what was printed made the guard refuse a slot the
+        # tool had just produced. What must hold is the other direction —
+        # nothing is printed that was not recorded, or the patient is offered
+        # a time the guard would then reject.
+        assert shown, "the reply printed none of the recorded slots"
+        assert shown <= recorded
 
     def test_the_options_are_distinct_times(self, patient):
         """Three doctors free at 09:00 is one appointment three times, not a

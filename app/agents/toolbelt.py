@@ -44,7 +44,7 @@ from app.models import (
 )
 from app.tools.appointments import LIVE_STATUSES
 from app.trace import TraceWriter
-from app.workflow.replies import offered_slot_ids, was_offered
+from app.workflow.replies import offered_slot_ids, record_offered, was_offered
 from app.tools import (
     apply_verification,
     diff_required_documents,
@@ -71,7 +71,12 @@ from app.workflow.state_machine import transition
 #: The closed set the model may answer a proposal with. ``confirm`` is
 #: deliberately absent: commitment requires a click or an exact token, and the
 #: model's only permitted verdicts are decline or non-answer.
-CONFIRMATION_VERDICTS = ("decline", "non_answer")
+#: The model's permitted reads of an answer to a proposal. ``confirm`` is
+#: deliberately absent — commitment requires a click or an exact token.
+#: ``slot_question`` is the third because a question is a third kind of answer,
+#: and without it four availability questions in one live conversation were all
+#: filed as non-answers and met the same frozen re-ask.
+CONFIRMATION_VERDICTS = ("decline", "non_answer", "slot_question")
 
 
 @dataclass
@@ -84,7 +89,8 @@ class TurnProposals:
 
     plan: list[PlanStep] | None = None
     class_verdict: ClassVerdict | None = None
-    #: "decline" or "non_answer" — never "confirm". See ``CONFIRMATION_VERDICTS``.
+    #: "decline", "non_answer" or "slot_question" — never "confirm". See
+    #: ``CONFIRMATION_VERDICTS``.
     confirmation_verdict: str | None = None
     incoming_steps: list[PlanStep] = field(default_factory=list)
     department_id: int | None = None
@@ -101,6 +107,10 @@ class TurnProposals:
     offered_slots: list[dict] = field(default_factory=list)
     #: This turn answered a question about other times while a proposal stood.
     answered_with_slots: bool = False
+    #: The window ``resolve_date`` made of the patient's words, when they
+    #: scoped their question ("between the 5th and the 10th"). Kept so the
+    #: reply can say which period it is answering about.
+    slot_window: dict | None = None
     #: This turn moved the proposal to a different slot the patient had been
     #: shown. Never a commit — the run is still waiting on an exact answer.
     reproposed: bool = False
@@ -230,19 +240,23 @@ class Toolbelt:
                 "reason": verdict.reason,
             }
 
-        def submit_confirmation_verdict(verdict: str, reason: str = "") -> dict:
+        def submit_confirmation_verdict(
+            verdict: str, reason: str = "", phrase: str = ""
+        ) -> dict:
             """Say how the patient answered the time you offered them.
-            `verdict` must be "decline" or "non_answer". There is no third
-            option: you may never confirm a booking. Only the patient's own
-            exact word, or the Confirm button, can do that."""
-            return self._submit_confirmation_verdict(verdict, reason)
+            "decline" - they turned it down. "slot_question" - they asked to
+            see other times; put their own words about when into `phrase`
+            ("between the 5th and the 10th", "week after next"). "non_answer" -
+            anything else. You may never confirm a booking: only the patient's
+            own exact word, or the Confirm button, can do that."""
+            return self._submit_confirmation_verdict(verdict, reason, phrase)
 
-        def list_other_slots() -> dict:
-            """Show the patient other free times while still holding the one
-            they were offered. Use this when they ask what else is available.
-            This books nothing and changes nothing: the time they were offered
-            is still being held for them afterwards."""
-            return self._list_other_slots()
+        def list_other_slots(phrase: str = "") -> dict:
+            """Show the patient free appointment times. Use this whenever they
+            ask what is available. Put their own words about when into `phrase`
+            ("next week", "after the 10th") and leave it empty if they said
+            nothing about timing. This books nothing and changes nothing."""
+            return self._list_other_slots(phrase)
 
         def propose_another_slot(slot_id: int) -> dict:
             """Move the offer to a different time the patient has already been
@@ -266,16 +280,24 @@ class Toolbelt:
             and self.run.status is WorkflowStatus.PENDING_CONFIRMATION
         ):
             tools.append(submit_confirmation_verdict)
-            # Answering "what else is free?" is the *other* half of the mapping
-            # table's answer-and-stay, and it needs data. Both are read-only or
-            # proposal-only by construction, and neither is reachable outside
-            # this state — a Coordinator with nothing held has no other time to
-            # offer and no proposal to move.
+            # Moving the offer is only meaningful where there is one to move.
+            # Listing times is *not* handed out here: at this state it is
+            # reachable through the confirmation verdict instead, so there is
+            # exactly one way to answer "what else is there?" and exactly one
+            # place the proposal could be disturbed.
             if self.run.proposed_action is ProposedAction.BOOK:
-                tools.extend([list_other_slots, propose_another_slot])
+                tools.append(propose_another_slot)
+        elif self.run is not None and not self.run.is_terminal:
+            # Answering "what else is free?" is the other half of the mapping
+            # table's answer-and-stay, and it needs data. Live, at
+            # `in_progress`, the same question got "noted as a side question. I
+            # will continue... Please hold on for a moment" — twice, with
+            # nothing following. Read-only by construction, and it refuses
+            # itself when no department has been decided.
+            tools.append(list_other_slots)
         return tools
 
-    def _list_other_slots(self) -> dict:
+    def _list_other_slots(self, phrase: str = "") -> dict:
         """Free times other than the one being held. Read-only, always.
 
         The proposal is not touched here — not cleared, not moved, not
@@ -284,6 +306,18 @@ class Toolbelt:
         confirmation path could only decline or re-ask, so the *answer* half
         had nowhere to happen and a patient asking "what else is there?" got a
         nag instead of an answer, twice.
+
+        ``phrase`` is the patient's own words about timing, and it goes through
+        ``resolve_date`` like every other date in this system — never parsed
+        here. Without it, "between august 5th and 10th" and "week after next"
+        are both answered with the same list starting from today, which is how
+        four different questions in one live conversation got one answer.
+
+        Refusing is not answering. When there is no department yet — a run
+        still waiting for staff to route it — this returns the problem and
+        leaves ``answered_with_slots`` alone, so the turn falls through to
+        whatever it would otherwise have said instead of rendering an empty
+        list as though it were an answer.
         """
         run = self.run
         if run is None:
@@ -293,21 +327,29 @@ class Toolbelt:
         if department_id is None:
             return {"slots": [], "problem": "No department has been decided yet."}
 
-        # Anchored on the day being held, not on today. A patient who asked for
-        # next week and is holding the 3rd should be shown the 3rd's other
-        # times, not tomorrow's: the alternatives to an offer are the times
-        # near it, and a list starting from now answers a question nobody
-        # asked. It is also what makes "the 10am one" resolvable — the times
-        # they can name are the times they were shown.
+        window = resolve_date(phrase, today=clock.today()) if phrase else {}
+        start = self._as_date(window.get("start") or "") if window.get("resolved") else None
+        end = self._as_date(window.get("end") or "") if window.get("resolved") else None
+
+        # With no window, anchored on the day being held rather than on today:
+        # the alternatives to an offer are the times near it, and a list
+        # starting from now answers a question nobody asked. It is also what
+        # makes "the 10am one" resolvable — the times they can name are the
+        # times they were shown.
         held = (
             self.session.get(AppointmentSlot, run.proposed_slot_id)
             if run.proposed_slot_id
             else None
         )
+        if start is None and held is not None:
+            start = held.start_time.date()
+
         found = find_available_slots(
             self.session,
             department_id=department_id,
-            start=held.start_time.date() if held else None,
+            start=start,
+            end=end,
+            part_of_day=window.get("part_of_day") or None,
         )
         others = [
             slot
@@ -316,7 +358,20 @@ class Toolbelt:
         ]
         self.proposals.offered_slots = others
         self.proposals.answered_with_slots = True
-        return {"slots": others, "total_matching": len(others)}
+        self.proposals.slot_window = window if window.get("resolved") else None
+        # Everything the search returned is answerable, not merely the three
+        # the reply lists. "Lets go with 4pm slot" named a time that was in
+        # this payload and below the fold, and recording only the rendered
+        # shortlist made the re-proposal guard refuse a slot the tool had just
+        # produced — the patient was shown alternatives again instead of being
+        # given the one they asked for.
+        #
+        # The guarantee is unchanged and is the one that matters: an id has to
+        # come from a tool result rather than from the model's memory of the
+        # conversation. A slot in another department, or one no search
+        # returned, is still refused.
+        record_offered(run, others)
+        return {"slots": others, "total_matching": len(others), "window": window or None}
 
     def _propose_another_slot(self, slot_id: int) -> dict:
         """Move the offer to a slot the patient has actually been shown.
@@ -356,7 +411,7 @@ class Toolbelt:
                 "accepted": False,
                 "problem": (
                     "You may only offer a time this patient has already been "
-                    "shown. Call list_other_slots and use an id from it."
+                    "shown. Ask for the times first, and use an id from that list."
                 ),
             }
 
@@ -373,14 +428,29 @@ class Toolbelt:
         self.proposals.reproposed = True
         return result
 
-    def _submit_confirmation_verdict(self, verdict: str, reason: str) -> dict:
+    def _submit_confirmation_verdict(
+        self, verdict: str, reason: str, phrase: str = ""
+    ) -> dict:
         """Validate the model's read of a confirmation answer.
 
         The asymmetry, restated as code: a wrongly re-asked "yes" costs one
         tap; a wrongly committed "no" books an appointment against the
-        patient's word at the exact step built to prevent that. So the enum has
-        two members and ``confirm`` is not one of them — the refusal is
-        structural rather than a matter of the prompt holding.
+        patient's word at the exact step built to prevent that. So ``confirm``
+        is not a member of the enum — the refusal is structural rather than a
+        matter of the prompt holding.
+
+        **Three members, because a question is a third kind of answer.** Live,
+        four availability questions in a row — "between august 5th and 10th",
+        "week after next", "after august 3rd", "more slots after august 10th" —
+        were all read as non-answers and met the same frozen re-ask, because
+        the enum had nowhere else to put them. ``slot_question`` carries the
+        patient's own words about timing and routes them through
+        ``resolve_date``, which is the only thing in this system permitted to
+        turn a phrase into dates.
+
+        Classification stays the model's job and the phrase stays the
+        patient's: there is no keyword list here, so a phrasing nobody
+        anticipated is read by the same thing that reads every other one.
         """
         proposed = str(verdict or "").strip().lower()
 
@@ -403,6 +473,17 @@ class Toolbelt:
             "confirmation_verdict", accepted=True, detail={"verdict": proposed}
         )
         self.proposals.confirmation_verdict = proposed
+
+        if proposed == "slot_question":
+            # Answered here rather than by a second tool: the confirmation read
+            # is the one place that says what the patient's reply *was*, and
+            # two entry points for "show me other times" would be two places
+            # for the proposal to be disturbed.
+            return {
+                "accepted": True,
+                "verdict": proposed,
+                **self._list_other_slots(phrase),
+            }
         return {"accepted": True, "verdict": proposed, "reason": reason}
 
     # --- Department Routing ----------------------------------------------

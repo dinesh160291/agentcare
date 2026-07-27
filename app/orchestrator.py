@@ -74,6 +74,7 @@ from app.workflow.plan import (
 )
 from app.workflow.replies import (
     promises_action,
+    render_outstanding,
     render_alternatives,
     render_proposal,
     render_reask,
@@ -99,6 +100,14 @@ DECLINED_REPLY = (
 NO_PLAN_REPLY = (
     "I want to make sure I get this right — could you tell me a little more about "
     "what you need help with?"
+)
+#: Said when a message would have replaced a run that is waiting for staff, and
+#: showed no difference to justify it. It states the run's *position*, never
+#: anything about what staff will decide.
+AWAITING_REVIEW_REPLY = (
+    "Your request is with our staff for review — nothing has been lost, and I "
+    "haven't started it again. They'll come back on it shortly. If you'd like "
+    "something different instead, tell me and I'll take it from there."
 )
 NOTHING_TO_CONFIRM_REPLY = (
     "There's nothing waiting for your confirmation just now. Tell me what you'd "
@@ -335,15 +344,7 @@ def _settle_confirmation(
     # above then reads as a stall. Live: "looks good. lets book that time" was
     # answered with "I will proceed to find a suitable time for you. Please
     # hold on", on a turn that was already holding one.
-    promised = bool(coordinator_reply) and promises_action(coordinator_reply)
-    if promised:
-        writer.guard_verdict(
-            "reply_promises_action",
-            passed=False,
-            detail={"reply": coordinator_reply[:200]},
-        )
-
-    lead = "" if (stalled or promised or not coordinator_reply) else coordinator_reply
+    lead = "" if stalled else _guarded(coordinator_reply, writer=writer)[0]
     return TurnResult(
         reply=f"{lead}\n{facts}".strip(),
         author=TraceAuthor.LLM if lead else TraceAuthor.TEMPLATE,
@@ -354,6 +355,29 @@ def _settle_confirmation(
     )
 
 
+def _guarded(text: str, *, writer: TraceWriter, fallback: str = "") -> tuple[str, bool]:
+    """Model prose, unless it announces an errand. Returns (text, was_model).
+
+    A reply that says the assistant is off doing something describes a turn
+    that is already over: nothing runs after the reply is written. Live, at
+    ``in_progress``, a side question got "noted as a side question. I will
+    continue... Please hold on for a moment" — twice, with nothing following
+    either time. The patient waits, then repeats themselves, and the stall
+    counter reads their patience as a stall.
+
+    Applied to every model-authored reply rather than only to the re-ask,
+    because the failure is not a property of the confirmation state — it is a
+    property of a model being asked to say something when the work is done.
+    """
+    if text and not promises_action(text):
+        return text, True
+    if text:
+        writer.guard_verdict(
+            "reply_promises_action", passed=False, detail={"reply": text[:200]}
+        )
+    return fallback, False
+
+
 def _answer_while_holding(
     session: Session,
     *,
@@ -362,7 +386,7 @@ def _answer_while_holding(
     outcome,
     base: dict,
 ) -> TurnResult | None:
-    """The answer half of answer-and-stay, at the one state that lacked it.
+    """The answer half of answer-and-stay, wherever the question was asked.
 
     ``None`` when this turn did neither of the two things, which leaves the
     confirmation path exactly as it was.
@@ -925,6 +949,20 @@ async def _continue_run(
             **base,
         )
 
+    if outcome.consequence is Consequence.STATUS_REPLY:
+        # A supersede the mapping refused. The patient has to be told *why*
+        # nothing appeared to happen, or the silence reads as the message
+        # having been ignored — and a templated answer is the only kind that
+        # can promise it states nothing about the review's outcome.
+        return TurnResult(
+            reply=AWAITING_REVIEW_REPLY,
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            message_class=outcome.message_class,
+            **base,
+        )
+
     if outcome.consequence is Consequence.SCOPE_REPLY:
         return TurnResult(
             reply=SCOPE_REPLY,
@@ -956,9 +994,21 @@ async def _continue_run(
         )
 
     if outcome.consequence is Consequence.ANSWER_AND_STAY:
+        # An availability question is answered with availability, in whatever
+        # state it was asked. Only the confirmation state had this path before,
+        # so the same question at `in_progress` got prose and no times.
+        answered = _answer_while_holding(
+            session, run=run, belt=belt, outcome=outcome, base=base
+        )
+        if answered is not None:
+            return answered
+
+        text, from_model = _guarded(
+            coordinator_reply, writer=writer, fallback=NO_PLAN_REPLY
+        )
         return TurnResult(
-            reply=coordinator_reply or NO_PLAN_REPLY,
-            author=TraceAuthor.LLM if coordinator_reply else TraceAuthor.TEMPLATE,
+            reply=text,
+            author=TraceAuthor.LLM if from_model else TraceAuthor.TEMPLATE,
             run_id=run.id,
             status=run.status.value,
             message_class=outcome.message_class,
@@ -1067,8 +1117,24 @@ async def _execute_plan(
             create=True,
         )
         steps_run.append(step.value)
-        if step_reply:
-            said.append(step_reply)
+        # Guarded per specialist rather than over the join: one agent's framing
+        # ("let me find you a time") must not take the next agent's proposal
+        # down with it. Dropping the whole reply left a turn that had proposed
+        # a time saying only "could you tell me more about what you need".
+        kept, _ = _guarded(step_reply, writer=writer)
+        if kept:
+            said.append(kept)
+
+        # The "what is still needed" half of a documents answer is code's, from
+        # the open task rows. A listing run that carries no department has
+        # nothing to diff against, and the model filled that gap with "no
+        # documents required" while an open task for a missing MRI report sat
+        # in the database — contradicted one turn later by the follow-up
+        # screen. Nothing to compare is not the same fact as nothing required.
+        if step is PlanStep.DOCUMENTS:
+            outstanding = render_outstanding(session, patient_id=run.patient_id)
+            if outstanding:
+                said.append(outstanding)
 
         if callbacks.budget_exhausted:
             return _fail_run(
@@ -1133,10 +1199,13 @@ async def _execute_plan(
 
     # The Coordinator's acknowledgement is only used when no specialist spoke:
     # "I'll find you an appointment" adds nothing next to "here is the time".
-    reply = " ".join(said) if said else fallback_reply
+    if said:
+        reply, from_model = " ".join(said), True
+    else:
+        reply, from_model = _guarded(fallback_reply, writer=writer, fallback=NO_PLAN_REPLY)
     return TurnResult(
-        reply=reply or NO_PLAN_REPLY,
-        author=TraceAuthor.LLM if reply else TraceAuthor.TEMPLATE,
+        reply=reply,
+        author=TraceAuthor.LLM if from_model else TraceAuthor.TEMPLATE,
         run_id=run.id,
         status=run.status.value,
         plan=list(run.plan or []),
