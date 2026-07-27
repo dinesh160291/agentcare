@@ -79,7 +79,21 @@ class BudgetExceeded(AgentCareError):
 
 
 class ProviderError(AgentCareError):
-    """The LLM provider failed after the retry ladder was exhausted."""
+    """The LLM provider failed after the retry ladder was exhausted.
+
+    ``turn`` carries the :class:`~app.orchestrator.TurnResult` the envelope
+    wrote for this failure, when the failure happened inside a turn. The
+    envelope records a template reply in the trace and commits it *before*
+    re-raising, so without this the two accounts of the turn disagree: the
+    trace says the patient was let down gently, and the patient got a bare 500.
+    The API's handler serves what is attached here.
+
+    Untyped and defaulted rather than an ``__init__`` argument because every
+    ``raise`` site is inside a provider, which has no turn to hand over — only
+    the envelope, further out, knows what the turn was.
+    """
+
+    turn: object | None = None
 
 
 class RateLimited(ProviderError):

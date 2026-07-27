@@ -96,6 +96,81 @@ class TestTheChatFrontDoor:
         assert run["department_name"] == "Cardiology"
 
 
+class TestAProviderFailureIsStillOneTurnWithOneReply:
+    """The trace and the patient must agree on what was said.
+
+    Observed live: the provider raised, the envelope wrote a template outbound
+    event and committed it — the trace records a graceful reply — and then
+    re-raised, so the HTTP response was a bare 500 and the screen showed
+    "Something went wrong: Internal Server Error". Two different accounts of
+    the same turn, and the one the patient got was the wrong one.
+
+    Failing loudly is still right: the status is an error status, the turn is
+    recorded as failed, and nothing pretends the request was handled. What
+    changes is that the error carries the words the trace says were sent.
+    """
+
+    @pytest.fixture
+    def broken_provider(self, monkeypatch):
+        from app.errors import ProviderError
+        from app.providers.base import AgentCareLlm
+
+        class Broken(AgentCareLlm):
+            model: str = "broken-stub"
+
+            async def generate_content_async(self, llm_request, stream=False):
+                raise ProviderError("openai call failed: connection reset")
+                yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: Broken()
+        )
+
+    def test_the_patient_is_not_shown_a_bare_500(
+        self, wired_seeded, patient_token, broken_provider
+    ):
+        with pytest.raises(ApiError) as caught:
+            wired_seeded.send_message(
+                patient_token, message=BOOKING, session_id="wire-broken-1"
+            )
+        assert caught.value.status_code == 503
+
+    def test_the_reply_the_trace_recorded_is_the_reply_that_was_served(
+        self, wired_seeded, patient_token, broken_provider
+    ):
+        from app.orchestrator import FAILED_REPLY
+
+        with pytest.raises(ApiError) as caught:
+            wired_seeded.send_message(
+                patient_token, message=BOOKING, session_id="wire-broken-2"
+            )
+        assert caught.value.payload["reply"] == FAILED_REPLY
+        # The client reads ``detail``; a body the current UI cannot read would
+        # be the same disagreement wearing a different status code.
+        assert caught.value.detail == FAILED_REPLY
+
+    def test_the_turn_is_identified_so_the_failure_can_be_looked_up(
+        self, wired_seeded, patient_token, broken_provider
+    ):
+        """A failed turn is the one a reviewer most needs to find in the
+        trace, and the id is the only handle on it."""
+        with pytest.raises(ApiError) as caught:
+            wired_seeded.send_message(
+                patient_token, message=BOOKING, session_id="wire-broken-3"
+            )
+        assert caught.value.payload["turn_id"]
+        assert caught.value.payload["session_id"] == "wire-broken-3"
+        assert caught.value.payload["author"] == "template"
+
+    def test_a_working_provider_is_unaffected(self, wired_seeded, patient_token):
+        """Distrust green: a handler that answered 503 for everything would
+        pass every assertion above."""
+        turn = wired_seeded.send_message(
+            patient_token, message=BOOKING, session_id="wire-broken-4"
+        )
+        assert turn["status"] == "pending_confirmation"
+
+
 class TestOwnershipThroughTheClient:
     def test_another_patients_run_is_a_404(self, wired_seeded, patient_token,
                                            other_patient_token):

@@ -133,6 +133,28 @@ class TurnOut(BaseModel):
     plan: list[str] = Field(default_factory=list)
     steps_run: list[str] = Field(default_factory=list)
 
+    @classmethod
+    def of(cls, result: Any) -> "TurnOut":
+        """Serialize a ``TurnResult``.
+
+        A classmethod rather than a helper in the router because a turn now
+        leaves the system through two doors: the router returns one, and the
+        provider-failure handler in ``app.api.errors`` serves one for a turn
+        that raised. Two serializers would be two shapes, and the one nobody
+        looks at is the one that drifts.
+        """
+        return cls(
+            reply=result.reply,
+            author=result.author.value,
+            turn_id=result.turn_id,
+            session_id=result.session_id,
+            run_id=result.run_id,
+            status=result.status,
+            message_class=result.message_class.value if result.message_class else None,
+            plan=result.plan,
+            steps_run=result.steps_run,
+        )
+
 
 class RunOut(BaseModel):
     run_id: int

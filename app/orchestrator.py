@@ -39,7 +39,7 @@ from app.agents.base import run_agent
 from app.audit import write_audit
 from app.config import get_settings
 from app.db import SessionLocal
-from app.errors import BudgetExceeded, ValidationFailed
+from app.errors import BudgetExceeded, ProviderError, ValidationFailed
 from app.models import (
     APPOINTMENT_VERBS,
     EscalationKind,
@@ -466,6 +466,18 @@ async def _turn_envelope(
             metadata={"error": f"{type(exc).__name__}: {exc}"},
         )
         session.commit()
+        # The trace now says the patient was answered with a template. Carry
+        # that answer out with the exception so the layer that replies can send
+        # the same words: a turn recorded one way and delivered another is a
+        # trace that describes a system nobody used.
+        if isinstance(exc, ProviderError):
+            exc.turn = TurnResult(
+                reply=FAILED_REPLY,
+                author=TraceAuthor.TEMPLATE,
+                turn_id=writer.turn_id,
+                session_id=conversation_id,
+                run_id=writer.workflow_run_id,
+            )
         raise
     finally:
         session.close()

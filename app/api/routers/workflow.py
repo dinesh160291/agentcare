@@ -26,7 +26,7 @@ from app.auth.dependencies import CurrentUser, PatientUser
 from app.auth.ownership import get_owned_or_404, patient_profile_for
 from app.db import get_session
 from app.models import WorkflowRun
-from app.orchestrator import TurnResult, apply_patient_action, run_workflow
+from app.orchestrator import apply_patient_action, run_workflow
 
 router = APIRouter(prefix="/workflow", tags=["workflow"])
 
@@ -53,18 +53,6 @@ def run_out(run: WorkflowRun) -> RunOut:
     )
 
 
-def _turn_out(result: TurnResult) -> TurnOut:
-    return TurnOut(
-        reply=result.reply,
-        author=result.author.value,
-        turn_id=result.turn_id,
-        session_id=result.session_id,
-        run_id=result.run_id,
-        status=result.status,
-        message_class=result.message_class.value if result.message_class else None,
-        plan=result.plan,
-        steps_run=result.steps_run,
-    )
 
 
 @router.post("/messages", response_model=TurnOut)
@@ -76,13 +64,15 @@ async def submit_message(payload: MessageRequest, user: PatientUser) -> TurnOut:
         # message is not a turn, and opening one would leave an inbound event
         # with nothing to be inbound about.
         raise HTTPException(status_code=422, detail="A message cannot be empty.")
-    return _turn_out(await run_workflow(user, message, payload.session_id))
+    return TurnOut.of(await run_workflow(user, message, payload.session_id))
 
 
 @router.post("/actions", response_model=TurnOut)
 async def submit_action(payload: ActionRequest, user: PatientUser) -> TurnOut:
     """✅ Confirm / ❌ Decline. No model is consulted about what it meant."""
-    return _turn_out(await apply_patient_action(user, payload.action, payload.session_id))
+    return TurnOut.of(
+        await apply_patient_action(user, payload.action, payload.session_id)
+    )
 
 
 @router.get("/runs", response_model=list[RunOut])

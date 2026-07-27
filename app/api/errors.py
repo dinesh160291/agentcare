@@ -21,10 +21,13 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.api.schemas import TurnOut
 from app.errors import (
     AgentCareError,
     AuthenticationError,
     PermissionDenied,
+    ProviderError,
+    RateLimited,
     RecordNotFound,
     ValidationFailed,
 )
@@ -37,6 +40,7 @@ STATUS_FOR: dict[type[AgentCareError], int] = {
     PermissionDenied: 403,
     RecordNotFound: 404,
     ValidationFailed: 422,
+    ProviderError: 503,
 }
 
 
@@ -64,6 +68,33 @@ def install_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ValidationFailed)
     async def _validation(_request: Request, exc: ValidationFailed) -> JSONResponse:
         return _json(422, str(exc))
+
+    @app.exception_handler(ProviderError)
+    async def _provider(_request: Request, exc: ProviderError) -> JSONResponse:
+        """The model provider failed. Serve the reply the trace already recorded.
+
+        A turn that dies inside the provider is not silent: the envelope writes
+        a template outbound event and **commits** it before re-raising, so the
+        trace says the patient was let down gently. Without this handler the
+        patient got a bare 500 instead — one turn with two different accounts
+        of what was said, and the trace vouching for words nobody read.
+
+        Still an error status, because the request genuinely was not carried
+        out. The body is a ``TurnOut`` so a client can render the reply and
+        keep the turn id, plus a ``detail`` key because that is where every
+        other refusal on this API puts its message and the client reads it
+        there. Attaching ``turn`` is the envelope's job; a provider raising
+        outside a turn has none, and gets the plain refusal.
+        """
+        retry_after = getattr(exc, "retry_after", None) if isinstance(exc, RateLimited) else None
+        headers = {"Retry-After": str(int(retry_after))} if retry_after else None
+
+        if exc.turn is None:
+            return _json(503, "The assistant is unavailable right now.", headers=headers)
+
+        body = TurnOut.of(exc.turn).model_dump()
+        body["detail"] = exc.turn.reply
+        return JSONResponse(status_code=503, content=body, headers=headers)
 
 
 __all__ = ["STATUS_FOR", "install_exception_handlers"]
