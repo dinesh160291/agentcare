@@ -18,6 +18,8 @@ run before any mutation, because that audit commits the acting session.
 from app.tools.appointments import (
     book_appointment,
     cancel_appointment,
+    describe_appointment,
+    list_patient_appointments,
     reschedule_appointment,
 )
 from app.tools.availability import find_available_slots, get_slot
@@ -31,6 +33,7 @@ from app.tools.departments import (
 from app.tools.documents import (
     apply_verification,
     checksum_bytes,
+    describe_document,
     diff_required_documents,
     extract_document_text,
     find_duplicate,
@@ -56,6 +59,8 @@ __all__ = [
     "checksum_bytes",
     "close_followup_tasks",
     "create_escalation",
+    "describe_appointment",
+    "describe_document",
     "diff_required_documents",
     "extract_document_text",
     "find_available_slots",
@@ -68,6 +73,7 @@ __all__ = [
     "list_due_reminders",
     "list_open_escalations",
     "list_open_tasks",
+    "list_patient_appointments",
     "list_patient_documents",
     "list_unverified_documents",
     "list_patient_reminders",

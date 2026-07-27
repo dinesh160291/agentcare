@@ -391,3 +391,42 @@ def cancel_appointment(
     session.commit()
 
     return _result(ok=True, appointment=_serialise(session, appointment))
+
+
+def describe_appointment(session: Session, appointment: Appointment) -> dict[str, Any]:
+    """One appointment as the read surfaces show it.
+
+    ``_serialise`` plus the department name. Public because the API reads one
+    appointment and a list of them through the same shape, and a router
+    building its own dict is how the shape acquires a second definition — the
+    exact failure that left ``missing_mandatory`` unread by two consumers.
+    """
+    row = _serialise(session, appointment)
+    department = session.get(Department, appointment.department_id)
+    row["department_name"] = department.name if department else None
+    return row
+
+
+def list_patient_appointments(
+    session: Session, *, patient_id: int, live_only: bool = False
+) -> list[dict[str, Any]]:
+    """Every appointment on file for a patient, soonest first.
+
+    Distinct from ``get_patient_context``'s upcoming list, which answers a
+    different question — "what does this patient have coming up" — and is
+    filtered to live statuses for that reason. PRD story 22 asks for the
+    overview: cancelled and completed visits included, each carrying the status
+    that says which it is.
+
+    Sorted by slot start time, with slot-less rows last: an appointment whose
+    slot was released still exists and still belongs in the list.
+    """
+    query = session.query(Appointment).filter(Appointment.patient_id == patient_id)
+    if live_only:
+        query = query.filter(Appointment.status.in_(LIVE_STATUSES))
+
+    rows = [describe_appointment(session, appointment) for appointment in query.all()]
+    # Slot-less rows sort last, then by start time, then by id for stability.
+    return sorted(
+        rows, key=lambda r: (r["start"] is None, r["start"] or "", r["appointment_id"])
+    )

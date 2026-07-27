@@ -329,7 +329,7 @@ def apply_verification(
             "status": document.status.value,
         },
     )
-    return _serialise_document(document)
+    return describe_document(document)
 
 
 def list_unverified_documents(
@@ -345,7 +345,7 @@ def list_unverified_documents(
         .order_by(PatientDocument.id)
         .all()
     )
-    return [_serialise_document(doc) for doc in documents]
+    return [describe_document(doc) for doc in documents]
 
 
 def list_flagged_documents(session: Session) -> list[dict[str, Any]]:
@@ -356,10 +356,16 @@ def list_flagged_documents(session: Session) -> list[dict[str, Any]]:
         .order_by(PatientDocument.id)
         .all()
     )
-    return [_serialise_document(doc) for doc in documents]
+    return [describe_document(doc) for doc in documents]
 
 
-def _serialise_document(doc: PatientDocument) -> dict[str, Any]:
+def describe_document(doc: PatientDocument) -> dict[str, Any]:
+    """One document as every read surface shows it.
+
+    Public because the API reads a single document through the same shape
+    the queues use, and a router assembling its own dict is how one shape
+    quietly becomes two.
+    """
     return {
         "document_id": doc.id,
         "patient_id": doc.patient_id,
