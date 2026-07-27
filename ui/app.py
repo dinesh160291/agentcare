@@ -115,6 +115,17 @@ def _login_form() -> None:
                 st.success("Account created. Log in with those details.")
 
     st.markdown(
+        '<p class="ac-dim"><b>Your session ends if you refresh the page.</b> The '
+        "access token is held in server-side session state and is deliberately "
+        "never written to the URL or to a browser cookie — a token in either one "
+        "outlives the tab it was issued to. Log in again to carry on: an open "
+        "request is held against your record, not against this tab, so the next "
+        "message picks it up where it was. Only the on-screen transcript restarts."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
         theme.card(
             "".join(
                 f'<div style="display:flex;gap:10px;padding:3px 0;font-size:13px;">'
