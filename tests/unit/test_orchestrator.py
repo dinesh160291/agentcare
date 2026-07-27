@@ -712,6 +712,200 @@ class TestIterationBudget:
         assert "staff" in result.reply.lower()
 
 
+class ResubmittingLlm(AgentCareLlm):
+    """A provider that re-calls a submit tool whose result was already accepted.
+
+    Observed live on ``openai/gpt-4o-mini``, reduced to a stub: holding a
+    single mandatory tool and asked again, it volunteers no text — it calls the
+    tool again. In the trace, ``submit_safety_verdict`` was accepted at seq
+    5-7, then re-called eight more times until the iteration budget fired and
+    the turn failed with a template. The function_response round-trip was
+    intact, so this is the model's behaviour and not the adapter's.
+
+    The mock and llama happen to answer with text at that point. That is the
+    only reason a defect living in *every* submit-style loop stayed invisible
+    until a third provider ran.
+    """
+
+    model: str = "resubmitting-stub"
+    category: str = "safe"
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        available = available_tool_names(llm_request)
+        if "submit_safety_verdict" in available:
+            yield function_call_response(
+                "submit_safety_verdict",
+                {"category": self.category, "rationale": "stub: re-submitting"},
+            )
+            return
+        if "submit_plan" in available:
+            if "load_patient_context" not in called_tools(llm_request):
+                yield function_call_response("load_patient_context", {})
+                return
+            yield function_call_response("submit_plan", {"steps": ["route", "book"]})
+            return
+        # Specialists are not the subject here; leave them a plain reply so the
+        # turn ends on the loop control being tested rather than on a stall.
+        yield text_response("stub")
+
+
+class EmergencyResubmittingLlm(ResubmittingLlm):
+    """The same defect, on the verdict whose loss would be silent and worst."""
+
+    model: str = "resubmitting-emergency-stub"
+    category: str = "emergency"
+
+
+def _validations(session, turn_id: str, what: str) -> list[TraceEvent]:
+    return [
+        event
+        for event in session.query(TraceEvent)
+        .filter(TraceEvent.turn_id == turn_id)
+        .order_by(TraceEvent.seq)
+        .all()
+        if event.event_type is TraceEventType.VALIDATION
+        and event.payload["what"] == what
+    ]
+
+
+def _tool_calls(session, turn_id: str) -> list[TraceEvent]:
+    return [
+        event
+        for event in session.query(TraceEvent)
+        .filter(TraceEvent.turn_id == turn_id)
+        .order_by(TraceEvent.seq)
+        .all()
+        if event.event_type is TraceEventType.TOOL_CALL
+    ]
+
+
+class TestAcceptedSubmitEndsTheLoop:
+    """A submit tool's acceptance is the end of that decision, and code says so.
+
+    The iteration budget is the outer bound and it works — but reaching it
+    costs eight wasted calls and *fails a turn that had already succeeded*.
+    The verdict was in the belt at call one; everything after it is the model
+    being asked a question it has already answered.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _resubmit(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: ResubmittingLlm()
+        )
+
+    def test_the_turn_completes_instead_of_exhausting_the_budget(self, patient):
+        result = turn(patient, BOOKING, "s-resubmit-1")
+        assert result.budget_exhausted is False
+
+    def test_the_safety_screen_calls_its_tool_once(self, patient):
+        """Terminal on acceptance: the screen's prompt forbids it a reply and
+        ``llm_screen`` discards the text, so the model call that would follow
+        acceptance has nothing left to produce."""
+        result = turn(patient, BOOKING, "s-resubmit-2")
+
+        session = fresh()
+        try:
+            calls = Counter(
+                event.payload["tool"]
+                for event in _tool_calls(session, result.turn_id)
+                if event.agent_name == "safety_screen"
+            )
+        finally:
+            session.close()
+
+        assert calls["submit_safety_verdict"] == 1
+
+    def test_the_screen_is_asked_once_and_not_asked_again(self, patient):
+        """The saving is a whole LLM call per turn, on every provider: the
+        screen runs on every message, and its second call never had a use."""
+        result = turn(patient, BOOKING, "s-resubmit-3")
+
+        session = fresh()
+        try:
+            requests = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.LLM_REQUEST
+                and event.agent_name == "safety_screen"
+            ]
+        finally:
+            session.close()
+
+        assert len(requests) == 1
+
+    def test_a_repeat_of_an_accepted_call_is_refused(self, patient):
+        """The Coordinator's ``submit_plan`` is not terminal — it may be
+        followed by an acknowledgement — so the bound there is repetition:
+        the same call, already accepted, is not run a second time."""
+        result = turn(patient, BOOKING, "s-resubmit-4")
+
+        session = fresh()
+        try:
+            plans = [
+                event
+                for event in _tool_calls(session, result.turn_id)
+                if event.payload["tool"] == "submit_plan"
+            ]
+            refusals = _validations(session, result.turn_id, "repeated_tool_call")
+        finally:
+            session.close()
+
+        assert len(plans) == 1
+        assert refusals, "the refusal must be in the trace, not merely happen"
+
+    def test_the_accepted_plan_survives_the_early_exit(self, patient):
+        """Distrust green: ending the loop must not throw away what the tool
+        accepted. A turn that completes but silently loses the plan would pass
+        every assertion above."""
+        result = turn(patient, BOOKING, "s-resubmit-5")
+        # The submitted steps, in canonical order, ahead of the ones
+        # ``validate_plan`` implies for a booking.
+        assert result.plan[:2] == ["route", "book"]
+        assert result.run_id is not None
+
+    def test_the_trace_is_still_well_formed(self, patient):
+        turn(patient, BOOKING, "s-resubmit-6")
+
+        session = fresh()
+        try:
+            assert_well_formed(session)
+        finally:
+            session.close()
+
+
+class TestTheTerminalExitKeepsTheVerdict:
+    """The safety verdict is the one whose loss would be silent and worst: the
+    turn would carry on booking as though nothing had been said."""
+
+    @pytest.fixture(autouse=True)
+    def _resubmit(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider",
+            lambda name=None: EmergencyResubmittingLlm(),
+        )
+
+    def test_an_emergency_still_escalates(self, patient):
+        result = turn(patient, BOOKING, "s-resubmit-safety")
+
+        session = fresh()
+        try:
+            escalations = (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.SAFETY)
+                .all()
+            )
+        finally:
+            session.close()
+
+        assert escalations, "the accepted verdict was dropped with the loop"
+        assert result.budget_exhausted is False
+
+
 RESTART_SCRIPT = """
 import asyncio, os, sys
 sys.path.insert(0, {root!r})

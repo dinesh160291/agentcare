@@ -17,13 +17,39 @@ slot search that returns empty, prompting a wider search that returns empty,
 prompting a wider search, is a sequence of perfectly good calls that never
 ends. ``before_tool`` refuses past the cap and records the exhaustion, which
 the orchestrator turns into a ``failed`` run and a graceful reply.
+
+They also carry the tighter bound the budget is too blunt for. A decision the
+model has already had accepted is *settled*, and asking for it again is not a
+step toward anything. Two rules, one flag:
+
+* an **accepted repeat** — the same tool, the same arguments, already accepted
+  this agent turn — is refused and ends the loop;
+* a **terminal tool** — one whose acceptance is the agent's entire output —
+  ends the loop the moment it is accepted, with no further call at all.
+
+Both matter because the budget's failure mode is expensive and misleading.
+Observed live on ``openai/gpt-4o-mini``: it re-called ``submit_safety_verdict``
+eight times after the verdict was accepted, spending nine calls on one screen
+and then **failing a turn that had already succeeded**. Models that volunteer
+text at that point — llama, the mock — merely paid for a call whose output is
+thrown away, which is why the defect survived two providers.
+
+Ending the loop is done from ``before_model``, not by refusing the tool:
+refusal leaves the model being asked again, wanting the same thing again.
 """
 
 from __future__ import annotations
 
+import json
+
 from app.agents.memory import window_contents
 from app.providers.base import request_snapshot, response_snapshot, text_response
 from app.trace import TraceWriter
+
+
+def _signature(name: str, args: dict | None) -> str:
+    """A call's identity: its tool and its arguments, order-independent."""
+    return f"{name}({json.dumps(args or {}, sort_keys=True, default=str)})"
 
 
 class TurnCallbacks:
@@ -41,6 +67,12 @@ class TurnCallbacks:
         self.history_window_turns = history_window_turns
         self.tool_iterations = 0
         self.budget_exhausted = False
+        #: This agent has said everything it was asked for. Unlike
+        #: ``budget_exhausted`` this is not a failure — the answer is in the
+        #: toolbelt, so the turn carries on from there.
+        self.settled = False
+        self.terminal_tool: str | None = None
+        self._accepted: set[str] = set()
         #: The request awaiting a partner. Held here rather than in ADK session
         #: state so that a provider exception can still be paired: the
         #: orchestrator reads this and writes the ``llm_error`` itself.
@@ -50,7 +82,7 @@ class TurnCallbacks:
 
     # --- LLM ------------------------------------------------------------
 
-    def start_agent(self) -> None:
+    def start_agent(self, *, terminal_tool: str | None = None) -> None:
         """Begin a new agent's turn. Resets the per-agent tool counter.
 
         The cap is per agent turn, not per conversation turn: a booking turn
@@ -58,8 +90,23 @@ class TurnCallbacks:
         three in Appointment, and a shared counter would put an ordinary
         request within one call of its own budget. ``budget_exhausted`` is
         *not* reset — once a turn has blown a budget, it has failed.
+
+        ``settled`` and the accepted-call set *are* per agent, for the same
+        reason the counter is: the Coordinator having submitted its plan says
+        nothing about whether Routing has submitted a department.
+
+        ``terminal_tool`` names the one tool, if any, whose acceptance is this
+        agent's whole output. Only the caller knows: the safety screen's
+        prompt forbids it a reply and :func:`app.safety.classifier.llm_screen`
+        discards its text, so a call after the verdict has nothing to produce.
+        Every other agent is asked to speak once its tool has run, so leaving
+        this ``None`` is the right default and the accepted-repeat rule is
+        what bounds them.
         """
         self.tool_iterations = 0
+        self.settled = False
+        self.terminal_tool = terminal_tool
+        self._accepted = set()
 
     def before_model(self, callback_context, llm_request):  # noqa: ANN001
         # Refusing the tool is not enough to stop a loop: the model would be
@@ -71,6 +118,13 @@ class TurnCallbacks:
             return text_response(
                 "I couldn't complete this request within the steps available."
             )
+
+        # Settled is the *successful* twin of the above, and the reply is empty
+        # on purpose: this agent has nothing left to say, and the orchestrator's
+        # existing fallbacks turn an empty reply into a template. A sentence
+        # here would become the patient's reply — words nobody wrote for them.
+        if self.settled:
+            return text_response("")
 
         # Window *before* the snapshot, so the trace records what was actually
         # sent rather than what the framework would have sent unaided.
@@ -142,6 +196,28 @@ class TurnCallbacks:
                 )
             }
 
+        signature = _signature(tool.name, dict(args or {}))
+        if signature in self._accepted:
+            # Not an error the model can correct — the answer it wants is one
+            # it already has. Running the tool again would re-apply whatever
+            # the first call applied, so this refuses *and* ends the loop.
+            self.settled = True
+            self.writer.validation(
+                "repeated_tool_call",
+                accepted=False,
+                detail={
+                    "tool": tool.name,
+                    "args": dict(args or {}),
+                    "problem": "already accepted this turn",
+                },
+            )
+            return {
+                "error": (
+                    f"{tool.name} has already been accepted this turn with these "
+                    "arguments. That decision is made; do not submit it again."
+                )
+            }
+
         correlation = self.writer.tool_call(
             tool.name, args=dict(args or {}), agent_name=tool_context.agent_name
         )
@@ -151,8 +227,9 @@ class TurnCallbacks:
     def after_tool(self, tool, args, tool_context, tool_response):  # noqa: ANN001
         correlation = self._tool_correlations.pop(tool.name, None)
         if correlation is None:
-            # The call was refused by the budget, so no tool_call was written;
-            # pairing a result to nothing would fail the well-formedness check.
+            # The call was refused before it ran — by the budget or as a repeat
+            # — so no tool_call was written, and pairing a result to nothing
+            # would fail the well-formedness check.
             return None
         self.writer.tool_result(
             correlation,
@@ -160,6 +237,24 @@ class TurnCallbacks:
             result=tool_response,
             agent_name=tool_context.agent_name,
         )
+
+        # Only *accepted* results settle anything. A rejected proposal is the
+        # retry ladder working — the model is meant to correct it and call
+        # again — and a read-only result carries no verdict to repeat.
+        accepted = (
+            isinstance(tool_response, dict) and tool_response.get("accepted") is True
+        )
+        if not accepted:
+            return None
+
+        self._accepted.add(_signature(tool.name, dict(args or {})))
+        if tool.name == self.terminal_tool:
+            self.settled = True
+            self.writer.validation(
+                "agent_settled",
+                accepted=True,
+                detail={"tool": tool.name, "agent": tool_context.agent_name},
+            )
         return None
 
 

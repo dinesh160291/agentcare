@@ -62,6 +62,7 @@ async def run_agent(
     session_id: str,
     user_id: str,
     create: bool,
+    terminal_tool: str | None = None,
 ) -> str:
     """Drive one agent for one task and return whatever text it produced.
 
@@ -73,13 +74,17 @@ async def run_agent(
     A provider failure is paired into the trace before it propagates: a request
     with no terminal partner is supposed to mean the process died mid-call, and
     that diagnosis is only worth anything if nothing else can produce it.
+
+    ``terminal_tool``, where the caller has one, names the tool whose accepted
+    result *is* this agent's output — so the loop can stop there rather than
+    asking a model to comment on an answer already in hand.
     """
     if create:
         await session_service.create_session(
             app_name=memory.APP_NAME, user_id=user_id, session_id=session_id
         )
 
-    callbacks.start_agent()
+    callbacks.start_agent(terminal_tool=terminal_tool)
     runner = Runner(
         agent=agent, app_name=memory.APP_NAME, session_service=session_service
     )

@@ -360,3 +360,24 @@ class TestTheLlmScreenCatchesWhatThePhraseListCannot:
         assert guards["safety_keyword_screen"]["passed"] is True
         assert guards["safety_llm_screen"]["passed"] is False
         assert guards["safety_llm_screen"]["detail"]["source"] == "llm"
+
+
+class TestTheScreensTerminalToolIsTheOneItActuallyHas:
+    """``llm_screen`` declares a tool name terminal, and the tool is a nested
+    function whose name the declaration cannot see. Renaming one and not the
+    other would not fail: the screen would simply go back to being asked a
+    second question after every verdict — cheap to miss, and exactly the
+    behaviour the declaration was added to stop."""
+
+    def test_the_named_tool_is_in_the_built_toolset(self):
+        from app.safety.classifier import VERDICT_TOOL, _Holder, _tools
+
+        names = {tool.__name__ for tool in _tools(_Holder(), None)}
+        assert VERDICT_TOOL in names
+
+    def test_the_screen_hands_out_nothing_else(self):
+        """One tool is what makes it terminal at all. A second would mean the
+        agent still had work to do after the verdict."""
+        from app.safety.classifier import _Holder, _tools
+
+        assert len(_tools(_Holder(), None)) == 1

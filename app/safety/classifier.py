@@ -36,6 +36,12 @@ from app.trace import TraceWriter
 #: classifier never ran" are different facts and the trace must tell them apart.
 SAFETY_CLASSES = ("emergency", "clinical_advice", "safe")
 
+#: The screen's only tool, and its only output. Named here because
+#: :func:`llm_screen` declares it terminal to :func:`app.agents.base.run_agent`,
+#: and a name that drifts from the function would silently un-declare it —
+#: pinned by a test that reads the real toolset.
+VERDICT_TOOL = "submit_safety_verdict"
+
 
 @dataclass
 class _Holder:
@@ -124,9 +130,15 @@ async def llm_screen(
         session_id=f"{writer.turn_id}-safety",
         user_id=user_id,
         create=True,
+        # The verdict *is* the output. The prompt tells this agent it has no
+        # reply to write and the return value above is discarded, so the model
+        # call that would follow acceptance can only produce something nobody
+        # reads — or, on a model that answers a single mandatory tool by
+        # calling it again, eight more of them and a failed turn.
+        terminal_tool=VERDICT_TOOL,
     )
 
     return holder.verdict if holder.verdict is not None else PASSED
 
 
-__all__ = ["SAFETY_CLASSES", "llm_screen"]
+__all__ = ["SAFETY_CLASSES", "VERDICT_TOOL", "llm_screen"]
