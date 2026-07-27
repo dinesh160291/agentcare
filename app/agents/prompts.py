@@ -77,6 +77,12 @@ message needs, drawn only from:
   documents  - check which documents are on file or still needed
   follow_up  - reminders, outstanding tasks, post-visit follow-up
 
+`steps` is a list of those words and nothing else. For "book me a cardiology
+appointment next week" it is exactly:
+  {"steps": ["route", "book"]}
+Never a list of objects, never a sentence, never a word that is not on the list
+above.
+
 Choose the steps the message actually asks for. A patient only uploading a
 document does not need an appointment booked. But if the message asks for a new
 appointment at all, include `book` — even when it also mentions documents. A

@@ -64,6 +64,26 @@ def _json_schema(schema: Any) -> dict[str, Any]:
     return normalise(raw)
 
 
+def _parameters(declaration: Any) -> dict[str, Any]:
+    """The argument schema, whichever of the two shapes ADK built it in.
+
+    ADK declares a function either as a genai ``Schema`` in ``parameters`` or
+    as plain JSON Schema in ``parameters_json_schema``, depending on a feature
+    flag. The installed version fills the second and leaves the first ``None``,
+    so reading only ``parameters`` sent every tool to the provider declaring no
+    arguments at all — leaving the model to infer the shape from the docstring.
+    That is how ``submit_plan`` arrived holding a list of objects rather than a
+    list of step names, and it cost a turn each time: rejected, resubmitted
+    identically, until the iteration budget fired.
+
+    It was invisible locally because the mock provider does not read schemas.
+    """
+    json_schema = getattr(declaration, "parameters_json_schema", None)
+    if json_schema:
+        return _json_schema(json_schema)
+    return _json_schema(declaration.parameters)
+
+
 def _tools_payload(llm_request: LlmRequest) -> list[dict[str, Any]]:
     """Tool declarations in chat-completions form."""
     tools: list[dict[str, Any]] = []
@@ -76,7 +96,7 @@ def _tools_payload(llm_request: LlmRequest) -> list[dict[str, Any]]:
                     "function": {
                         "name": declaration.name,
                         "description": declaration.description or "",
-                        "parameters": _json_schema(declaration.parameters),
+                        "parameters": _parameters(declaration),
                     },
                 }
             )
@@ -89,6 +109,11 @@ def _messages_payload(llm_request: LlmRequest) -> list[dict[str, Any]]:
     Tool call ids are synthesised and matched by position: a ``function_response``
     binds to the most recent unmatched ``function_call`` of the same name. The
     genai side does not always carry an id, and the chat API requires one.
+
+    A response whose call is not in this request is re-paired with a
+    synthesised one rather than emitted alone — see the comment below. The
+    invariant the whole function owes its caller is that **every** tool message
+    has an assistant ``tool_call`` bearing its id before it.
     """
     messages: list[dict[str, Any]] = []
 
@@ -129,8 +154,35 @@ def _messages_payload(llm_request: LlmRequest) -> list[dict[str, Any]]:
 
             response = getattr(part, "function_response", None)
             if response is not None:
+                name = response.name or "unknown_tool"
                 queued = pending.get(response.name or "", [])
-                call_id = queued.pop(0) if queued else f"call_{response.name}"
+                if queued:
+                    call_id = queued.pop(0)
+                else:
+                    # An orphan: the call this answers is not in this request.
+                    # It happens where a history begins mid-turn — a stage
+                    # boundary, or a window that started at a tool result,
+                    # since ADK carries results as ``role="user"`` contents.
+                    # The chat API rejects a tool message with no assistant
+                    # tool_call before it, and says so as a 400 naming the
+                    # index rather than the cause. Re-paired rather than
+                    # dropped: the result is real and the model needs it, and
+                    # only the call's arguments are unrecoverable.
+                    counter += 1
+                    call_id = f"call_{counter}"
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": "{}"},
+                                }
+                            ],
+                        }
+                    )
                 messages.append(
                     {
                         "role": "tool",

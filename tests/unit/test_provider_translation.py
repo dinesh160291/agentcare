@@ -20,8 +20,11 @@ import json
 from dataclasses import dataclass
 
 from google.adk.models import LlmRequest
+from google.adk.tools import FunctionTool
 from google.genai import types
 
+from app.agents.toolbelt import Toolbelt
+from app.models.enums import PlanStep
 from app.providers.base import (
     ADK_CONTEXT_MARKERS,
     called_tools,
@@ -37,6 +40,7 @@ from app.providers.base import (
 from app.providers.openai_compatible import (
     _json_schema,
     _messages_payload,
+    _tools_payload,
     _to_llm_response,
     _is_rate_limit,
     _retry_after,
@@ -249,6 +253,70 @@ class TestSchemaTranslation:
         assert out["properties"]["slots"]["items"]["type"] == "integer"
 
 
+def _declared(func) -> dict:
+    """What the provider is told about ``func``, through the real ADK path.
+
+    Built from a genuine ``FunctionTool`` rather than a hand-written
+    declaration on purpose: the defect this pins lives in the *shape* ADK
+    chooses, which a hand-written fixture would simply not have.
+    """
+    declaration = FunctionTool(func)._get_declaration()
+    request = LlmRequest(
+        model="m",
+        contents=[],
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(function_declarations=[declaration])]
+        ),
+    )
+    return _tools_payload(request)[0]["function"]
+
+
+class TestToolDeclarations:
+    """The arguments a provider is told a tool takes.
+
+    ADK declares a function in one of two shapes: a genai ``Schema`` under
+    ``parameters``, or plain JSON Schema under ``parameters_json_schema``. The
+    installed version fills the second and leaves the first ``None`` — so
+    reading only ``parameters`` sent **every** tool to OpenAI and Groq with no
+    arguments declared at all, and the model was left to guess the shape from
+    the docstring. That is how ``submit_plan`` came back holding a list of
+    objects. Nothing failed locally: the mock does not read schemas.
+    """
+
+    def test_a_tools_arguments_are_declared_at_all(self):
+        function = _declared(lambda_free_submit_plan)
+        assert "steps" in function["parameters"]["properties"], (
+            "the provider was told the tool takes no arguments"
+        )
+
+    def test_the_plan_tool_constrains_steps_to_the_enum(self):
+        """The enum is what makes the shape enforceable at generation time
+        rather than correctable afterwards through the retry ladder."""
+        belt = Toolbelt(None, user=None, patient_id=1, writer=None, run=None)
+        submit_plan = next(
+            tool for tool in belt.coordinator_tools() if tool.__name__ == "submit_plan"
+        )
+        items = _declared(submit_plan)["parameters"]["properties"]["steps"]["items"]
+        assert items["type"] == "string"
+        assert set(items["enum"]) == {step.value for step in PlanStep}
+
+    def test_the_declared_enum_cannot_drift_from_the_plan_enum(self):
+        """``Literal`` cannot be spelled from ``PlanStep`` at class-definition
+        time, so the members are written out twice. This is the join."""
+        belt = Toolbelt(None, user=None, patient_id=1, writer=None, run=None)
+        submit_plan = next(
+            tool for tool in belt.coordinator_tools() if tool.__name__ == "submit_plan"
+        )
+        declared = _declared(submit_plan)["parameters"]["properties"]["steps"]["items"]
+        for value in declared["enum"]:
+            assert PlanStep(value)
+
+
+def lambda_free_submit_plan(steps: list[str]) -> dict:
+    """A stand-in with the plainest possible signature."""
+    return {}
+
+
 class TestMessageTranslation:
     def test_a_plain_exchange_becomes_user_and_assistant_messages(self):
         request = LlmRequest(
@@ -324,6 +392,110 @@ class TestMessageTranslation:
         assistant = next(m for m in messages if m["role"] == "assistant")
         assert tool_message["tool_call_id"] == assistant["tool_calls"][0]["id"]
         assert json.loads(tool_message["content"]) == {"resolved": True}
+
+
+class TestAnOrphanedToolResultIsNeverSentAlone:
+    """A tool message with no assistant ``tool_calls`` before it is a 400.
+
+    Recorded live, three times: ``messages.[1].role`` — the first thing after
+    the system prompt was a ``role: tool`` message answering a call the request
+    did not contain. It arrives that way at a stage boundary, and history
+    windowing can produce it too: ADK carries tool results as ``role="user"``
+    contents, so a window that counts user contents can begin at a result whose
+    call it just trimmed.
+
+    Whatever put it there, the request has to be legal. The rule is a property
+    of the builder, so it is asserted as one: *no tool message may be the first
+    message, and every tool message must have an assistant ``tool_call`` with
+    its id somewhere before it.*
+    """
+
+    #: The recorded shape: a request whose history opens on a tool result.
+    ORPHAN = [
+        types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="load_patient_context",
+                        response={"patient": {"name": "Asha Menon"}},
+                    )
+                )
+            ],
+        ),
+        types.Content(role="user", parts=[types.Part(text="next tuesday please")]),
+    ]
+
+    @staticmethod
+    def _ids_before(messages: list[dict], index: int) -> set[str]:
+        return {
+            call["id"]
+            for message in messages[:index]
+            if message["role"] == "assistant"
+            for call in message.get("tool_calls") or []
+        }
+
+    def test_the_request_does_not_open_on_a_tool_message(self):
+        request = LlmRequest(model="m", contents=list(self.ORPHAN))
+        messages = _messages_payload(request)
+        assert messages[0]["role"] != "tool"
+
+    def test_every_tool_message_answers_a_call_the_provider_can_see(self):
+        request = LlmRequest(model="m", contents=list(self.ORPHAN))
+        messages = _messages_payload(request)
+
+        tool_messages = [m for m in messages if m["role"] == "tool"]
+        assert tool_messages, "the guard must not work by dropping the evidence"
+        for index, message in enumerate(messages):
+            if message["role"] != "tool":
+                continue
+            assert message["tool_call_id"] in self._ids_before(messages, index)
+
+    def test_the_result_itself_survives(self):
+        """Re-paired, not discarded. The patient's context is the whole reason
+        the call was made; dropping it would trade a 400 for a worse answer."""
+        request = LlmRequest(model="m", contents=list(self.ORPHAN))
+        tool_message = next(
+            m for m in _messages_payload(request) if m["role"] == "tool"
+        )
+        assert json.loads(tool_message["content"]) == {
+            "patient": {"name": "Asha Menon"}
+        }
+
+    def test_the_synthesised_call_names_the_tool_it_answers(self):
+        request = LlmRequest(model="m", contents=list(self.ORPHAN))
+        messages = _messages_payload(request)
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        assert assistant["tool_calls"][0]["function"]["name"] == "load_patient_context"
+
+    def test_a_real_pairing_is_left_alone(self):
+        """Distrust green: a fix that re-pairs *everything* would also pass the
+        assertions above while inventing a second call for every genuine one."""
+        request = LlmRequest(
+            model="m",
+            contents=[
+                types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            function_call=types.FunctionCall(name="resolve_date", args={})
+                        )
+                    ],
+                ),
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name="resolve_date", response={"resolved": True}
+                            )
+                        )
+                    ],
+                ),
+            ],
+        )
+        messages = _messages_payload(request)
+        assert len([m for m in messages if m["role"] == "assistant"]) == 1
 
 
 @dataclass

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from typing import Literal
 
 from sqlalchemy.orm import Session
 
@@ -147,9 +148,17 @@ class Toolbelt:
                 self.session, self.user, patient_id=self.patient_id
             )
 
-        def submit_plan(steps: list[str]) -> dict:
-            """Submit the plan for this request as a list of steps. Valid steps
-            are: route, book, documents, follow_up."""
+        def submit_plan(
+            steps: list[
+                Literal[
+                    "route", "book", "reschedule", "cancel", "documents", "follow_up"
+                ]
+            ],
+        ) -> dict:
+            """Submit the plan for this request: a list of step names, e.g.
+            ["route", "book"]. Each item is one of the words below, on its own —
+            never an object. Valid steps are: route, book, reschedule, cancel,
+            documents, follow_up."""
             try:
                 plan = validate_plan(steps)
             except PlanRejected as rejected:
