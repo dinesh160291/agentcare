@@ -32,6 +32,7 @@ from app import clock
 from app.errors import ClassRejected, PlanRejected
 from app.models import (
     FollowUpTaskType,
+    PatientDocument,
     PlanStep,
     ProposedAction,
     User,
@@ -40,7 +41,9 @@ from app.models import (
 )
 from app.trace import TraceWriter
 from app.tools import (
+    apply_verification,
     diff_required_documents,
+    extract_document_text,
     find_available_slots,
     get_patient_context,
     get_slot,
@@ -48,6 +51,7 @@ from app.tools import (
     list_open_tasks,
     list_patient_documents,
     list_patient_reminders,
+    list_unverified_documents,
     render_confirmation,
     resolve_date,
     resolve_department,
@@ -437,9 +441,15 @@ class Toolbelt:
             patient has filed, and report what is missing."""
             department_id = self._department_id()
             if department_id is None:
+                # Shape-stable with the real result. A refusal that invents its
+                # own key names is how a consumer ends up reading a key nobody
+                # writes and quietly seeing nothing missing, forever.
                 return {
-                    "missing": [],
-                    "optional_missing": [],
+                    "required": [],
+                    "satisfied": [],
+                    "missing_mandatory": [],
+                    "missing_optional": [],
+                    "complete": False,
                     "problem": "No department has been decided for this request yet.",
                 }
             return diff_required_documents(
@@ -451,13 +461,94 @@ class Toolbelt:
             lost when this conversation ends."""
             return self._record_missing_documents()
 
+        def list_unverified_documents_tool() -> dict:
+            """List documents that have been uploaded but not yet checked
+            against the type the patient declared them as."""
+            return {
+                "documents": list_unverified_documents(
+                    self.session, patient_id=self.patient_id
+                )
+            }
+
+        def read_document_text(document_id: int) -> dict:
+            """Read the text of an uploaded PDF so you can see what it is.
+            Images return no text: classify those by their declared type."""
+            return self._read_document_text(document_id)
+
+        def submit_document_verification(
+            document_id: int, detected_type: str, matches: bool
+        ) -> dict:
+            """Say whether a document's content matches the type the patient
+            declared it as. `detected_type` is what the content looks like.
+            You propose; the status is set by code."""
+            return self._submit_document_verification(
+                document_id, detected_type, matches
+            )
+
         list_patient_documents_tool.__name__ = "list_patient_documents"
         diff_required_documents_tool.__name__ = "diff_required_documents"
+        list_unverified_documents_tool.__name__ = "list_unverified_documents"
         return [
             list_patient_documents_tool,
+            list_unverified_documents_tool,
+            read_document_text,
+            submit_document_verification,
             diff_required_documents_tool,
             record_missing_documents,
         ]
+
+    def _read_document_text(self, document_id: int) -> dict:
+        """Extract text, but only from a document this patient owns.
+
+        The ownership check is the whole reason this is bound rather than
+        handed over raw: a document id is an integer, and a model that got
+        creative with one would otherwise read another patient's file.
+        """
+        document = self.session.get(PatientDocument, document_id)
+        if document is None or document.patient_id != self.patient_id:
+            # Indistinguishable from a document that never existed — the same
+            # rule the HTTP layer follows, for the same reason.
+            return {"extracted": False, "reason": "not_found", "text": "", "pages": 0}
+        return extract_document_text(self.session, document_id)
+
+    def _submit_document_verification(
+        self, document_id: int, detected_type: str, matches: bool
+    ) -> dict:
+        document = self.session.get(PatientDocument, document_id)
+        if document is None or document.patient_id != self.patient_id:
+            self.writer.validation(
+                "document_verification",
+                accepted=False,
+                detail={"document_id": document_id, "problem": "not this patient's"},
+            )
+            return {"accepted": False, "problem": f"No document {document_id}."}
+
+        self.writer.validation(
+            "document_verification",
+            accepted=True,
+            detail={
+                "document_id": document_id,
+                "declared_type": document.declared_type,
+                "detected_type": detected_type,
+                "matches": bool(matches),
+            },
+        )
+        verified = apply_verification(
+            self.session,
+            document_id=document_id,
+            matches=bool(matches),
+            detected_type=detected_type,
+            note=(
+                ""
+                if matches
+                else (
+                    f"Content reads as {detected_type!r}, filed as "
+                    f"{document.declared_type!r}."
+                )
+            ),
+            actor=self.user,
+        )
+        return {"accepted": True, "document": verified}
 
     def _record_missing_documents(self) -> dict:
         """Re-run the diff and upsert the task from *its* result.
@@ -474,7 +565,7 @@ class Toolbelt:
         diff = diff_required_documents(
             self.session, patient_id=self.patient_id, department_id=department_id
         )
-        missing = diff.get("missing") or []
+        missing = diff.get("missing_mandatory") or []
         appointment_id = (
             (self.run.state or {}).get("appointment_id") if self.run else None
         )
@@ -496,6 +587,8 @@ class Toolbelt:
             task_type=FollowUpTaskType.MISSING_DOCUMENTS,
             details={"missing": missing},
             appointment_id=appointment_id,
+            close_when_empty_key="missing",
+            actor=self.user,
         )
         return {"recorded": True, "missing": missing, "task": task["task"]}
 

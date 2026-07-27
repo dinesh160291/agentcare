@@ -78,6 +78,32 @@ def find_open_task(
     )
 
 
+def _task_for_subject(
+    session: Session,
+    *,
+    patient_id: int,
+    task_type: FollowUpTaskType,
+    appointment_id: int | None,
+) -> FollowUpTask | None:
+    """The task for this subject **whatever its status** — the upsert's target.
+
+    Deliberately not scoped to open tasks. The growth rule is *one row per
+    subject*, not one open row: a shortfall that clears and comes back — staff
+    reclassify a document, then reclassify it again — must reopen the row it
+    already has rather than leave a trail of closed siblings behind it.
+    """
+    return (
+        session.query(FollowUpTask)
+        .filter(
+            FollowUpTask.patient_id == patient_id,
+            FollowUpTask.task_type == task_type,
+            FollowUpTask.appointment_id == appointment_id,
+        )
+        .order_by(FollowUpTask.id)
+        .first()
+    )
+
+
 def upsert_followup_task(
     session: Session,
     *,
@@ -95,9 +121,10 @@ def upsert_followup_task(
     the task is done — for a missing-documents task, the list of what is still
     missing. When the diff comes back clean the task closes itself, so nothing
     has to remember to go back and tidy up. Re-running the diff updates the
-    open task in place; it never spawns a sibling.
+    task in place; it never spawns a sibling, and a shortfall that clears and
+    returns **reopens the same row** rather than starting a new one.
     """
-    existing = find_open_task(
+    existing = _task_for_subject(
         session, patient_id=patient_id, task_type=task_type, appointment_id=appointment_id
     )
 
@@ -133,25 +160,40 @@ def upsert_followup_task(
         return {"created": True, "updated": False, "closed": False,
                 "task": _serialise_task(task)}
 
+    was_open = existing.status is FollowUpTaskStatus.OPEN
     existing.details = details
     if due_date is not None:
         existing.due_date = due_date
 
     if should_close:
         existing.status = FollowUpTaskStatus.CLOSED
+        # Only when it actually changes. Auditing a close that already happened
+        # every time the diff re-runs turns the log into weather.
+        if was_open:
+            write_audit(
+                session,
+                action="followup_task_closed",
+                entity_type="FollowUpTask",
+                entity_id=existing.id,
+                actor=actor,
+                actor_kind="user" if actor else "system",
+                metadata={"task_type": task_type.value},
+            )
+        session.flush()
+        return {"created": False, "updated": True, "closed": True,
+                "task": _serialise_task(existing)}
+
+    existing.status = FollowUpTaskStatus.OPEN
+    if not was_open:
         write_audit(
             session,
-            action="followup_task_closed",
+            action="followup_task_reopened",
             entity_type="FollowUpTask",
             entity_id=existing.id,
             actor=actor,
             actor_kind="user" if actor else "system",
             metadata={"task_type": task_type.value},
         )
-        session.flush()
-        return {"created": False, "updated": True, "closed": True,
-                "task": _serialise_task(existing)}
-
     session.flush()
     return {"created": False, "updated": True, "closed": False,
             "task": _serialise_task(existing)}

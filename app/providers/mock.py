@@ -60,6 +60,23 @@ REBOOK_CUES = (
     "book", "schedule", "make it", "instead", "change it to", "switch to",
     "i need a", "i want a", "can i get a",
 )
+#: How the understudy reads a document's type off its text. Ordered, because
+#: the first match wins and the more specific labels have to come first: an
+#: X-ray report mentioning a referral is still an X-ray report.
+#:
+#: This is the mock standing in for a *reading* judgement, which is the one
+#: place a real model is genuinely better. It is honest about that in the only
+#: way that matters — it flags nothing it cannot name.
+DOCUMENT_TYPE_CUES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("ECG report", ("electrocardiogram", "ecg report", "ecg summary")),
+    ("Blood test report", ("blood panel", "blood test", "haematology", "full blood count")),
+    ("X-ray report", ("x-ray", "xray", "radiograph")),
+    ("MRI or CT report", ("mri", "magnetic resonance", "ct scan", "computed tomography")),
+    ("Eye prescription", ("eye prescription", "spectacle", "optometr", "visual acuity")),
+    ("Referral letter", ("referral letter", "refer this patient", "letter of referral")),
+    ("Identification", ("passport", "driving licence", "identity card")),
+)
+
 #: Hesitation. Not a subject at all, which is what makes it a *non-answer*
 #: rather than an off-topic message: "hmm, maybe" carries no administrative
 #: noun, but a patient who has just been offered a time and says it is
@@ -177,7 +194,7 @@ class MockLlm(AgentCareLlm):
         if "propose_appointment" in available:
             return self._appointment(llm_request, done, task)
         if "record_missing_documents" in available:
-            return self._documents(llm_request, done, task)
+            return self._documents(llm_request, available, done, task)
         if "list_open_tasks" in available:
             return self._followup(llm_request, done)
         return text_response(SCOPE_TEXT)
@@ -521,8 +538,16 @@ class MockLlm(AgentCareLlm):
     # --- Document ---------------------------------------------------------
 
     def _documents(
-        self, llm_request: LlmRequest, done: set[str], task: dict[str, Any]
+        self,
+        llm_request: LlmRequest,
+        available: set[str],
+        done: set[str],
+        task: dict[str, Any],
     ) -> LlmResponse:
+        verifying = self._verify_next(llm_request, available, done)
+        if verifying is not None:
+            return verifying
+
         if "list_patient_documents" not in done:
             return function_call_response("list_patient_documents", {})
 
@@ -538,6 +563,76 @@ class MockLlm(AgentCareLlm):
             latest_tool_result(llm_request, "diff_required_documents"),
         )
 
+    def _verify_next(
+        self, llm_request: LlmRequest, available: set[str], done: set[str]
+    ) -> LlmResponse | None:
+        """Verify one pending document per turn, or hand back to the listing.
+
+        One per turn is a bound, not a shortcut: a patient with forty unchecked
+        uploads would otherwise spend the whole iteration budget here and never
+        reach the diff the booking actually needs. The rest are still pending
+        and the next turn picks them up.
+
+        Gated on the toolset like every other branch in this file. Asking for a
+        tool the agent was not handed is how a mock starts describing a system
+        that does not exist.
+        """
+        if "list_unverified_documents" not in available:
+            return None
+
+        if "list_unverified_documents" not in done:
+            return function_call_response("list_unverified_documents", {})
+
+        listed = latest_tool_result(llm_request, "list_unverified_documents")
+        pending = (listed.payload.get("documents") if listed else None) or []
+        if not pending:
+            return None
+
+        target = pending[0]
+        if "read_document_text" not in done:
+            return function_call_response(
+                "read_document_text", {"document_id": target["document_id"]}
+            )
+
+        if "submit_document_verification" not in done:
+            extracted = latest_tool_result(llm_request, "read_document_text")
+            payload = extracted.payload if extracted else {}
+            detected, matches = self._detect_type(
+                payload.get("text") or "",
+                declared=target.get("declared_type") or "",
+                extractable=bool(payload.get("extracted")),
+            )
+            return function_call_response(
+                "submit_document_verification",
+                {
+                    "document_id": target["document_id"],
+                    "detected_type": detected,
+                    "matches": matches,
+                },
+            )
+        return None
+
+    @staticmethod
+    def _detect_type(text: str, *, declared: str, extractable: bool) -> tuple[str, bool]:
+        """Read a document type out of the text, the way a rule-based stand-in can.
+
+        No OCR and no image classification: an unreadable file is accepted at
+        its declared type, because the alternative — flagging every photo a
+        patient uploads — turns the review queue into a list of things nobody
+        did wrong.
+        """
+        if not extractable or not text.strip():
+            return declared, True
+
+        lowered = text.lower()
+        for detected, cues in DOCUMENT_TYPE_CUES:
+            if any(cue in lowered for cue in cues):
+                return detected, detected.strip().lower() == declared.strip().lower()
+
+        # Nothing recognisable. The mock does not guess a mismatch it cannot
+        # name: an unexplained flag costs a human the time to work out why.
+        return declared, True
+
     @staticmethod
     def _from_documents(listing, diff) -> LlmResponse:
         documents = (listing.payload.get("documents") if listing else None) or []
@@ -551,7 +646,7 @@ class MockLlm(AgentCareLlm):
         )
         sentence = f"You have {len(documents)} document(s) on file: {held}."
 
-        missing = (diff.payload.get("missing") if diff else None) or []
+        missing = (diff.payload.get("missing_mandatory") if diff else None) or []
         if missing:
             sentence += " Still needed: " + ", ".join(missing) + "."
         elif diff is not None:

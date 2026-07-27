@@ -39,12 +39,17 @@ from sqlalchemy.orm import Session
 from app.audit import write_audit
 from app.errors import PermissionDenied, RecordNotFound, ValidationFailed
 from app.models import (
+    Appointment,
+    AppointmentStatus,
     Department,
+    DocumentStatus,
     Escalation,
     EscalationKind,
     EscalationStatus,
+    FollowUpTaskType,
     Notification,
     NotificationKind,
+    PatientDocument,
     PlanStep,
     TERMINAL_WORKFLOW_STATUSES,
     TraceAuthor,
@@ -53,7 +58,8 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
-from app.tools.tasks import OPEN_ESCALATION_STATUSES
+from app.tools.documents import diff_required_documents
+from app.tools.tasks import OPEN_ESCALATION_STATUSES, upsert_followup_task
 from app.trace import TraceWriter
 from app.workflow.plan import advance_plan
 from app.workflow.state_machine import transition
@@ -431,11 +437,134 @@ def resolve_escalation(
     }
 
 
+#: What staff may do with a flagged document.
+DOCUMENT_RESOLUTIONS = ("accept", "reclassify", "reject")
+
+
+def resolve_document(
+    session: Session,
+    *,
+    staff: User,
+    document_id: int,
+    action: str,
+    corrected_type: str | None = None,
+    note: str = "",
+) -> dict:
+    """Close a flagged document, and re-derive everything that depended on it.
+
+    The second half is the point. A document's type decides which requirements
+    it satisfies, so changing it changes the required-documents diff — and the
+    **derivation invariant** says a derived row gets its update rule applied in
+    the source's transaction, not eventually. Without that, a patient whose
+    misfiled X-ray is reclassified as an ECG keeps a follow-up task telling
+    them to supply the ECG that is now on file.
+
+    The diff is re-run rather than adjusted, and the task upserted rather than
+    inserted, so this stays correct however many times staff change their mind.
+    """
+    _require_staff(staff)
+
+    chosen = str(action or "").strip().lower()
+    if chosen not in DOCUMENT_RESOLUTIONS:
+        raise ValidationFailed(
+            f"{action!r} is not a document resolution. Use one of: "
+            f"{', '.join(DOCUMENT_RESOLUTIONS)}."
+        )
+
+    document = session.get(PatientDocument, document_id)
+    if document is None:
+        raise RecordNotFound("PatientDocument", document_id)
+
+    if chosen == "accept":
+        # The declared type stands: the model read it wrong, or the content is
+        # thinner than the label. Either way a human has looked.
+        document.status = DocumentStatus.VERIFIED
+    elif chosen == "reclassify":
+        if not (corrected_type or "").strip():
+            raise ValidationFailed("A reclassification must name the correct type.")
+        document.document_type = corrected_type.strip()
+        document.status = DocumentStatus.VERIFIED
+    else:
+        document.status = DocumentStatus.REJECTED
+
+    document.verification_note = (note or "").strip()[:500] or document.verification_note
+    session.flush()
+
+    write_audit(
+        session,
+        action="document_resolved",
+        entity_type="PatientDocument",
+        entity_id=document.id,
+        actor=staff,
+        metadata={
+            "resolution": chosen,
+            "document_type": document.document_type,
+            "status": document.status.value,
+        },
+    )
+
+    rediffed = _rediff_for(session, document=document, staff=staff)
+    return {
+        "document_id": document.id,
+        "resolution": chosen,
+        "status": document.status.value,
+        "document_type": document.document_type,
+        "tasks_updated": rediffed,
+    }
+
+
+def _rediff_for(session: Session, *, document: PatientDocument, staff: User) -> list[dict]:
+    """Re-run the required-docs diff for every department this patient is
+    booked into, and upsert the open task from *its* result.
+
+    Scoped to departments the patient actually has an appointment in: a diff
+    against a department nobody booked would open a task for paperwork nobody
+    asked for.
+    """
+    appointments = (
+        session.query(Appointment)
+        .filter(
+            Appointment.patient_id == document.patient_id,
+            Appointment.status.in_(
+                (AppointmentStatus.PENDING, AppointmentStatus.CONFIRMED)
+            ),
+        )
+        .all()
+    )
+
+    updated: list[dict] = []
+    for appointment in appointments:
+        diff = diff_required_documents(
+            session,
+            patient_id=document.patient_id,
+            department_id=appointment.department_id,
+        )
+        outcome = upsert_followup_task(
+            session,
+            patient_id=document.patient_id,
+            task_type=FollowUpTaskType.MISSING_DOCUMENTS,
+            details={"missing": diff["missing_mandatory"]},
+            appointment_id=appointment.id,
+            close_when_empty_key="missing",
+            actor=staff,
+        )
+        updated.append(
+            {
+                "appointment_id": appointment.id,
+                "missing": diff["missing_mandatory"],
+                "closed": outcome["closed"],
+            }
+        )
+    return updated
+
+
 __all__ = [
+    "DOCUMENT_RESOLUTIONS",
     "REVIEW_OUTCOMES",
     "SAFETY_OUTCOMES",
     "STAFF_DECISIONS",
     "StaffDecision",
     "apply_staff_decision",
+    "resolve_document",
     "resolve_escalation",
 ]

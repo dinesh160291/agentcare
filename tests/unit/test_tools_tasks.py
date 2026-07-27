@@ -82,24 +82,45 @@ class TestFollowUpTaskUpsert:
         assert result == {"created": False, "updated": False, "closed": False, "task": None}
         assert seeded_db.query(FollowUpTask).count() == 0
 
-    def test_a_closed_task_does_not_block_a_later_one(self, seeded_db):
-        """A document withdrawn after the task closed must reopen the loop."""
+    def test_a_shortfall_that_returns_reopens_the_same_row(self, seeded_db):
+        """A document withdrawn after the task closed must reopen the loop —
+        in place.
+
+        The growth rule is one row per subject, not one *open* row. A
+        reappearing shortfall that created a sibling would leave a trail of
+        closed rows behind a patient who changed nothing, and the row count is
+        the thing the boundedness invariant actually bounds.
+        """
         upsert_followup_task(
             seeded_db, patient_id=1, task_type=MISSING_DOCS,
             details={"missing": ["ECG report"]}, appointment_id=1,
             close_when_empty_key="missing",
         )
-        upsert_followup_task(
+        closed = upsert_followup_task(
             seeded_db, patient_id=1, task_type=MISSING_DOCS,
             details={"missing": []}, appointment_id=1, close_when_empty_key="missing",
         )
+        assert closed["closed"] is True
+
         result = upsert_followup_task(
             seeded_db, patient_id=1, task_type=MISSING_DOCS,
             details={"missing": ["ECG report"]}, appointment_id=1,
             close_when_empty_key="missing",
         )
-        assert result["created"] is True
-        assert seeded_db.query(FollowUpTask).count() == 2
+        assert result["created"] is False
+        assert result["closed"] is False
+        assert result["task"]["status"] == "open"
+        assert seeded_db.query(FollowUpTask).count() == 1
+
+    def test_the_row_count_never_grows_past_one_per_subject(self, seeded_db):
+        """Whatever the diff does, however often it runs."""
+        for missing in (["ECG report"], [], ["ECG report", "Blood test report"], [], []):
+            upsert_followup_task(
+                seeded_db, patient_id=1, task_type=MISSING_DOCS,
+                details={"missing": missing}, appointment_id=1,
+                close_when_empty_key="missing",
+            )
+        assert seeded_db.query(FollowUpTask).count() == 1
 
     def test_tasks_for_different_appointments_are_separate(self, seeded_db):
         for appointment_id in (1, None):

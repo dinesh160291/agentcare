@@ -49,11 +49,19 @@ APPOINTMENT = (
     "propose_appointment",
     "render_confirmation",
 )
+#: Mirrors what Toolbelt.document_tools() actually hands over. A constant that
+#: drifted from the real toolset would let these tests describe a mock policy
+#: the running system never takes.
 DOCUMENTS = (
     "list_patient_documents",
+    "list_unverified_documents",
+    "read_document_text",
+    "submit_document_verification",
     "diff_required_documents",
     "record_missing_documents",
 )
+#: "Nothing waiting to be verified" — the precondition for the diff stage.
+NOTHING_PENDING = ("list_unverified_documents", {"documents": []})
 FOLLOWUP = ("list_patient_reminders", "list_open_tasks")
 
 
@@ -505,10 +513,106 @@ class TestTheReceiptIsReadBackFromTheRow:
         assert not [name for name in others if name in reply]
 
 
+class TestDocumentVerificationPolicy:
+    """The mock's reading judgement. It stands in for the one thing a real
+    model is genuinely better at, so what matters is that it is *honest* about
+    the limits rather than that it is clever."""
+
+    PENDING = (
+        "list_unverified_documents",
+        {"documents": [{"document_id": 7, "declared_type": "ECG report"}]},
+    )
+
+    def test_pending_documents_are_read_before_anything_else(self):
+        response = ask(
+            build_request(
+                {"step": "documents", "department_id": 1},
+                self.PENDING,
+                tools=DOCUMENTS,
+            )
+        )
+        assert calls(response) == ["read_document_text"]
+        assert call_args(response)["document_id"] == 7
+
+    def test_a_mismatch_is_proposed_from_the_extracted_text(self):
+        response = ask(
+            build_request(
+                {"step": "documents", "department_id": 1},
+                self.PENDING,
+                (
+                    "read_document_text",
+                    {"extracted": True, "text": "SYNTHETIC X-RAY REPORT - chest radiograph"},
+                ),
+                tools=DOCUMENTS,
+            )
+        )
+        submitted = call_args(response)
+        assert submitted["matches"] is False
+        assert submitted["detected_type"] == "X-ray report"
+
+    def test_matching_content_is_proposed_as_a_match(self):
+        response = ask(
+            build_request(
+                {"step": "documents", "department_id": 1},
+                self.PENDING,
+                (
+                    "read_document_text",
+                    {"extracted": True, "text": "Report type: Electrocardiogram summary"},
+                ),
+                tools=DOCUMENTS,
+            )
+        )
+        submitted = call_args(response)
+        assert submitted["matches"] is True
+
+    def test_an_unreadable_file_is_accepted_at_its_declared_type(self):
+        """No OCR. Flagging every photo a patient uploads would fill the review
+        queue with things nobody did wrong."""
+        response = ask(
+            build_request(
+                {"step": "documents", "department_id": 1},
+                self.PENDING,
+                ("read_document_text", {"extracted": False, "reason": "not_extractable", "text": ""}),
+                tools=DOCUMENTS,
+            )
+        )
+        submitted = call_args(response)
+        assert submitted["matches"] is True
+        assert submitted["detected_type"] == "ECG report"
+
+    def test_unrecognisable_text_is_not_guessed_into_a_mismatch(self):
+        """An unexplained flag costs a human the time to work out why."""
+        response = ask(
+            build_request(
+                {"step": "documents", "department_id": 1},
+                self.PENDING,
+                ("read_document_text", {"extracted": True, "text": "Lorem ipsum dolor sit amet"}),
+                tools=DOCUMENTS,
+            )
+        )
+        assert call_args(response)["matches"] is True
+
+    def test_verification_is_skipped_when_the_tool_was_not_handed_over(self):
+        """Toolset dispatch, like every other branch: asking for a tool the
+        agent does not have is how a mock starts describing a system that does
+        not exist."""
+        response = ask(
+            build_request(
+                {"step": "documents", "department_id": 1},
+                tools=("list_patient_documents", "record_missing_documents"),
+            )
+        )
+        assert calls(response) == ["list_patient_documents"]
+
+
 class TestDocumentsAndFollowUp:
     def test_documents_are_listed_before_anything_is_diffed(self):
         response = ask(
-            build_request({"step": "documents", "department_id": 1}, tools=DOCUMENTS)
+            build_request(
+                {"step": "documents", "department_id": 1},
+                NOTHING_PENDING,
+                tools=DOCUMENTS,
+            )
         )
         assert calls(response) == ["list_patient_documents"]
 
@@ -516,6 +620,7 @@ class TestDocumentsAndFollowUp:
         response = ask(
             build_request(
                 {"step": "documents", "department_id": 1},
+                NOTHING_PENDING,
                 ("list_patient_documents", {"documents": []}),
                 tools=DOCUMENTS,
             )
@@ -528,6 +633,7 @@ class TestDocumentsAndFollowUp:
         response = ask(
             build_request(
                 {"step": "documents"},
+                NOTHING_PENDING,
                 ("list_patient_documents", {"documents": []}),
                 tools=DOCUMENTS,
             )
@@ -540,8 +646,9 @@ class TestDocumentsAndFollowUp:
         response = ask(
             build_request(
                 {"step": "documents", "department_id": 1},
+                NOTHING_PENDING,
                 ("list_patient_documents", {"documents": []}),
-                ("diff_required_documents", {"missing": ["ECG report"]}),
+                ("diff_required_documents", {"missing_mandatory": ["ECG report"]}),
                 tools=DOCUMENTS,
             )
         )
@@ -555,6 +662,7 @@ class TestDocumentsAndFollowUp:
         response = ask(
             build_request(
                 {"step": "documents"},
+                NOTHING_PENDING,
                 ("list_patient_documents", {"documents": documents}),
                 tools=DOCUMENTS,
             )

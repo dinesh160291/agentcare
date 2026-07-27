@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from app.audit import write_audit
 from app.auth.ownership import patient_profile_for
 from app.config import get_settings
+from app.errors import RecordNotFound
 from app.models import DepartmentRequiredDocument, PatientDocument, User
 from app.models.enums import DocumentStatus
 
@@ -234,6 +235,142 @@ def ingest_document(
             "mime_type": mime,
         },
         "duplicate_of": None,
+    }
+
+
+#: Text extraction is bounded like everything else. A model does not need a
+#: whole discharge summary to tell an ECG from an X-ray report, and an
+#: unbounded extract is an unbounded prompt.
+MAX_EXTRACT_CHARS = 4000
+
+
+def extract_document_text(session: Session, document_id: int) -> dict[str, Any]:
+    """Pull readable text out of a stored document.
+
+    PDFs go through pypdf. **Images return no text and say so** — there is no
+    OCR here, and that is a scope decision rather than an oversight: an image
+    is classified by its declared type alone, so the verification step must be
+    able to tell "this says nothing" apart from "this says nothing relevant".
+    Silently returning an empty string for both would make every uploaded photo
+    look like a mismatch.
+    """
+    document = session.get(PatientDocument, document_id)
+    if document is None:
+        return {"extracted": False, "reason": "not_found", "text": "", "pages": 0}
+
+    if (document.mime_type or "") != "application/pdf":
+        return {
+            "extracted": False,
+            "reason": "not_extractable",
+            "text": "",
+            "pages": 0,
+            "mime_type": document.mime_type,
+        }
+
+    path = Path(document.storage_path)
+    if not path.exists():
+        return {"extracted": False, "reason": "file_missing", "text": "", "pages": 0}
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(path))
+    text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    return {
+        "extracted": True,
+        "reason": None,
+        "text": text.strip()[:MAX_EXTRACT_CHARS],
+        "pages": len(reader.pages),
+        "mime_type": document.mime_type,
+    }
+
+
+def apply_verification(
+    session: Session,
+    *,
+    document_id: int,
+    matches: bool,
+    detected_type: str | None = None,
+    note: str = "",
+    actor: User | None = None,
+) -> dict[str, Any]:
+    """Record a verification verdict. **Code sets the status, not the model.**
+
+    This is the decision-bin split at its clearest: the model proposes that
+    content does not match its declared type — a reading task — and code turns
+    that proposal into a ``flagged`` row and a human review. The model never
+    writes a status, never rejects a document, and never decides what happens
+    next.
+
+    A flagged document stops satisfying a requirement, which is the point:
+    the patient supplied *something*, but not something the hospital can use,
+    and the follow-up task must stay open.
+    """
+    document = session.get(PatientDocument, document_id)
+    if document is None:
+        raise RecordNotFound("PatientDocument", document_id)
+
+    document.detected_type = (detected_type or "").strip() or None
+    document.status = (
+        DocumentStatus.VERIFIED if matches else DocumentStatus.FLAGGED
+    )
+    document.verification_note = note.strip()[:500] or None
+    session.flush()
+
+    write_audit(
+        session,
+        action="document_verified" if matches else "document_flagged",
+        entity_type="PatientDocument",
+        entity_id=document.id,
+        actor=actor,
+        actor_kind="user" if actor else "system",
+        metadata={
+            "declared_type": document.declared_type,
+            "detected_type": document.detected_type,
+            "status": document.status.value,
+        },
+    )
+    return _serialise_document(document)
+
+
+def list_unverified_documents(
+    session: Session, *, patient_id: int
+) -> list[dict[str, Any]]:
+    """Documents still awaiting a verification verdict, oldest first."""
+    documents = (
+        session.query(PatientDocument)
+        .filter(
+            PatientDocument.patient_id == patient_id,
+            PatientDocument.status == DocumentStatus.PENDING_VERIFICATION,
+        )
+        .order_by(PatientDocument.id)
+        .all()
+    )
+    return [_serialise_document(doc) for doc in documents]
+
+
+def list_flagged_documents(session: Session) -> list[dict[str, Any]]:
+    """The staff review queue: every document whose content did not match."""
+    documents = (
+        session.query(PatientDocument)
+        .filter(PatientDocument.status == DocumentStatus.FLAGGED)
+        .order_by(PatientDocument.id)
+        .all()
+    )
+    return [_serialise_document(doc) for doc in documents]
+
+
+def _serialise_document(doc: PatientDocument) -> dict[str, Any]:
+    return {
+        "document_id": doc.id,
+        "patient_id": doc.patient_id,
+        "document_type": doc.document_type,
+        "declared_type": doc.declared_type,
+        "detected_type": doc.detected_type,
+        "status": doc.status.value,
+        "verification_note": doc.verification_note,
+        "document_date": doc.document_date.isoformat() if doc.document_date else None,
+        "checksum": doc.checksum,
+        "original_filename": doc.original_filename,
     }
 
 

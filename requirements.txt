@@ -34,6 +34,10 @@ bcrypt==5.0.0
 python-multipart==0.0.32
 filetype==1.2.0
 
+# --- Document verification (PDF text extraction) ---
+# Images are classified by declared type only; there is no OCR.
+pypdf==6.14.2
+
 # --- Scheduler (reminder poll job) ---
 APScheduler==3.11.3
 
