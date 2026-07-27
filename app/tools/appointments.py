@@ -29,12 +29,14 @@ from sqlalchemy.orm import Session
 from app import clock
 from app.audit import write_audit
 from app.auth.ownership import get_owned_or_404, patient_profile_for
+from app.tools.confirmations import _clock_time
 from app.models import (
     Appointment,
     AppointmentSlot,
     AppointmentStatus,
     Department,
     Doctor,
+    FollowUpTaskType,
     Reminder,
     ReminderStatus,
     ReminderType,
@@ -177,7 +179,26 @@ def _retire_reminders(session: Session, appointment_id: int) -> None:
     ).update({Reminder.status: ReminderStatus.CANCELLED}, synchronize_session=False)
 
 
-def _create_reminder(session: Session, appointment: Appointment, slot: AppointmentSlot) -> Reminder:
+def _create_reminder(
+    session: Session, appointment: Appointment, slot: AppointmentSlot
+) -> Reminder | None:
+    """Schedule the day-before reminder, when there is still a day before.
+
+    ``None`` for a same-day booking, and that is the whole point. The lead is
+    24 hours, so a 15:00 slot booked at 14:00 produced a row dated *yesterday*
+    — already due the moment it was written. Nothing failed: the row is
+    perfectly valid and the receipt cheerfully promised a reminder the day
+    before, for an appointment three hours away.
+
+    It would not have stayed harmless. The Phase 8 poll job selects pending
+    reminders whose time has passed, so its very first sweep would deliver a
+    "reminder" for a visit already in progress or over. A row that is wrong the
+    instant it is written is not a scheduling bug to fix later — it is a
+    delivery bug waiting for a scheduler to exist.
+    """
+    if slot.start_time - REMINDER_LEAD <= clock.now():
+        return None
+
     doctor = session.get(Doctor, appointment.doctor_id)
     reminder = Reminder(
         patient_id=appointment.patient_id,
@@ -187,7 +208,7 @@ def _create_reminder(session: Session, appointment: Appointment, slot: Appointme
         status=ReminderStatus.PENDING,
         message=(
             f"Reminder: appointment with {doctor.name} on "
-            f"{slot.start_time:%A %d %B at %H:%M}."
+            f"{slot.start_time:%A %d %B} at {_clock_time(slot.start_time)}."
         ),
     )
     session.add(reminder)
@@ -377,6 +398,25 @@ def cancel_appointment(
     appointment.status = AppointmentStatus.CANCELLED
     _release_slot(session, slot_id)
     _retire_reminders(session, appointment.id)
+    # The derivation invariant, applied to the other derived row. Reminders
+    # were retired here from the start; the missing-documents task was not, so
+    # a cancelled appointment left an open task telling the patient to bring a
+    # scan to a visit that no longer existed — and the follow-up screen went on
+    # showing it. Every row derived from this appointment updates inside this
+    # appointment's transaction, or it is only derived until something goes
+    # wrong. Scoped to *this* appointment: a task raised against another visit,
+    # or against none, is not this cancellation's business.
+    # Imported here rather than at module scope: ``tasks`` imports this module
+    # for its appointment lookups, and the pair would not load otherwise.
+    from app.tools.tasks import close_followup_tasks
+
+    close_followup_tasks(
+        session,
+        patient_id=appointment.patient_id,
+        task_type=FollowUpTaskType.MISSING_DOCUMENTS,
+        appointment_id=appointment.id,
+        actor=user,
+    )
 
     write_audit(
         session,

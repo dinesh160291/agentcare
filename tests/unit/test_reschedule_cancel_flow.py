@@ -23,6 +23,8 @@ import asyncio
 
 import pytest
 
+from datetime import timedelta
+
 from app import clock
 from app.db import SessionLocal
 from app.models import (
@@ -63,7 +65,9 @@ def turn(user, message, session_id):
     return asyncio.run(run_workflow(user, message, session_id))
 
 
-def free_slot_in_cardiology(session, *, exclude_id: int | None = None) -> AppointmentSlot:
+def free_slot_in_cardiology(
+    session, *, exclude_id: int | None = None, min_lead: timedelta | None = None
+) -> AppointmentSlot:
     """A bookable Cardiology slot **in the future**.
 
     The future filter is not decoration. The seed lays slots down from today,
@@ -71,6 +75,12 @@ def free_slot_in_cardiology(session, *, exclude_id: int | None = None) -> Appoin
     refuse a slot whose start time has passed. Without this, the reschedule
     tests pass before 09:00 and fail after it, which is a suite that reports
     on the clock rather than on the code.
+
+    ``min_lead`` is the same trap one layer along. A booking less than 24 hours
+    out has no day before it and so gets **no reminder row** — deliberately, or
+    the scheduler's first sweep delivers one for a visit already under way. A
+    test about reminders that takes the earliest slot lands in that rule
+    instead of the one it means to check.
     """
     from app.models import Department, Doctor
 
@@ -81,7 +91,7 @@ def free_slot_in_cardiology(session, *, exclude_id: int | None = None) -> Appoin
         .filter(
             Department.name == "Cardiology",
             AppointmentSlot.status == SlotStatus.AVAILABLE,
-            AppointmentSlot.start_time > clock.now(),
+            AppointmentSlot.start_time > clock.now() + (min_lead or timedelta(0)),
         )
         .order_by(AppointmentSlot.start_time)
     )
@@ -283,7 +293,9 @@ class TestTheDerivationInvariant:
 
     def test_rescheduling_retimes_the_reminder(self, patient, seeded_db):
         original_slot_id = seeded_db.get(Appointment, SEEDED_APPOINTMENT_ID).slot_id
-        target = free_slot_in_cardiology(seeded_db, exclude_id=original_slot_id)
+        target = free_slot_in_cardiology(
+            seeded_db, exclude_id=original_slot_id, min_lead=timedelta(hours=24)
+        )
         target_start = target.start_time
         pending_run(
             seeded_db,

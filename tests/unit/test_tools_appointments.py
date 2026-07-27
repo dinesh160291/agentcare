@@ -21,6 +21,7 @@ from datetime import date, datetime, timedelta
 import pytest
 
 from app import clock
+from app.db import SessionLocal
 from app.models import (
     Appointment,
     AppointmentSlot,
@@ -66,6 +67,23 @@ def free_slot(db, department_id: int = 1, index: int = 0) -> int:
     ]
 
 
+def remindable_slot(db, department_id: int = 1, index: int = 0) -> int:
+    """A free slot far enough out to *have* a day before it.
+
+    The earliest free slot is today — the seed lays them from today at 09:00
+    and the search only returns future ones — so a same-day booking is what
+    ``free_slot`` returns for most of the working day. That is a real state
+    with its own rule (no reminder is scheduled, because there is no day
+    before to send it on), and a test about reminder derivation that silently
+    lands in it is testing the other rule by accident.
+    """
+    slots = find_available_slots(db, department_id=department_id, limit=200)["slots"]
+    cutoff = clock.now() + timedelta(hours=24)
+    later = [s for s in slots if datetime.fromisoformat(s["start"]) > cutoff]
+    assert len(later) > index, "the seed has no slot more than a day out"
+    return later[index]["slot_id"]
+
+
 class TestBooking:
     def test_a_booking_creates_a_confirmed_appointment(self, db, patient_b):
         slot_id = free_slot(db)
@@ -82,7 +100,7 @@ class TestBooking:
         assert db.get(AppointmentSlot, slot_id).status == SlotStatus.BOOKED
 
     def test_a_reminder_is_derived_from_the_appointment(self, db, patient_b):
-        slot_id = free_slot(db)
+        slot_id = remindable_slot(db)
         result = book_appointment(db, patient_b, slot_id=slot_id, reason="follow-up")
 
         reminder = (
@@ -305,10 +323,10 @@ class TestProposalIsClearedOnFailure:
 
 class TestRescheduling:
     def test_rescheduling_moves_the_appointment(self, db, patient_b):
-        original = free_slot(db)
+        original = remindable_slot(db)
         booked = book_appointment(db, patient_b, slot_id=original, reason="x")
         appointment_id = booked["appointment"]["appointment_id"]
-        target = free_slot(db, index=3)
+        target = remindable_slot(db, index=3)
 
         result = reschedule_appointment(db, patient_b, appointment_id, new_slot_id=target)
         assert result["ok"] is True
@@ -326,10 +344,10 @@ class TestRescheduling:
     def test_reminders_follow_the_appointment(self, db, patient_b):
         """The derivation invariant. A reminder still pointing at the old time
         would tell the patient to turn up on the wrong day."""
-        original = free_slot(db)
+        original = remindable_slot(db)
         booked = book_appointment(db, patient_b, slot_id=original, reason="x")
         appointment_id = booked["appointment"]["appointment_id"]
-        target = free_slot(db, index=3)
+        target = remindable_slot(db, index=3)
 
         reschedule_appointment(db, patient_b, appointment_id, new_slot_id=target)
 
@@ -360,10 +378,10 @@ class TestRescheduling:
 
     def test_a_refused_reschedule_leaves_the_original_intact(self, db, patient_b):
         """A half-applied move is worse than a refused one."""
-        original = free_slot(db)
+        original = remindable_slot(db)
         booked = book_appointment(db, patient_b, slot_id=original, reason="x")
         appointment_id = booked["appointment"]["appointment_id"]
-        target = free_slot(db, index=3)
+        target = remindable_slot(db, index=3)
         db.get(AppointmentSlot, target).status = SlotStatus.BOOKED
         db.commit()
 
@@ -446,7 +464,7 @@ class TestCancellation:
     def test_pending_reminders_are_cancelled_with_it(self, db, patient_b):
         """A reminder outliving its appointment tells the patient to attend
         something that no longer exists."""
-        slot_id = free_slot(db)
+        slot_id = remindable_slot(db)
         booked = book_appointment(db, patient_b, slot_id=slot_id, reason="x")
         appointment_id = booked["appointment"]["appointment_id"]
 
@@ -506,3 +524,152 @@ class TestContract:
         ok = book_appointment(db, patient_b, slot_id=free_slot(db), reason="x")
         bad = book_appointment(db, patient_b, slot_id=999_999, reason="x")
         assert set(ok) == set(bad)
+
+
+class TestSameDayBookingHasNothingToRemind:
+    """A 24-hour lead and a booking three hours away do not both fit.
+
+    Live: a 15:00 slot booked the same afternoon produced a reminder row dated
+    *yesterday* — already due the moment it was written — while the receipt
+    promised "we'll remind you the day before". Nothing failed, because a
+    past-dated pending row is perfectly valid SQL.
+
+    It would not have stayed harmless. Phase 8's poll job selects pending
+    reminders whose time has passed, so its first sweep would deliver a
+    reminder for a visit already under way. The row is the decision: none is
+    written, and the receipt says what is true instead.
+    """
+
+    def _today_slot(self, db) -> int:
+        slots = find_available_slots(db, department_id=1, limit=200)["slots"]
+        today = [
+            s
+            for s in slots
+            if datetime.fromisoformat(s["start"]).date() == clock.today()
+        ]
+        assert today, "the seed lays slots from today; without one this proves nothing"
+        return today[0]["slot_id"]
+
+    def test_no_reminder_row_is_written(self, db, patient_b):
+        booked = book_appointment(
+            db, patient_b, slot_id=self._today_slot(db), reason="x"
+        )
+        reminders = (
+            db.query(Reminder)
+            .filter(Reminder.appointment_id == booked["appointment"]["appointment_id"])
+            .all()
+        )
+        assert reminders == []
+
+    def test_no_row_is_left_already_due(self, db, patient_b):
+        """The sharper version: not "none was written" but "none is deliverable
+        the instant it exists". A future change that wrote a *cancelled* row
+        would pass the test above and still be wrong if it ever flipped."""
+        book_appointment(db, patient_b, slot_id=self._today_slot(db), reason="x")
+
+        due_now = (
+            db.query(Reminder)
+            .filter(
+                Reminder.status == ReminderStatus.PENDING,
+                Reminder.scheduled_at <= clock.now(),
+            )
+            .count()
+        )
+        assert due_now == 0
+
+    def test_a_later_booking_still_gets_one(self, db, patient_b):
+        """Distrust green: a change that simply stopped creating reminders
+        would pass both tests above."""
+        booked = book_appointment(
+            db, patient_b, slot_id=remindable_slot(db), reason="x"
+        )
+        assert (
+            db.query(Reminder)
+            .filter(Reminder.appointment_id == booked["appointment"]["appointment_id"])
+            .count()
+            == 1
+        )
+
+
+class TestCancellingClosesWhatItDerived:
+    """Item 5, and the derivation invariant it belongs to.
+
+    Reminders were retired on cancellation from the start. The
+    missing-documents task was not — so a cancelled appointment left an open
+    task telling the patient to bring a scan to a visit that no longer existed,
+    and the follow-up screen went on showing it. Confirmed in the live
+    database: AC-000002 cancelled, its reminder cancelled, the task still open.
+
+    Every row derived from an appointment updates inside that appointment's
+    transaction, or it is only derived until something goes wrong.
+    """
+
+    def _with_task(self, db, patient_b):
+        from app.models import FollowUpTaskType
+        from app.tools.tasks import upsert_followup_task
+
+        booked = book_appointment(
+            db, patient_b, slot_id=remindable_slot(db), reason="x"
+        )
+        appointment_id = booked["appointment"]["appointment_id"]
+        upsert_followup_task(
+            db,
+            patient_id=2,
+            task_type=FollowUpTaskType.MISSING_DOCUMENTS,
+            details={"missing": ["Prior MRI or CT report"]},
+            appointment_id=appointment_id,
+        )
+        db.commit()
+        return appointment_id
+
+    def test_the_task_is_closed(self, db, patient_b):
+        from app.models import FollowUpTask, FollowUpTaskStatus
+
+        appointment_id = self._with_task(db, patient_b)
+        cancel_appointment(db, patient_b, appointment_id)
+
+        # Read from a session that has seen none of this: an object still in
+        # the unit of work can look closed without the change having landed.
+        fresh = SessionLocal()
+        try:
+            statuses = {
+                task.status
+                for task in fresh.query(FollowUpTask)
+                .filter(FollowUpTask.appointment_id == appointment_id)
+                .all()
+            }
+        finally:
+            fresh.close()
+        assert statuses == {FollowUpTaskStatus.CLOSED}
+
+    def test_a_task_for_another_appointment_stays_open(self, db, patient_b):
+        """Scoped to this appointment. A cancellation is not a licence to close
+        the patient's other obligations."""
+        from app.models import FollowUpTask, FollowUpTaskStatus, FollowUpTaskType
+        from app.tools.tasks import upsert_followup_task
+
+        appointment_id = self._with_task(db, patient_b)
+        other = book_appointment(
+            db, patient_b, slot_id=remindable_slot(db, index=5), reason="y"
+        )["appointment"]["appointment_id"]
+        upsert_followup_task(
+            db,
+            patient_id=2,
+            task_type=FollowUpTaskType.MISSING_DOCUMENTS,
+            details={"missing": ["Referral letter"]},
+            appointment_id=other,
+        )
+        db.commit()
+
+        cancel_appointment(db, patient_b, appointment_id)
+
+        fresh = SessionLocal()
+        try:
+            survivor = (
+                fresh.query(FollowUpTask)
+                .filter(FollowUpTask.appointment_id == other)
+                .one()
+            )
+            assert survivor.status is FollowUpTaskStatus.OPEN
+        finally:
+            fresh.close()
