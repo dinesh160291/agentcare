@@ -51,6 +51,73 @@ def _rendered(at: AppTest) -> str:
     return "\n".join(parts)
 
 
+class TestTheShellMatchesTheDesignReference:
+    """Placement, pinned — as far as ``AppTest`` can see it, which is not all
+    the way.
+
+    **What these cannot check, and a falsification pass proved it:** whether
+    the wordmark sits above the *navigation*. Streamlit renders its own nav
+    widget outside the sidebar's user content, and ``AppTest`` does not expose
+    it at all — so removing ``position="hidden"`` from ``ui/app.py``, which
+    puts the native nav back above the brand and duplicates every link, leaves
+    all seven of these green. They were written asserting otherwise and renamed
+    when the falsification passed.
+
+    So the ordering below is "first and last among the things this page wrote",
+    which is real but weaker. Brand-above-nav is verifiable in a browser only.
+    """
+
+    def test_the_wordmark_is_the_first_thing_this_page_writes_to_the_left_bar(
+        self, wired_seeded
+    ):
+        at = _log_in(_app(), PATIENT)
+        first = at.sidebar.markdown[0].value
+        assert "AGENTCARE" in first
+        assert "Patient portal" in first
+
+    def test_staff_get_their_own_subtitle(self, wired_seeded):
+        at = _log_in(_app(), STAFF)
+        assert "Staff console" in at.sidebar.markdown[0].value
+
+    def test_the_left_bar_ends_with_the_date_and_the_live_provider(
+        self, wired_seeded
+    ):
+        """Last, not merely present: the reference puts these under a rule at
+        the very bottom, below the workflow card."""
+        from datetime import date
+
+        at = _log_in(_app(), PATIENT)
+        last = at.sidebar.markdown[-1].value
+        assert "LLM_PROVIDER" in last
+        assert date.today().strftime("%A") in last
+
+    def test_the_role_s_pages_are_drawn_as_page_links(self, wired_seeded):
+        """Present, and in the sidebar. Whether Streamlit *also* drew its own
+        nav above them is the part nothing here can see."""
+        at = _log_in(_app(), PATIENT)
+        titles = {link.label for link in at.sidebar.get("page_link")}
+        assert {"Chat", "My appointments", "Documents", "Profile"} <= titles
+
+    def test_log_out_sits_in_the_top_bar_not_the_left_bar(self, wired_seeded):
+        """It moved to sit beside the patient's name, as the reference has it.
+        Asserting only that it *exists* would pass in either place."""
+        at = _log_in(_app(), PATIENT)
+        assert "logout" in {b.key for b in at.button}
+        assert "logout" not in {b.key for b in at.sidebar.button}
+
+    def test_the_top_bar_carries_the_signed_in_name(self, wired_seeded):
+        at = _log_in(_app(), PATIENT)
+        assert "Asha Menon" in _rendered(at)
+
+    def test_logging_out_clears_the_session(self, wired_seeded):
+        at = _log_in(_app(), PATIENT)
+        at.button(key="logout").click().run()
+
+        assert not at.exception
+        assert at.session_state["token"] is None
+        assert {i.key for i in at.text_input} >= {"login_email", "login_password"}
+
+
 class TestLogin:
     def test_the_login_screen_renders(self, wired_seeded):
         at = _app().run()

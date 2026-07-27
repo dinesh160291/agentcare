@@ -39,8 +39,11 @@ if sys.path[:1] != [_ROOT]:
 
 import streamlit as st  # noqa: E402
 
+from datetime import date  # noqa: E402
+
 from ui import theme  # noqa: E402
 from ui.api_client import ApiError, get_client  # noqa: E402
+from ui.shell import sign_out as _sign_out  # noqa: E402
 
 #: Printed by ``scripts/seed.py``. Synthetic, and documented in the README —
 #: offering them saves a judge from typing a password they have to go and find.
@@ -68,8 +71,7 @@ def _init_state() -> None:
 
 
 def sign_out() -> None:
-    for key in ("token", "user", "session_id", "transcript", "last_run_id", "pending"):
-        st.session_state.pop(key, None)
+    _sign_out()
     _init_state()
 
 
@@ -151,31 +153,41 @@ def _login_form() -> None:
     )
 
 
-def _sidebar_footer() -> None:
-    user = st.session_state.user
+def _sidebar_brand(role: str) -> None:
+    """The wordmark, above the navigation — which is why the navigation is
+    hidden and redrawn below rather than left to render itself: Streamlit puts
+    its own nav above *all* sidebar content, and the reference puts the brand
+    there."""
     with st.sidebar:
-        st.markdown("---")
         st.markdown(
-            f'<p class="ac-dim">{theme.esc(user["name"])} · '
-            f'{theme.esc(user["role"].title())}</p>',
+            '<div class="ac-brand"><h1>AGENTCARE</h1>'
+            f'<p>{"Staff console" if role == "staff" else "Patient portal"}</p></div>',
             unsafe_allow_html=True,
         )
+
+
+def _sidebar_meta() -> None:
+    """Today's date and the live provider, at the very bottom of the left bar.
+
+    The date is this machine's. The backend has its own idea of today —
+    ``APP_TODAY`` overrides it for demos — and the two can differ; making them
+    agree means ``/health`` reporting the clock, which is a backend change and
+    not this batch's. Noted in HANDOFF.
+    """
+    with st.sidebar:
         try:
-            health = get_client().health()
-            st.markdown(
+            provider = get_client().health().get("provider")
+            chip = (
                 f'<span class="ac-tag" style="color:{theme.TEXT_SECONDARY};'
-                f'border-color:{theme.DIVIDER};">LLM_PROVIDER='
-                f'{theme.esc(health.get("provider"))}</span>',
-                unsafe_allow_html=True,
+                f'border-color:{theme.DIVIDER};">LLM_PROVIDER={theme.esc(provider)}</span>'
             )
         except ApiError:
-            st.markdown(
-                '<span class="ac-dim">backend unreachable</span>',
-                unsafe_allow_html=True,
-            )
-        if st.button("Log out", key="logout"):
-            sign_out()
-            st.rerun()
+            chip = '<span class="ac-dim">backend unreachable</span>'
+        st.markdown(
+            f'<div class="ac-sidefoot"><div>{theme.esc(date.today().strftime("%A %d %B %Y"))}'
+            f"</div>{chip}</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def main() -> None:
@@ -207,8 +219,19 @@ def main() -> None:
             st.Page("views/patient_profile.py", title="Profile"),
         ]
 
-    _sidebar_footer()
-    st.navigation(pages).run()
+    # Hidden, then redrawn as page links: Streamlit's own navigation renders
+    # above every other sidebar element, and the reference wants the wordmark
+    # there and the workflow card below. ``st.page_link`` keeps the active-page
+    # highlight, so nothing is lost by drawing them here.
+    nav = st.navigation(pages, position="hidden")
+    _sidebar_brand(role)
+    with st.sidebar:
+        for page in pages:
+            st.page_link(page)
+
+    nav.run()
+
+    _sidebar_meta()
 
 
 main()

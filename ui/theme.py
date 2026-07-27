@@ -109,6 +109,39 @@ CSS = f"""
   .ac-card.blueprint > i::before {{ bottom: -1px; left: -1px; border-bottom-width: 1px; border-left-width: 1px; }}
   .ac-card.blueprint > i::after  {{ bottom: -1px; right: -1px; border-bottom-width: 1px; border-right-width: 1px; }}
 
+  /* The left bar's wordmark, above the page links. */
+  .ac-brand {{
+      border-bottom: 1px solid {DIVIDER}; padding: 0 0 12px; margin: 0 0 8px;
+  }}
+  .ac-brand h1 {{
+      font-size: 22px; margin: 0; letter-spacing: 0.03em; font-weight: 600;
+      line-height: 1.1;
+  }}
+  .ac-brand p {{ margin: 3px 0 0; font-size: 11.5px; color: {TEXT_SECONDARY}; }}
+
+  /* …and its foot: today, then the provider actually answering. */
+  .ac-sidefoot {{
+      border-top: 1px solid {DIVIDER}; margin-top: 14px; padding-top: 10px;
+      font-size: 11.5px; color: {TEXT_SECONDARY};
+  }}
+  .ac-sidefoot > div {{ margin-bottom: 6px; }}
+
+  /* The top bar's right-hand end: bell, name, then the Log out button. */
+  .ac-identity {{
+      display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+      font-size: 13px; color: {TEXT_SECONDARY};
+  }}
+  .ac-bell {{ position: relative; font-size: 15px; line-height: 1; }}
+  .ac-badge {{
+      position: absolute; top: -7px; right: -9px; background: {ACCENT};
+      color: {BG}; font-size: 10px; font-weight: 700; min-width: 15px;
+      height: 15px; display: flex; align-items: center; justify-content: center;
+      padding: 0 3px;
+  }}
+  .ac-rule {{
+      border-bottom: 1px solid {DIVIDER}; margin: 10px 0 16px;
+  }}
+
   .ac-tag {{
       display: inline-block; padding: 1px 7px; font-size: 11.5px;
       border: 1px solid; white-space: nowrap; font-weight: 600;
