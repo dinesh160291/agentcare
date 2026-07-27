@@ -28,6 +28,7 @@ from google.adk.models import LlmRequest
 from google.genai import types
 
 from app import clock
+from app.workflow.replies import when_words
 from app.providers.mock import MockLlm, reads_as_confirmation, reads_as_decline
 from app.tools.appointments import book_appointment
 from app.tools.availability import find_available_slots
@@ -420,8 +421,10 @@ class TestAppointmentProposesButNeverBooks:
         )
         text = reply_text(response)
         assert first["doctor_name"] in text
-        assert first["start"][:10] in text
-        assert first["start"][11:16] in text
+        # The slot the tool accepted, said the way a patient reads a time. The
+        # ISO stamp is what the row holds; it is not what goes on screen.
+        day, time = when_words(first["start"])
+        assert day in text and time in text
 
     def test_an_empty_availability_result_is_not_dressed_up_as_success(self):
         response = ask(

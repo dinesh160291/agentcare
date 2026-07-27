@@ -22,6 +22,18 @@ from app.errors import RecordNotFound
 from app.models import Appointment, AppointmentSlot, Department, Doctor
 
 
+def _clock_time(moment) -> str:
+    """12-hour, matching ``app.workflow.replies.clock_time``.
+
+    Duplicated rather than imported: ``replies`` imports this module, and a
+    tool reaching back up into the workflow layer would invert the dependency
+    the whole ``tools`` package is built on. Four lines, pinned by a test that
+    compares the two.
+    """
+    hour = moment.hour % 12 or 12
+    return f"{hour}:{moment:%M} {'AM' if moment.hour < 12 else 'PM'}"
+
+
 def render_confirmation(session: Session, appointment_id: int) -> dict[str, Any]:
     """Facts and a ready-made sentence for an appointment, read from the row.
 
@@ -44,7 +56,10 @@ def render_confirmation(session: Session, appointment_id: int) -> dict[str, Any]
         "doctor_name": doctor.name if doctor else None,
         "weekday": f"{slot.start_time:%A}" if slot else None,
         "date": f"{slot.start_time.day} {slot.start_time:%B} {slot.start_time.year}" if slot else None,
-        "time": f"{slot.start_time:%H:%M}" if slot else None,
+        # 12-hour, because this string is read by patients — the receipt, the
+        # cancellation prompt and the proposal card all render it. The row
+        # keeps the timestamp; only the way it is said changes.
+        "time": _clock_time(slot.start_time) if slot else None,
         "status": appointment.status.value,
     }
 

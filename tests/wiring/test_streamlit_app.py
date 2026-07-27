@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from app.workflow.replies import clock_time
 from ui import theme
 from app.models import (
     Appointment,
@@ -252,7 +253,14 @@ class TestTheConfirmationRule:
         )
         assert card in screen, "the card is not rendering the four facts"
         assert slot.doctor.name in screen
-        assert f"{slot.start_time:%H:%M}" in screen
+
+        # Card and chat must say the same time about the same slot. They did
+        # not: the card read 15:00 while the reply beside it read 3:00 PM,
+        # which a patient reads as two appointments rather than as two
+        # notations. Both go through one formatter now, so this asserts the
+        # 12-hour string is present and the 24-hour one is nowhere.
+        assert clock_time(slot.start_time) in screen
+        assert f"{slot.start_time:%H:%M}" not in screen
 
     def test_those_four_facts_came_from_the_api(self, wired_seeded, seeded_db):
         """Distrust green: the chat reply also names the doctor and the time,

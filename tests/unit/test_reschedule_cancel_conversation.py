@@ -22,6 +22,7 @@ import asyncio
 import pytest
 
 from app import clock
+from app.db import SessionLocal
 from app.models import (
     Appointment,
     AppointmentSlot,
@@ -33,6 +34,7 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
+from app.workflow.replies import clock_time
 from app.orchestrator import run_workflow
 
 PATIENT_EMAIL = "asha.patient@example.invalid"
@@ -106,8 +108,23 @@ class TestTheWholeWayFromASentence:
     ):
         result = turn(patient, "please reschedule my appointment to next week", "s-e2e-8")
         assert "AC-000001" in result.reply
-        lowered = result.reply.lower()
-        assert " from " in lowered and " to " in lowered
+
+        # Both times, not the connective words that used to join them. The
+        # wording moved from "from X to Y" to patient-speak ("I found your
+        # appointment on X. I can move it to Y"), and a test pinned to " from "
+        # was checking the sentence's grammar rather than its content.
+        session = SessionLocal()
+        try:
+            appointment = session.get(Appointment, SEEDED_APPOINTMENT_ID)
+            run = session.get(WorkflowRun, result.run_id)
+            leaving = clock_time(appointment.slot.start_time)
+            arriving = clock_time(
+                session.get(AppointmentSlot, run.proposed_slot_id).start_time
+            )
+        finally:
+            session.close()
+        assert leaving in result.reply
+        assert arriving in result.reply
 
     def test_confirming_a_reschedule_moves_it(self, patient, seeded_db):
         original_slot_id = seeded_db.get(Appointment, SEEDED_APPOINTMENT_ID).slot_id

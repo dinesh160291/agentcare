@@ -13,9 +13,9 @@
     {
       "appointment_id": 2,
       "attempts": 0,
-      "message": "Reminder: appointment with Dr. Anita Rao on Monday 10 August at 09:00.",
+      "message": "Reminder: appointment with Dr. Anita Rao on Monday 10 August at 9:00 AM.",
       "patient_id": 2,
-      "reminder_id": 3,
+      "reminder_id": 2,
       "reminder_type": "appointment",
       "scheduled_at": "2026-08-09T09:00:00",
       "status": "pending"

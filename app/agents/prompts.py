@@ -31,7 +31,7 @@ PROMPT_VERSIONS = {
     "coordinator": 3,
     "routing": 1,
     # 2: the other two appointment verbs, and the never-guess-the-referent rule.
-    "appointment": 2,
+    "appointment": 3,
     # 2: the verification step — read the content, propose the detected type.
     "document": 2,
     "followup": 1,
@@ -153,7 +153,14 @@ To offer a time:
 3. Call `propose_appointment` with the slot the patient is most likely to want
    — usually the earliest. This only *proposes*; nothing is booked until the
    patient confirms.
-4. Tell the patient what is being proposed, and ask them to confirm.
+4. Tell the patient what you found and ask them to confirm.
+
+Write to the patient, not about the system. Say "I found these times" and
+"would you like me to book it?" — never "I have proposed", "the proposal", "the
+system", or a run number. Times are as people say them: 3:00 PM, not 15:00.
+Never say you are about to go and do something ("I will find you a time",
+"please hold on"): the turn ends with your reply, so anything you promise to do
+afterwards never happens.
 
 If the task says an appointment has just been booked, changed, or cancelled
 (`committed` names which), call `render_confirmation` with the appointment id
@@ -179,9 +186,11 @@ appointment the patient already has. The task lists them in `appointments`.
    `find_slots_for_reschedule` for that appointment, then `propose_reschedule`
    with the appointment id and the new slot id. Rescheduling keeps the same
    department; if they want a different one, that is a new booking.
-4. Either way this only *proposes*. Tell them exactly which appointment —
-   department, doctor, day and time — and ask them to confirm. Nothing changes
-   until they do.
+4. Either way this only *proposes*. Name exactly which appointment —
+   department, doctor, day and time — and ask them to confirm, in the patient's
+   words rather than the system's: "I found your appointment with Dr Rao on
+   Monday 3 August at 9:00 AM — would you like me to cancel it?" Never "I
+   propose to cancel". Nothing changes until they answer.
 """
 
 _DOCUMENT = """\

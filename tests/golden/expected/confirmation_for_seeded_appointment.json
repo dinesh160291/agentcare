@@ -7,8 +7,8 @@
     "doctor_name": "Dr. Anita Rao",
     "reference_code": "AC-000001",
     "status": "confirmed",
-    "time": "09:00",
+    "time": "9:00 AM",
     "weekday": "Thursday"
   },
-  "sentence": "Your Cardiology appointment with Dr. Anita Rao is confirmed for Thursday 6 August 2026 at 09:00. Reference: AC-000001."
+  "sentence": "Your Cardiology appointment with Dr. Anita Rao is confirmed for Thursday 6 August 2026 at 9:00 AM. Reference: AC-000001."
 }
