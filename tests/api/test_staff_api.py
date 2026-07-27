@@ -561,3 +561,35 @@ class TestCapacity:
             json={"start_times": ["2099-01-08T09:00:00"]},
         )
         assert response.status_code == 404
+
+
+class TestTheCapacityListingIsNotAOneWayDoor:
+    """Closing a department must not remove it from the page that re-opens it.
+
+    Found by rendering the capacity view for the first time: the endpoint was
+    serving the agents' active-only listing, so a closed department disappeared
+    and could never be switched back on.
+    """
+
+    def test_a_closed_department_is_still_listed(self, seeded_client, seeded_db):
+        seeded_client.patch(
+            "/staff/departments/1",
+            headers=auth_header(STAFF, "staff"),
+            json={"active": False},
+        )
+        listed = seeded_client.get(
+            "/staff/departments", headers=auth_header(STAFF, "staff")
+        ).json()
+
+        cardiology = next(d for d in listed if d["name"] == "Cardiology")
+        assert cardiology["active"] is False
+
+    def test_it_can_therefore_be_reopened(self, seeded_client, seeded_db):
+        headers = auth_header(STAFF, "staff")
+        seeded_client.patch("/staff/departments/1", headers=headers,
+                            json={"active": False})
+        seeded_client.patch("/staff/departments/1", headers=headers,
+                            json={"active": True})
+
+        seeded_db.expire_all()
+        assert seeded_db.get(Department, 1).active is True

@@ -1,0 +1,15 @@
+# The "Industry" palette the Phase 7 design reference is built in: a light
+# technical ground, one steel accent, square corners. The rest of the look is
+# injected by ui/theme.py, which Streamlit's theme options cannot express.
+[theme]
+base = "light"
+primaryColor = "#5980a6"
+backgroundColor = "#f2f2f3"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1d1f20"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

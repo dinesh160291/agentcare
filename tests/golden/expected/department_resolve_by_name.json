@@ -1,6 +1,7 @@
 {
   "candidates": [],
   "department": {
+    "active": true,
     "description": "Handles heart and circulatory appointments and follow-ups.",
     "id": 1,
     "name": "Cardiology"

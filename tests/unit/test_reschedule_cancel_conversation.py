@@ -21,6 +21,7 @@ import asyncio
 
 import pytest
 
+from app import clock
 from app.models import (
     Appointment,
     AppointmentSlot,
@@ -147,6 +148,10 @@ class TestNeverGuessWhichAppointment:
             .filter(
                 Department.name == "Neurology",
                 AppointmentSlot.status == SlotStatus.AVAILABLE,
+                # Upcoming, not merely free: the seed's earliest slot is today
+                # at 09:00, so without this the fixture builds a past
+                # "upcoming appointment" from lunchtime onwards.
+                AppointmentSlot.start_time > clock.now(),
             )
             .order_by(AppointmentSlot.start_time)
             .first()

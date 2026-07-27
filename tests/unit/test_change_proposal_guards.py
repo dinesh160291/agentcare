@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pytest
 
+from app import clock
 from app.agents.toolbelt import Toolbelt
 from app.models import (
     Appointment,
@@ -73,17 +74,27 @@ def belt_for(seeded_db, user, run, *, patient_id: int = ASHA_PROFILE_ID) -> Tool
 
 
 def slot_in(seeded_db, department_name: str) -> AppointmentSlot:
-    return (
+    """A free slot in that department, **in the future**.
+
+    ``get_slot``'s ``available`` verdict rules out a slot that has already
+    started, and the seed's earliest slot is today at 09:00 — so a helper that
+    took the earliest one would make these tests pass in the morning and fail
+    in the afternoon.
+    """
+    slot = (
         seeded_db.query(AppointmentSlot)
         .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
         .join(Department, Department.id == Doctor.department_id)
         .filter(
             Department.name == department_name,
             AppointmentSlot.status == SlotStatus.AVAILABLE,
+            AppointmentSlot.start_time > clock.now(),
         )
         .order_by(AppointmentSlot.start_time)
         .first()
     )
+    assert slot is not None, f"no future free slot in {department_name}"
+    return slot
 
 
 class TestOwnership:

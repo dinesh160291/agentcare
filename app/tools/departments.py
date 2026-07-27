@@ -34,6 +34,11 @@ def _serialise(department: Department) -> dict[str, Any]:
         "id": department.id,
         "name": department.name,
         "description": department.description,
+        # Whether the department is open. Carried on every department dict
+        # rather than only the staff-facing one: a second shape is a second
+        # thing to keep in step, and a consumer that has to know which flavour
+        # it is holding will eventually guess wrong.
+        "active": department.active,
     }
 
 
@@ -55,15 +60,23 @@ def _result(
     }
 
 
-def list_departments(session: Session) -> list[dict[str, Any]]:
-    """Every active department, name-ordered so output is stable."""
-    departments = (
-        session.query(Department)
-        .filter(Department.active.is_(True))
-        .order_by(Department.name)
-        .all()
-    )
-    return [_serialise(d) for d in departments]
+def list_departments(
+    session: Session, *, active_only: bool = True
+) -> list[dict[str, Any]]:
+    """Departments, name-ordered so output is stable.
+
+    Active-only by default, because the agents' question is "where can this be
+    booked" and a closed department is not an answer to it.
+
+    ``active_only=False`` is for the staff console, and it is not a nicety: a
+    closed department that disappears from the only page that can re-open it is
+    a one-way door. The listing an operator manages capacity with has to
+    include the capacity they switched off.
+    """
+    query = session.query(Department)
+    if active_only:
+        query = query.filter(Department.active.is_(True))
+    return [_serialise(d) for d in query.order_by(Department.name).all()]
 
 
 def resolve_department(session: Session, text: str) -> dict[str, Any]:

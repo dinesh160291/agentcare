@@ -1,50 +1,60 @@
 [
   {
+    "active": true,
     "description": "Handles heart and circulatory appointments and follow-ups.",
     "id": 1,
     "name": "Cardiology"
   },
   {
+    "active": true,
     "description": "Handles skin, hair, and nail appointments.",
     "id": 3,
     "name": "Dermatology"
   },
   {
+    "active": true,
     "description": "Handles ear, nose, and throat appointments.",
     "id": 7,
     "name": "ENT"
   },
   {
+    "active": true,
     "description": "Handles digestive-system appointments and follow-ups.",
     "id": 10,
     "name": "Gastroenterology"
   },
   {
+    "active": true,
     "description": "Handles general adult consultations and routine check-ups.",
     "id": 4,
     "name": "General Medicine"
   },
   {
+    "active": true,
     "description": "Handles women's health, pregnancy, and maternity appointments.",
     "id": 9,
     "name": "Gynecology & Obstetrics"
   },
   {
+    "active": true,
     "description": "Handles nervous-system appointments and follow-ups.",
     "id": 6,
     "name": "Neurology"
   },
   {
+    "active": true,
     "description": "Handles eye and vision appointments.",
     "id": 8,
     "name": "Ophthalmology"
   },
   {
+    "active": true,
     "description": "Handles bone, joint, and musculoskeletal appointments.",
     "id": 2,
     "name": "Orthopedics"
   },
   {
+    "active": true,
     "description": "Handles appointments for children and adolescents.",
     "id": 5,
     "name": "Pediatrics"

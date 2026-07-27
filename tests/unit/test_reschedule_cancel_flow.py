@@ -23,6 +23,7 @@ import asyncio
 
 import pytest
 
+from app import clock
 from app.db import SessionLocal
 from app.models import (
     Appointment,
@@ -63,7 +64,14 @@ def turn(user, message, session_id):
 
 
 def free_slot_in_cardiology(session, *, exclude_id: int | None = None) -> AppointmentSlot:
-    """Any bookable Cardiology slot other than the one already taken."""
+    """A bookable Cardiology slot **in the future**.
+
+    The future filter is not decoration. The seed lays slots down from today,
+    so the earliest available one is today at 09:00 — and the mutating tools
+    refuse a slot whose start time has passed. Without this, the reschedule
+    tests pass before 09:00 and fail after it, which is a suite that reports
+    on the clock rather than on the code.
+    """
     from app.models import Department, Doctor
 
     query = (
@@ -73,12 +81,15 @@ def free_slot_in_cardiology(session, *, exclude_id: int | None = None) -> Appoin
         .filter(
             Department.name == "Cardiology",
             AppointmentSlot.status == SlotStatus.AVAILABLE,
+            AppointmentSlot.start_time > clock.now(),
         )
         .order_by(AppointmentSlot.start_time)
     )
     if exclude_id is not None:
         query = query.filter(AppointmentSlot.id != exclude_id)
-    return query.first()
+    slot = query.first()
+    assert slot is not None, "the seed window contains no future Cardiology slot"
+    return slot
 
 
 def pending_run(

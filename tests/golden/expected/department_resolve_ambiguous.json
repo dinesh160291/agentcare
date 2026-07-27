@@ -1,11 +1,13 @@
 {
   "candidates": [
     {
+      "active": true,
       "description": "Handles ear, nose, and throat appointments.",
       "id": 7,
       "name": "ENT"
     },
     {
+      "active": true,
       "description": "Handles appointments for children and adolescents.",
       "id": 5,
       "name": "Pediatrics"

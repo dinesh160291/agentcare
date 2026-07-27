@@ -159,3 +159,35 @@ class TestListing:
         ambiguous = resolve_department(seeded_db, "my kid has ear pain")
         unsupported = resolve_department(seeded_db, "the weather")
         assert set(resolved) == set(ambiguous) == set(unsupported)
+
+
+class TestTheStaffListingIncludesClosedDepartments:
+    """A closed department that vanishes from the only page which can re-open
+    it is a one-way door. The agents' listing stays active-only — "where can
+    this be booked" has no room for a service that is shut — but the operator's
+    does not."""
+
+    def test_the_default_listing_hides_a_closed_department(self, seeded_db):
+        from app.models import Department
+
+        seeded_db.get(Department, 1).active = False
+        seeded_db.flush()
+
+        names = [d["name"] for d in list_departments(seeded_db)]
+        assert "Cardiology" not in names
+
+    def test_the_operator_listing_still_shows_it(self, seeded_db):
+        from app.models import Department
+
+        seeded_db.get(Department, 1).active = False
+        seeded_db.flush()
+
+        listed = {d["name"]: d for d in list_departments(seeded_db, active_only=False)}
+        assert "Cardiology" in listed
+        assert listed["Cardiology"]["active"] is False
+
+    def test_every_department_dict_carries_the_flag(self, seeded_db):
+        """One shape, not two: a caller must never have to know which flavour
+        of department dict it is holding."""
+        for department in list_departments(seeded_db, active_only=False):
+            assert "active" in department

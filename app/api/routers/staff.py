@@ -299,7 +299,13 @@ def read_audit(
 
 @router.get("/departments")
 def departments(staff: StaffUser, session: DbSession) -> list[dict[str, Any]]:
-    return list_departments(session)
+    """Every department, open or closed.
+
+    ``active_only=False`` deliberately: this is the listing an operator manages
+    capacity from, and a closed department missing from it could never be
+    re-opened.
+    """
+    return list_departments(session, active_only=False)
 
 
 @router.patch("/departments/{department_id}")
