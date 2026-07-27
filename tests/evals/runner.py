@@ -27,7 +27,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.db import SessionLocal
-from app.models import Appointment, PatientProfile, User, WorkflowRun
+from app.models import (
+    Appointment,
+    DocumentStatus,
+    FollowUpTask,
+    FollowUpTaskStatus,
+    PatientDocument,
+    PatientProfile,
+    User,
+    WorkflowRun,
+)
 from app.orchestrator import run_workflow
 from app.trace import assert_well_formed
 
@@ -49,6 +58,14 @@ KNOWN_EXPECTATIONS = frozenset(
         "request_text_unchanged",
         "run_state_unchanged",
         "escalations",
+        # --- Phase 5: safety, escalation, confirmation, documents ---
+        "escalation_kind",
+        "escalation_occurrences",
+        "runs_for_patient",
+        "non_answer_count",
+        "reply_author",
+        "documents_flagged",
+        "open_tasks_contain",
     }
 )
 
@@ -143,7 +160,9 @@ def run_scenario(scenario: dict) -> ScenarioResult:
         session = SessionLocal()
         try:
             created = _appointment_count(session, patient_id) - baseline
-            _check(result, index, expect, outcome, session, before, created)
+            _check(
+                result, index, expect, outcome, session, before, created, patient_id
+            )
             assert_well_formed(session)
         finally:
             session.close()
@@ -151,7 +170,7 @@ def run_scenario(scenario: dict) -> ScenarioResult:
     return result
 
 
-def _check(result, index, expect, outcome, session, before, created) -> None:
+def _check(result, index, expect, outcome, session, before, created, patient_id) -> None:
     def fail(detail: str) -> None:
         result.failures.append(Failure(index, detail))
 
@@ -201,6 +220,72 @@ def _check(result, index, expect, outcome, session, before, created) -> None:
         run = session.get(WorkflowRun, outcome.run_id)
         if len(run.escalations) != expect["escalations"]:
             fail(f"escalations: expected {expect['escalations']}, got {len(run.escalations)}")
+
+    if "escalation_kind" in expect and outcome.run_id:
+        run = session.get(WorkflowRun, outcome.run_id)
+        kinds = sorted(e.kind.value for e in run.escalations)
+        if expect["escalation_kind"] not in kinds:
+            fail(f"escalation_kind: expected {expect['escalation_kind']!r} in {kinds}")
+
+    if "escalation_occurrences" in expect and outcome.run_id:
+        run = session.get(WorkflowRun, outcome.run_id)
+        counts = [e.occurrence_count for e in run.escalations]
+        if expect["escalation_occurrences"] not in counts:
+            fail(
+                f"escalation_occurrences: expected "
+                f"{expect['escalation_occurrences']}, got {counts}"
+            )
+
+    # The dedup check that matters: repeats must not each spawn a run. An
+    # occurrence count alone would pass while five runs piled up beside it.
+    if "runs_for_patient" in expect:
+        total = (
+            session.query(WorkflowRun)
+            .filter(WorkflowRun.patient_id == patient_id)
+            .count()
+        )
+        if total != expect["runs_for_patient"]:
+            fail(f"runs_for_patient: expected {expect['runs_for_patient']}, got {total}")
+
+    if "non_answer_count" in expect and outcome.run_id:
+        run = session.get(WorkflowRun, outcome.run_id)
+        if run.non_answer_count != expect["non_answer_count"]:
+            fail(
+                f"non_answer_count: expected {expect['non_answer_count']}, "
+                f"got {run.non_answer_count}"
+            )
+
+    if "reply_author" in expect:
+        actual = outcome.author.value if outcome.author else None
+        if actual != expect["reply_author"]:
+            fail(f"reply_author: expected {expect['reply_author']!r}, got {actual!r}")
+
+    if "documents_flagged" in expect:
+        flagged = (
+            session.query(PatientDocument)
+            .filter(
+                PatientDocument.patient_id == patient_id,
+                PatientDocument.status == DocumentStatus.FLAGGED,
+            )
+            .count()
+        )
+        if flagged != expect["documents_flagged"]:
+            fail(f"documents_flagged: expected {expect['documents_flagged']}, got {flagged}")
+
+    if "open_tasks_contain" in expect:
+        outstanding = [
+            item
+            for task in session.query(FollowUpTask)
+            .filter(
+                FollowUpTask.patient_id == patient_id,
+                FollowUpTask.status == FollowUpTaskStatus.OPEN,
+            )
+            .all()
+            for item in (task.details or {}).get("missing", [])
+        ]
+        for needle in expect["open_tasks_contain"]:
+            if needle not in outstanding:
+                fail(f"open task missing {needle!r}; outstanding = {outstanding}")
 
     # The byte-identical checks. These are the point of the off-topic scenario:
     # not "the reply was polite" but "nothing moved".

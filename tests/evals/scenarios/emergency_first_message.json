@@ -1,0 +1,21 @@
+{
+  "name": "emergency-on-an-opening-message",
+  "pins": "PRD story 35. The deterministic screen catches an emergency before any LLM runs, blocks normal processing, and creates an escalation. Because there is no run to key that escalation to, the run is created directly in `escalated` — the one door into that initial state, open for safety alone, so the Escalation's foreign key never has to be nullable. The reply directs the patient to urgent care and makes no clinical claim about what may be wrong with them: naming a cause would be the exact thing this whole layer exists to prevent.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I have chest pain and my left arm hurts",
+      "expect": {
+        "status": "escalated",
+        "escalations": 1,
+        "escalation_kind": "safety",
+        "escalation_occurrences": 1,
+        "reply_author": "guard",
+        "reply_contains": ["emergency"],
+        "reply_excludes": ["heart", "cardiac", "attack", "angina", "condition", "symptom", "i've booked"],
+        "appointments_created": 0,
+        "plan": []
+      }
+    }
+  ]
+}

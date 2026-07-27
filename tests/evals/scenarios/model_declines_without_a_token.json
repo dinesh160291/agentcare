@@ -1,0 +1,20 @@
+{
+  "name": "model-declines-without-an-exact-token",
+  "pins": "Step (c) of the confirmation reading order. \"not that one, thanks\" carries no exact token, so code cannot read it — but it plainly means no, and a decline that was never heard leaves the patient re-asked forever. The model's permitted verdicts are decline and non-answer only; it can never confirm. So this turn must clear the proposal and return to slot selection while booking nothing.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a cardiology appointment next week",
+      "expect": {"status": "pending_confirmation"}
+    },
+    {
+      "message": "not that one, thanks",
+      "expect": {
+        "status": "in_progress",
+        "reply_author": "template",
+        "appointments_created": 0,
+        "non_answer_count": 0
+      }
+    }
+  ]
+}

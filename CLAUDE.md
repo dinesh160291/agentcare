@@ -89,7 +89,8 @@ app/
   agents/            one module per agent; prompts/ separate from logic
   providers/         BaseLlm adapters: mock.py, openai.py, groq.py
   tools/             plain Python functions, framework-agnostic
-  orchestrator.py    run_workflow(user, message, session_id) — ADK confined here
+  orchestrator.py    run_workflow(...) + apply_patient_action(...) — ADK confined here
+  workflow/          state machine, plan, message mapping, confirmation, staff actions
   safety/            keyword screen, LLM pass, escalation
   trace/             TraceEvent writer, redaction, well-formedness checker
   scheduler/         APScheduler poll job (reminders + visit-completion sweep)
@@ -118,6 +119,11 @@ Tools stay plain functions and prompts stay in their own module **so the LangGra
 - **`clock.today()` everywhere.** Never `date.today()` in app code — golden tests freeze the clock. Live app uses the real date; `APP_TODAY` is a test/demo override only.
 - **The mock provider is an understudy, not a fixture.** `LLM_PROVIDER=mock` must run the *whole* app end to end: real tool calls, real DB writes, replies **templated from persisted tool results** — never canned strings (that would break rule 6). Mock and live emit identically-shaped traces. If a feature works in live mode but not mock, the feature is not done.
 - **Streamlit is a thin client.** Zero business logic, zero direct DB access. It calls `api_client`; the API enforces everything. A page that renders data it didn't fetch from the backend scores as faked.
+- **A second opinion that agrees with the first is not a check.** Sabotaging the deterministic safety screen left *every* scenario green — the mock's LLM layer happened to subsume it on all of them, so the whole first layer could have been deleted unnoticed. A hybrid guard needs at least one pinned case per layer that **only that layer** can catch (self-harm for the phrase list, which has no body-part-plus-severity co-occurrence; a worsening symptom for the LLM pass, which carries no listed phrase). Falsify each guard *individually*.
+- **The safety screen's false-positive direction is the one that makes it unusable.** A missed emergency is the worst outcome; a screen that fires on ordinary administration is not the safe side of that trade, because a review queue that is mostly noise is a queue nobody reads. Three live traps: `pain` alone is not an emergency (the seed's own ambiguous-routing case is "my kid has ear pain"), `prescription` is a **document type** Ophthalmology requires (only a *request* for one is clinical), and `emergency contact` is a field on the patient's profile.
+- **After a safety trigger the run is terminal, so it is no longer the *active* run.** Escalation dedup therefore cannot rely on `active_run`: the naive path creates a fresh run for every repeat, turning one frightened patient typing "chest pain" five times into five queue items. Look explicitly for this session's escalated run with an open escalation, and attach.
+- **A bound tied to a classification is bypassed by a misclassification.** The confirmation non-answer counter is incremented for *any* turn that leaves the run waiting, not for the classes that "look like" non-answers — an "hmm, maybe" read as off-topic would otherwise buy an extra free turn forever. A bound reachable only through correctly-classified paths is not a bound.
+- **Result dicts and their consumers drift silently.** `diff_required_documents` returns `missing_mandatory`; the toolbelt and the mock both read `missing`, so the missing-documents task was never created and patients were told nothing was needed. Nothing failed — the key was simply absent and `or []` did the rest. When a tool's refusal path returns a differently-shaped dict from its success path, that is the same bug waiting.
 - **Ownership, not just role.** Every id-taking endpoint verifies the row belongs to the acting user. Failed ownership → **404, not 403** (403 confirms the record exists), and audit the denied attempt. Judges try the one-digit edit first.
 - **Upload hardening**: max file size, MIME allowlist via magic bytes (`filetype`), server-generated filenames. The client filename is a path-traversal vector.
 

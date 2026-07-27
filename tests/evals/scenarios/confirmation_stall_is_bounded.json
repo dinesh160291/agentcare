@@ -1,0 +1,33 @@
+{
+  "name": "confirmation-stall-is-bounded",
+  "pins": "Stall containment. Non-answers in pending_confirmation are legal self-stays, but the re-ask loop is bounded: at the cap (3) the re-ask stops being LLM-worded and becomes a code template, costing no further model wording. The stall never resolves implicitly in either direction — no auto-commit and no auto-decline — so after five non-answers the run is still waiting, the proposal is still live, and nothing has been booked.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a cardiology appointment next week",
+      "expect": {"status": "pending_confirmation", "non_answer_count": 0}
+    },
+    {
+      "message": "hmm, maybe",
+      "expect": {"status": "pending_confirmation", "non_answer_count": 1, "reply_author": "llm"}
+    },
+    {
+      "message": "not sure yet",
+      "expect": {"status": "pending_confirmation", "non_answer_count": 2}
+    },
+    {
+      "message": "hmm, I think so",
+      "expect": {"status": "pending_confirmation", "non_answer_count": 3, "reply_author": "template"}
+    },
+    {
+      "message": "hmm, maybe",
+      "expect": {
+        "status": "pending_confirmation",
+        "non_answer_count": 4,
+        "reply_author": "template",
+        "reply_contains": ["Confirm"],
+        "appointments_created": 0
+      }
+    }
+  ]
+}

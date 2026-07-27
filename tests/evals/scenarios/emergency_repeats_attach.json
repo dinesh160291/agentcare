@@ -1,0 +1,38 @@
+{
+  "name": "emergency-repeats-attach-to-one-escalation",
+  "pins": "Escalation dedup, and the trap underneath it. After the first message the run is terminal, so it is no longer the *active* run — the naive path therefore creates a fresh run and a fresh escalation for every repeat, turning one frightened patient into five queue items for a human to reconcile. Repeats must attach: one run, one escalation, an occurrence count that climbs. Turns 4 and 5 pin the other half — `escalated` is the one state a withdrawal must not close. Turn 4 reports no status on purpose: the escalated run is terminal, so the patient has no *active* run for that turn to belong to, and the reply is the scope template. Turn 5 then shows the run itself is untouched, still escalated and still collecting triggers.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I have chest pain",
+      "expect": {"status": "escalated", "escalations": 1, "runs_for_patient": 1}
+    },
+    {
+      "message": "chest pain again, it is getting worse",
+      "expect": {"status": "escalated", "escalations": 1, "escalation_occurrences": 2, "runs_for_patient": 1}
+    },
+    {
+      "message": "I still have chest pain",
+      "expect": {"status": "escalated", "escalations": 1, "escalation_occurrences": 3, "runs_for_patient": 1}
+    },
+    {
+      "message": "actually forget it, never mind",
+      "expect": {
+        "status": null,
+        "runs_for_patient": 1,
+        "appointments_created": 0
+      }
+    },
+    {
+      "message": "the chest pain is back",
+      "expect": {
+        "status": "escalated",
+        "escalations": 1,
+        "escalation_occurrences": 4,
+        "runs_for_patient": 1,
+        "cancellation_reason": null,
+        "appointments_created": 0
+      }
+    }
+  ]
+}

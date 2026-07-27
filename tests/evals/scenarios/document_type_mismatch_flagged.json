@@ -1,0 +1,22 @@
+{
+  "name": "document-type-mismatch-is-flagged",
+  "pins": "PRD stories 24 and 29. The seed ships an X-ray report filed as an ECG — a genuine mismatch, not a fixture bent to produce one. The model proposes that the content does not match the declared type; code sets the status. Verification is bounded to one document per turn, so clearing the backlog takes three, and the flag lands on the third. The reply says what is on file and never what a document contains: reading one for meaning is the clinical line.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "what documents do I have on file?",
+      "expect": {"documents_flagged": 0}
+    },
+    {
+      "message": "what documents do I have on file?",
+      "expect": {"documents_flagged": 0}
+    },
+    {
+      "message": "what documents do I have on file?",
+      "expect": {
+        "documents_flagged": 1,
+        "reply_excludes": ["normal", "abnormal", "shows", "indicates", "suggests"]
+      }
+    }
+  ]
+}

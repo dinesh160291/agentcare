@@ -1,0 +1,20 @@
+{
+  "name": "missing-documents-become-a-task",
+  "pins": "PRD stories 26 and 27. Neurology requires a prior MRI or CT report, which this patient does not have. The shortfall must reach the patient in the reply *and* outlive the conversation as a follow-up task — a missing-documents list that exists only in a sentence is lost the moment the chat ends. This scenario exists because the diff and its consumers had silently disagreed on a key name, so the task was never created and the patient was told nothing was needed.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a neurology appointment next week",
+      "expect": {"status": "pending_confirmation", "plan": ["route", "book", "documents", "follow_up"]}
+    },
+    {
+      "message": "yes",
+      "expect": {
+        "status": "completed",
+        "appointments_created": 1,
+        "reply_contains": ["Prior MRI or CT report"],
+        "open_tasks_contain": ["Prior MRI or CT report"]
+      }
+    }
+  ]
+}
