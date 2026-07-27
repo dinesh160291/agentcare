@@ -43,6 +43,7 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
+from app.tools.departments import resolve_department
 from app.trace import TraceWriter
 from app.workflow.plan import CANONICAL_ORDER, append_step
 from app.workflow.state_machine import transition
@@ -77,6 +78,10 @@ class Consequence(str, Enum):
     ANSWER_AND_STAY = "answer_and_stay"  # side question
     SCOPE_REPLY = "scope_reply"          # off-topic
     WITHDRAW = "withdraw"                # withdrawal
+    #: Not a class of its own — what a *conflicting* message becomes when the
+    #: run it would replace is waiting for staff and the message shows no
+    #: difference. See :func:`_supersede_needs_difference`.
+    STATUS_REPLY = "status_reply"
 
 
 CONSEQUENCE_FOR: dict[MessageClass, Consequence] = {
@@ -196,6 +201,64 @@ def validate_class(
     )
 
 
+def _supersede_needs_difference(
+    session: Session,
+    run: WorkflowRun,
+    *,
+    message: str,
+    incoming_steps: Sequence[PlanStep] | None,
+    writer: TraceWriter,
+) -> bool:
+    """Would superseding this run throw away a review nobody replaced?
+
+    **At `pending_review`, conflicting requires difference.** A run waiting on
+    staff is a queue item as well as a conversation, and cancelling it destroys
+    both — so a message that carries the run's own intent and names nothing new
+    must not be able to do it. The live shape: a low-confidence route queues for
+    review, the patient says "looks good, lets book that time", the assent
+    classifies as conflicting because it carries the same intent, and the
+    request a human was about to look at is gone. The patient watches a fresh
+    search start from nothing and is never told.
+
+    Difference means one of two things, and both are decided here rather than
+    proposed:
+
+    * **a different intent** — cancelling is not agreeing to book;
+    * **a different subject** — the message resolves, against the Department
+      table, to a department that is not this run's.
+
+    The subject test is ``resolve_department`` on the message text, which is
+    the same resolution routing uses everywhere else. No model argument, no
+    keyword list: "a different subject" means what the table says it means, and
+    a phrasing nobody anticipated cannot slip past a list that does not exist.
+
+    Unknown intent supersedes. If the Coordinator proposed no steps there is
+    nothing to compare, and the conservative reading of "requires difference"
+    is that difference has not been *dis*proved — the patient keeps the ability
+    to replace a request they may have meant to replace.
+    """
+    incoming = primary_intent(list(incoming_steps or []))
+    if incoming is None or incoming is not primary_intent(run.plan or []):
+        return False
+
+    named = resolve_department(session, message or "")
+    if named.get("status") == "resolved":
+        current = (run.state or {}).get("department_id")
+        if named["department"]["id"] != current:
+            return False
+
+    writer.validation(
+        "supersede_at_review",
+        accepted=False,
+        detail={
+            "intent": incoming.value,
+            "problem": "same intent and no new subject while awaiting staff review",
+            "subject": named.get("status"),
+        },
+    )
+    return True
+
+
 def apply_consequence(
     session: Session,
     run: WorkflowRun,
@@ -223,6 +286,22 @@ def apply_consequence(
 
     message_class = verdict.message_class
     consequence = CONSEQUENCE_FOR[message_class]
+
+    # The class stays what it was — the message really is conflicting — and
+    # only what it is *allowed to do* changes. Recording it as a side question
+    # instead would make the trace describe a different message.
+    if (
+        consequence is Consequence.SUPERSEDE
+        and run.status is WorkflowStatus.PENDING_REVIEW
+        and _supersede_needs_difference(
+            session,
+            run,
+            message=message,
+            incoming_steps=incoming_steps,
+            writer=writer,
+        )
+    ):
+        consequence = Consequence.STATUS_REPLY
 
     if consequence is Consequence.WITHDRAW:
         transition(
@@ -254,9 +333,11 @@ def apply_consequence(
         # Part of the request, so routing and slot matching should read it.
         run.request_text = f"{run.request_text}\n{message}".strip()
 
-    # ANSWER_AND_STAY and SCOPE_REPLY deliberately do nothing. A side question
-    # is read-only, and an off-topic message must leave the run — including its
-    # request text — byte-identical.
+    # ANSWER_AND_STAY, SCOPE_REPLY and STATUS_REPLY deliberately do nothing. A
+    # side question is read-only, an off-topic message must leave the run —
+    # including its request text — byte-identical, and a status reply is a
+    # supersede that was refused: touching anything would be the very write the
+    # refusal exists to prevent.
 
     return MappingOutcome(
         consequence=consequence,

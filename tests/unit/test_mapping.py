@@ -26,6 +26,7 @@ import pytest
 from app.errors import ClassRejected, ValidationFailed
 from app.models import (
     AuditEvent,
+    Department,
     MessageClass,
     PlanStep,
     TraceEvent,
@@ -447,3 +448,150 @@ def _verdict(message_class: MessageClass):
     return ClassVerdict(
         message_class=message_class, proposed=message_class, adjusted=False, reason=""
     )
+
+
+class TestConflictingAtReviewRequiresDifference:
+    """A run waiting on staff cannot be destroyed by agreement.
+
+    Found by repro rather than in the wild: "my kid has ear pain" routes with
+    low confidence and queues for review; "looks good. lets book that time"
+    carries the run's own intent, so it classifies as conflicting — and
+    superseding cancelled the queued review a human was about to look at. The
+    patient sees a fresh search start from nothing and never learns their
+    request was thrown away.
+
+    The asymmetry is the same one that governs complementary: a wrongly
+    superseded review costs a re-ask *and* a staff queue item, while a
+    genuinely new request that has to be repeated costs a sentence. So
+    difference has to be shown, not assumed.
+
+    **Difference is decided in code, from the Department table.** The message's
+    own text is resolved against it — no model input, no new tool argument, and
+    no keyword list — so "a different subject" means exactly what routing means
+    by it everywhere else.
+    """
+
+    def test_the_same_intent_with_no_new_subject_does_not_supersede(
+        self, seeded_db, writer
+    ):
+        run = make_run(seeded_db, status=S.PENDING_REVIEW)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="looks good. lets book that time",
+            incoming_steps=[PlanStep.BOOK],
+        )
+
+        assert outcome.consequence is Consequence.STATUS_REPLY
+        assert run.status is S.PENDING_REVIEW
+        assert outcome.spawns_new_run is False
+
+    def test_the_queued_run_is_untouched(self, seeded_db, writer):
+        """Not merely uncancelled: the request text must not pick up the
+        assent either, or the staff member reads a request nobody made."""
+        run = make_run(seeded_db, status=S.PENDING_REVIEW)
+        before = (run.request_text, run.cancellation_reason)
+
+        apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="looks good. lets book that time",
+            incoming_steps=[PlanStep.BOOK],
+        )
+
+        assert (run.request_text, run.cancellation_reason) == before
+
+    def test_a_different_department_still_supersedes(self, seeded_db, writer):
+        """The other direction, and the one that makes the guard a rule rather
+        than a blanket refusal. A patient who has changed their mind about what
+        they need is making a new request, review or no review."""
+        run = make_run(seeded_db, status=S.PENDING_REVIEW, text="book ent")
+        ent = seeded_db.query(Department).filter(Department.name == "ENT").one()
+        run.state = {"department_name": ent.name, "department_id": ent.id}
+        seeded_db.flush()
+
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="actually I need a dermatology appointment instead",
+            incoming_steps=[PlanStep.BOOK],
+        )
+
+        assert outcome.consequence is Consequence.SUPERSEDE
+        assert run.status is S.CANCELLED
+
+    def test_a_different_intent_still_supersedes(self, seeded_db, writer):
+        """Same subject, different verb: cancelling something is not agreeing
+        to book it."""
+        run = make_run(seeded_db, status=S.PENDING_REVIEW)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="cancel my appointment",
+            incoming_steps=[PlanStep.CANCEL],
+        )
+
+        assert outcome.consequence is Consequence.SUPERSEDE
+
+    def test_withdrawal_is_unaffected(self, seeded_db, writer):
+        """The patient can always leave. A guard that protected the run from
+        its own owner would be a trap, not a safeguard."""
+        run = make_run(seeded_db, status=S.PENDING_REVIEW)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.WITHDRAWAL),
+            writer=writer,
+            message="never mind, forget it",
+        )
+
+        assert outcome.consequence is Consequence.WITHDRAW
+        assert run.status is S.CANCELLED
+
+    def test_the_refusal_is_traced(self, seeded_db, writer):
+        """A supersede that did not happen leaves no other mark. Without the
+        event, a reviewer cannot tell this run from one nobody wrote to."""
+        run = make_run(seeded_db, status=S.PENDING_REVIEW)
+        apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="looks good. lets book that time",
+            incoming_steps=[PlanStep.BOOK],
+        )
+        seeded_db.flush()
+
+        refusals = [
+            event.payload
+            for event in seeded_db.query(TraceEvent).all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload.get("what") == "supersede_at_review"
+        ]
+        assert refusals and refusals[0]["accepted"] is False
+
+    def test_the_same_message_at_in_progress_still_supersedes(
+        self, seeded_db, writer
+    ):
+        """Distrust green: the guard is scoped to `pending_review`. A version
+        that blocked every same-intent supersede everywhere would pass all of
+        the above and quietly break the rephrase path."""
+        run = make_run(seeded_db, status=S.IN_PROGRESS)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="looks good. lets book that time",
+            incoming_steps=[PlanStep.BOOK],
+        )
+
+        assert outcome.consequence is Consequence.SUPERSEDE

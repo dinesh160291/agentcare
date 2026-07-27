@@ -1,0 +1,48 @@
+{
+  "name": "assent-cannot-supersede-a-review",
+  "pins": "**At `pending_review`, conflicting requires difference.** A run waiting on staff is a queue item as well as a conversation, and superseding it destroys both. \"My kid has ear pain\" routes with low confidence and queues for review; \"looks good. lets book that time\" carries the run's own intent, so it classifies as conflicting — and the request a human was about to look at was cancelled, with the patient watching a fresh search start from nothing and never learning why. Difference is decided in code, against the Department table, so a phrasing nobody anticipated cannot slip past a keyword list that does not exist. A genuinely different request still supersedes; withdrawal is always available.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "book an appointment, my kid has ear pain",
+      "expect": {
+        "status": "pending_review",
+        "escalations": 1,
+        "escalation_kind": "low_confidence_routing",
+        "runs_for_patient": 1
+      }
+    },
+    {
+      "message": "looks good. lets book that time",
+      "expect": {
+        "status": "pending_review",
+        "message_class": "conflicting",
+        "runs_for_patient": 1,
+        "request_text_unchanged": true,
+        "run_state_unchanged": true,
+        "appointments_created": 0,
+        "reply_author": "template",
+        "reply_contains": [
+          "staff",
+          "nothing has been lost"
+        ],
+        "reply_excludes": [
+          "i've closed your earlier request",
+          "i will proceed",
+          "hold on"
+        ]
+      }
+    },
+    {
+      "message": "actually I need a dermatology appointment instead",
+      "expect": {
+        "status": "pending_confirmation",
+        "message_class": "conflicting",
+        "runs_for_patient": 2,
+        "reply_contains": [
+          "closed your earlier request"
+        ]
+      }
+    }
+  ]
+}
