@@ -167,6 +167,13 @@ class RunOut(BaseModel):
     department_name: str | None
     proposed_action: str | None
     proposed_slot_id: int | None
+    #: The proposal as a patient reads it. A slot id and an action enum say
+    #: nothing to the person being asked to agree to them, and the screen must
+    #: not derive these itself — a card showing a doctor and a time it worked
+    #: out locally is a card that can disagree with the row.
+    proposed_doctor_name: str | None = None
+    proposed_day: str | None = None
+    proposed_time: str | None = None
     session_id: str | None
     created_at: str
     updated_at: str

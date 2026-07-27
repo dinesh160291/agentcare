@@ -211,15 +211,28 @@ def _confirmation_controls() -> None:
     run_id = last["result"].get("run_id")
     run = fetch(lambda: client().run(token(), run_id), default={}) if run_id else {}
 
+    # What the patient is being asked to agree to, in the terms they would use
+    # to describe it. The card used to read "Action: book · Department: ENT ·
+    # Run: #7" — two of which are the system describing itself, and none of
+    # which is the appointment. Every field is served by the API; the screen
+    # derives nothing, so it cannot disagree with the row.
     body = theme.facts(
         [
-            ("Action", (run.get("proposed_action") or "").replace("_", " ")),
+            ("Doctor", run.get("proposed_doctor_name")),
+            ("Date", run.get("proposed_day")),
+            ("Time", run.get("proposed_time")),
             ("Department", run.get("department_name")),
-            ("Run", f"#{run_id}" if run_id else None),
         ]
     )
     st.markdown(
         theme.card(body, kicker="Waiting for your confirmation"),
+        unsafe_allow_html=True,
+    )
+    # Kept, in fine print: it is what a reviewer needs to find the run in the
+    # trace, and it is not what the patient is being asked about.
+    st.markdown(
+        f'<p class="ac-dim ac-num">{theme.esc((run.get("proposed_action") or "").replace("_", " "))}'
+        f" · run #{theme.esc(str(run_id))}</p>",
         unsafe_allow_html=True,
     )
 

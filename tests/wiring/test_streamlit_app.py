@@ -21,7 +21,14 @@ from __future__ import annotations
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from app.models import Appointment, PatientProfile
+from ui import theme
+from app.models import (
+    Appointment,
+    AppointmentSlot,
+    PatientProfile,
+    WorkflowRun,
+    WorkflowStatus,
+)
 
 APP = "ui/app.py"
 PATIENT = ("asha.patient@example.invalid", "Demo123!pass")
@@ -201,6 +208,70 @@ class TestTheConfirmationRule:
         assert not at.exception
         keys = {b.key for b in at.button}
         assert "confirm_proposal" in keys and "decline_proposal" in keys
+
+    def test_the_card_names_what_the_patient_is_agreeing_to(
+        self, wired_seeded, seeded_db
+    ):
+        """Doctor, date, time, department — the appointment, in the patient's
+        terms.
+
+        The card used to read "Action: book · Department: ENT · Run: #7". Two
+        of those three are the system describing itself, and none of them is
+        the thing being agreed to: a patient cannot tell from that card whether
+        it is the Monday or the Tuesday they are about to accept.
+        """
+        at = _log_in(_app(), PATIENT)
+        at.button(key="demo_0").click().run()
+
+        seeded_db.expire_all()
+        run = (
+            seeded_db.query(WorkflowRun)
+            .filter(WorkflowRun.status == WorkflowStatus.PENDING_CONFIRMATION)
+            .order_by(WorkflowRun.id.desc())
+            .first()
+        )
+        token = wired_seeded.login(
+            email=PATIENT[0], password=PATIENT[1]
+        )["access_token"]
+        run_row = wired_seeded.run(token, run.id)
+        slot = seeded_db.get(AppointmentSlot, run.proposed_slot_id)
+        screen = _rendered(at)
+
+        # The labels first, and they are the load-bearing half. Written after a
+        # falsification pass: deleting the card's three new fields outright left
+        # this test green, because the chat reply beside it also names the
+        # doctor and the time. The values alone prove nothing about the card —
+        # only "Doctor"/"Date"/"Time" as *labels* are unique to it.
+        card = theme.facts(
+            [
+                ("Doctor", run_row["proposed_doctor_name"]),
+                ("Date", run_row["proposed_day"]),
+                ("Time", run_row["proposed_time"]),
+                ("Department", "Cardiology"),
+            ]
+        )
+        assert card in screen, "the card is not rendering the four facts"
+        assert slot.doctor.name in screen
+        assert f"{slot.start_time:%H:%M}" in screen
+
+    def test_those_four_facts_came_from_the_api(self, wired_seeded, seeded_db):
+        """Distrust green: the chat reply also names the doctor and the time,
+        so the assertions above would pass on a card that rendered nothing at
+        all. This checks the fields the card is built from are ones the backend
+        actually serves — a screen deriving them from a slot id could disagree
+        with the row.
+        """
+        token = wired_seeded.login(
+            email=PATIENT[0], password=PATIENT[1]
+        )["access_token"]
+        turn = wired_seeded.send_message(
+            token, message=BOOKING, session_id="card-1"
+        )
+        run = wired_seeded.run(token, turn["run_id"])
+
+        assert run["proposed_doctor_name"]
+        assert run["proposed_day"]
+        assert run["proposed_time"]
 
     def test_the_buttons_only_appear_while_a_proposal_is_outstanding(
         self, wired_seeded
