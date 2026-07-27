@@ -8,6 +8,14 @@ backgroundColor = "#f2f2f3"
 secondaryBackgroundColor = "#ffffff"
 textColor = "#1d1f20"
 
+[client]
+# Streamlit's toolbar defaults to "auto", which on a local run means developer
+# mode: the hamburger dev menu, a "Deploy" button, and the single-key hotkeys
+# behind them. One of those hotkeys is `c` — "clear caches" — and it fires on
+# **Ctrl+C**, so a judge copying a run id out of the trace timeline gets a
+# modal dialog instead. "viewer" removes all three.
+toolbarMode = "viewer"
+
 [server]
 headless = true
 
