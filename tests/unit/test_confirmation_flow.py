@@ -205,6 +205,22 @@ class TestTheConfirmButton:
         with pytest.raises(ValidationFailed):
             press(patient, "book it immediately", "s-btn-7")
 
+    def test_the_typed_action_turn_parses_against_the_grammar(self, patient):
+        """The checker's docstring has always claimed typed-action turns follow
+        the same rules. Until there were typed actions, nothing exercised the
+        claim — and a checker that only understood chatty turns would pass the
+        system's least deterministic flows while ignoring its most."""
+        from app.trace import assert_well_formed
+
+        turn(patient, BOOKING, "s-btn-grammar")
+        result = press(patient, "confirm", "s-btn-grammar")
+
+        session = fresh()
+        try:
+            assert_well_formed(session, turn_id=result.turn_id)
+        finally:
+            session.close()
+
     def test_a_typed_action_costs_no_model_call(self, patient):
         """Zero interpretation means zero interpretation."""
         turn(patient, BOOKING, "s-btn-8")

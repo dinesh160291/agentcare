@@ -135,6 +135,20 @@ class TestApproval:
         assert events[0].author is TraceAuthor.STAFF_ACTION
         assert events[-1].event_type is TraceEventType.OUTBOUND
 
+    def test_the_staff_turn_parses_against_the_grammar(self, paused, staff):
+        """Third input kind, same grammar. For staff-action turns the
+        notification is the outbound the bracketing rule wants, and it is
+        written as a trace outbound too so the checker needs no special case."""
+        from app.trace import assert_well_formed
+
+        session = fresh()
+        try:
+            staff_row = session.get(User, staff.id)
+            _, writer = decide(session, staff_row, paused.run_id, "approve")
+            assert_well_formed(session, turn_id=writer.turn_id)
+        finally:
+            session.close()
+
     def test_the_patient_is_notified(self, paused, staff):
         """A patient whose run moved while they were away learns through the
         in-app panel — the channel already exists."""
