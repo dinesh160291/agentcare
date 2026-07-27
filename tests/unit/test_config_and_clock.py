@@ -16,6 +16,27 @@ class TestSettings:
         assert settings.llm_provider == "mock"
         assert settings.api_key_for_active_provider() == ""
 
+    def test_secrets_never_appear_in_the_settings_repr(self):
+        """Found the hard way: a pytest assertion involving the settings
+        fixture prints ``repr(settings)`` into the failure output, and a
+        failure in CI puts that in a public build log. It happened in this
+        repo's own test run with a live Groq key in ``.env``.
+
+        The values are still readable through the attributes — this closes the
+        accidental path, not the deliberate one.
+        """
+        secret = "sk-do-not-print-me-0123456789"
+        settings = Settings(
+            groq_api_key=secret,
+            openai_api_key=secret,
+            jwt_secret_key=secret,
+        )
+
+        assert secret not in repr(settings)
+        assert secret not in str(settings)
+        # And it is still usable where it is meant to be.
+        assert settings.jwt_secret_key == secret
+
     def test_blank_app_today_is_treated_as_unset(self):
         """``.env.example`` ships APP_TODAY with an empty value."""
         assert Settings(app_today="").app_today is None

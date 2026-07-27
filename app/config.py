@@ -32,9 +32,15 @@ class Settings(BaseSettings):
     )
 
     # --- LLM provider -----------------------------------------------------
+    # `repr=False` on every secret, and it is not cosmetic. pytest prints
+    # `repr(settings)` into its failure output whenever an assertion mentions
+    # the settings object, so one unrelated red test publishes the developer's
+    # API keys — into the terminal, and in CI into a public build log. This
+    # repo did exactly that before the field was excluded. The values are still
+    # readable through the attributes; what is closed is the accidental path.
     llm_provider: ProviderName = "mock"
-    groq_api_key: str = ""
-    openai_api_key: str = ""
+    groq_api_key: str = Field(default="", repr=False)
+    openai_api_key: str = Field(default="", repr=False)
     groq_model: str = "llama-3.3-70b-versatile"
     openai_model: str = "gpt-4o-mini"
 
@@ -46,7 +52,9 @@ class Settings(BaseSettings):
     adk_session_db_url: str = "sqlite+aiosqlite:///./data/adk_sessions.db"
 
     # --- Auth -------------------------------------------------------------
-    jwt_secret_key: str = "dev-only-insecure-secret-change-me"
+    jwt_secret_key: str = Field(
+        default="dev-only-insecure-secret-change-me", repr=False
+    )
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
 
