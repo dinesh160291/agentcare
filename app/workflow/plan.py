@@ -24,26 +24,38 @@ uploaded ECG and never learns the appointment they asked for was not booked.
 from __future__ import annotations
 
 from app.errors import BudgetExceeded, PlanRejected
-from app.models import PlanStep, WorkflowRun
+from app.models import APPOINTMENT_VERBS, PlanStep, WorkflowRun
 
 #: Dependency order. Routing first (the department is an input to everything
-#: else), booking next, the required-documents diff after the department is
-#: known, follow-up last because it summarises the rest.
+#: else), the appointment verbs next, the required-documents diff after the
+#: department is known, follow-up last because it summarises the rest.
 CANONICAL_ORDER: tuple[PlanStep, ...] = (
     PlanStep.ROUTE,
     PlanStep.BOOK,
+    PlanStep.RESCHEDULE,
+    PlanStep.CANCEL,
     PlanStep.DOCUMENTS,
     PlanStep.FOLLOW_UP,
 )
 
 #: What each step cannot work without. ``BOOK`` closes over the whole booking
-#: plan: an appointment needs a department, brings required-document rules with
-#: it, and produces something to follow up on.
+#: plan: a new appointment needs a department, brings required-document rules
+#: with it, and produces something to follow up on.
+#:
+#: The other two verbs close over far less, and the difference is the argument
+#: for their existing at all. ``RESCHEDULE`` keeps the department and the
+#: document requirements it was booked with — only the time moves — but the
+#: reminder moves with it, so there is something to summarise. ``CANCEL``
+#: closes over nothing: routing a request that is being withdrawn is pointless,
+#: and diffing required documents for it would open a task telling the patient
+#: to prepare for an appointment they have just called off.
 STEP_CLOSURE: dict[PlanStep, frozenset[PlanStep]] = {
     PlanStep.ROUTE: frozenset({PlanStep.ROUTE}),
     PlanStep.BOOK: frozenset(
         {PlanStep.ROUTE, PlanStep.BOOK, PlanStep.DOCUMENTS, PlanStep.FOLLOW_UP}
     ),
+    PlanStep.RESCHEDULE: frozenset({PlanStep.RESCHEDULE, PlanStep.FOLLOW_UP}),
+    PlanStep.CANCEL: frozenset({PlanStep.CANCEL}),
     PlanStep.DOCUMENTS: frozenset({PlanStep.DOCUMENTS}),
     PlanStep.FOLLOW_UP: frozenset({PlanStep.FOLLOW_UP}),
 }
@@ -81,6 +93,18 @@ def validate_plan(proposed: object) -> list[PlanStep]:
         raise PlanRejected("A plan must contain at least one step.")
 
     steps = {_as_step(item) for item in proposed}
+
+    # One appointment verb, at most. The pending proposal is a single
+    # ``ProposedAction`` and the commit dispatches on it, so a plan naming two
+    # verbs would commit one and drop the other — a half-executed request that
+    # reports success. Caught here, it is a re-plan instead.
+    verbs = steps & APPOINTMENT_VERBS
+    if len(verbs) > 1:
+        named = ", ".join(sorted(verb.value for verb in verbs))
+        raise PlanRejected(
+            f"A plan may name at most one appointment action, got: {named}. "
+            "One request confirms one thing."
+        )
 
     closed: set[PlanStep] = set()
     for step in steps:

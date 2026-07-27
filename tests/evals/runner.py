@@ -66,6 +66,16 @@ KNOWN_EXPECTATIONS = frozenset(
         "reply_author",
         "documents_flagged",
         "open_tasks_contain",
+        # --- Phase 6a: the other two appointment verbs ---
+        # What happened to an appointment that already existed. The booking
+        # scenarios could get by with `appointments_created`, because a booking
+        # is the only verb that makes a row; reschedule and cancel change one,
+        # and a count cannot see that.
+        "appointment_status",
+        # Whether a proposal is still outstanding. A declined cancellation that
+        # leaves the proposal confirmable is a loop with no exit, and the
+        # status alone does not show it.
+        "proposed_action",
     }
 )
 
@@ -206,6 +216,25 @@ def _check(result, index, expect, outcome, session, before, created, patient_id)
             fail(
                 f"appointments_created: expected {expect['appointments_created']}, "
                 f"got {created}"
+            )
+
+    if "appointment_status" in expect:
+        for appointment_id, expected_status in expect["appointment_status"].items():
+            appointment = session.get(Appointment, int(appointment_id))
+            actual = appointment.status.value if appointment else None
+            if actual != expected_status:
+                fail(
+                    f"appointment_status[{appointment_id}]: expected "
+                    f"{expected_status!r}, got {actual!r}"
+                )
+
+    if "proposed_action" in expect and outcome.run_id:
+        run = session.get(WorkflowRun, outcome.run_id)
+        actual = run.proposed_action.value if run.proposed_action else None
+        if actual != expect["proposed_action"]:
+            fail(
+                f"proposed_action: expected {expect['proposed_action']!r}, "
+                f"got {actual!r}"
             )
 
     if "cancellation_reason" in expect and outcome.run_id:

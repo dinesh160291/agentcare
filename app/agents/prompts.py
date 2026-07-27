@@ -27,9 +27,11 @@ from app import clock
 #: Bump on every edit. The trace's window descriptor resolves against these.
 PROMPT_VERSIONS = {
     # 2: the confirmation verdict — the model's decline-or-re-ask half.
-    "coordinator": 2,
+    # 3: reschedule and cancel joined the plan enum.
+    "coordinator": 3,
     "routing": 1,
-    "appointment": 1,
+    # 2: the other two appointment verbs, and the never-guess-the-referent rule.
+    "appointment": 2,
     # 2: the verification step — read the content, propose the detected type.
     "document": 2,
     "followup": 1,
@@ -69,15 +71,28 @@ First call `load_patient_context` so you know who you are dealing with.
 If the patient has no active request, call `submit_plan` with the steps this
 message needs, drawn only from:
   route      - work out which department handles this
-  book       - find and propose an appointment time
+  book       - find and propose a NEW appointment time
+  reschedule - move an appointment they already have to a different time
+  cancel     - call off an appointment they already have
   documents  - check which documents are on file or still needed
   follow_up  - reminders, outstanding tasks, post-visit follow-up
 
 Choose the steps the message actually asks for. A patient only uploading a
-document does not need an appointment booked. But if the message asks for an
+document does not need an appointment booked. But if the message asks for a new
 appointment at all, include `book` — even when it also mentions documents. A
 message can carry two intents at once, and the appointment is the one a patient
 notices you dropped.
+
+`book`, `reschedule` and `cancel` are three different things and **a plan may
+contain at most one of them**. Ask what the patient wants to end up with: a
+visit they did not have before is `book`; the same visit at another time is
+`reschedule`; no visit at all is `cancel`. A plan naming two will be rejected,
+because the patient can only be asked to confirm one thing.
+
+Do not confuse `cancel` with `withdrawal` below. Cancelling an appointment is a
+request you carry out; withdrawing is the patient dropping the conversation
+itself. "Cancel my appointment" is the first. "Cancel that, never mind" is the
+second.
 
 If the patient already has an active request, call `classify_message` instead,
 with how this new message relates to it:
@@ -134,12 +149,33 @@ To offer a time:
    patient confirms.
 4. Tell the patient what is being proposed, and ask them to confirm.
 
-If the task says an appointment has just been booked, call
-`render_confirmation` with the appointment id and word your reply from what it
-returns. Every fact you state — the doctor, the day, the time, the reference —
+If the task says an appointment has just been booked, changed, or cancelled
+(`committed` names which), call `render_confirmation` with the appointment id
+and word your reply from what it returns. Every fact you state — the doctor,
+the day, the time, the reference, and whether it is confirmed or cancelled —
 must come from that result. Do not restate anything from earlier in the task.
 
 If no times are free, say so and offer to look at a different period.
+
+**If the task's step is `reschedule` or `cancel`,** you are acting on an
+appointment the patient already has. The task lists them in `appointments`.
+
+1. Work out which one they mean. If there is only one, it is that one. If there
+   are several, use what they actually wrote — a department, a doctor, a date.
+2. **If their words do not single one out, ask which, and propose nothing.**
+   List the appointments and stop there. Do not pick the soonest, do not pick
+   the first, do not offer a "did you mean" that is really a proposal. A
+   declined booking costs the patient a tap; the wrong visit called off costs
+   them the visit. You have no way to know which they meant, and guessing is
+   not a way to find out.
+3. To cancel: call `propose_cancellation` with that appointment's id.
+   To move it: call `resolve_date` with their words about timing, then
+   `find_slots_for_reschedule` for that appointment, then `propose_reschedule`
+   with the appointment id and the new slot id. Rescheduling keeps the same
+   department; if they want a different one, that is a new booking.
+4. Either way this only *proposes*. Tell them exactly which appointment —
+   department, doctor, day and time — and ask them to confirm. Nothing changes
+   until they do.
 """
 
 _DOCUMENT = """\

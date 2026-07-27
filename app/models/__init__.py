@@ -19,6 +19,8 @@ from app.models.entities import (
     WorkflowRun,
 )
 from app.models.enums import (
+    APPOINTMENT_VERBS,
+    STEP_FOR_PROPOSED_ACTION,
     TERMINAL_WORKFLOW_STATUSES,
     AppointmentStatus,
     CancellationReason,
@@ -41,6 +43,8 @@ from app.models.enums import (
 )
 
 __all__ = [
+    "APPOINTMENT_VERBS",
+    "STEP_FOR_PROPOSED_ACTION",
     "TERMINAL_WORKFLOW_STATUSES",
     "Appointment",
     "AppointmentSlot",

@@ -132,7 +132,32 @@ class TestSupersetRule:
 
 class TestDependencyOrder:
     def test_steps_come_back_in_canonical_order(self):
-        assert validate_plan(["follow_up", "book", "route"]) == list(CANONICAL_ORDER)
+        """The booking plan, whatever order it was proposed in.
+
+        This used to assert equality with ``CANONICAL_ORDER`` itself, which was
+        true only by coincidence: the booking closure happened to be the entire
+        enum. It stopped being the enum the moment reschedule and cancel joined
+        it, so the assertion now states the property the test is named for —
+        the returned steps are a **subsequence** of the canonical order — and
+        pins the booking plan's contents separately.
+        """
+        plan = validate_plan(["follow_up", "book", "route"])
+        assert plan == [ROUTE, BOOK, DOCUMENTS, FOLLOW_UP]
+
+    @pytest.mark.parametrize(
+        "proposed",
+        [
+            ["follow_up", "book", "route"],
+            ["documents", "route"],
+            ["follow_up", "reschedule"],
+            ["cancel"],
+        ],
+    )
+    def test_every_plan_is_a_subsequence_of_the_canonical_order(self, proposed):
+        """Ordering is a property of the domain, not of what the model typed."""
+        plan = validate_plan(proposed)
+        positions = [CANONICAL_ORDER.index(step) for step in plan]
+        assert positions == sorted(positions)
 
     def test_routing_always_precedes_booking(self):
         plan = validate_plan(["book", "route"])
@@ -259,3 +284,79 @@ class TestReplanBudget:
         with pytest.raises(BudgetExceeded):
             record_replan(run, max_replans=1)
         assert run.replan_count == 1
+
+
+RESCHEDULE, CANCEL = PlanStep.RESCHEDULE, PlanStep.CANCEL
+
+
+class TestTheOtherTwoAppointmentVerbs:
+    """Reschedule and cancel are their own steps, not booking wearing a hat.
+
+    The alternative — one ``book`` step with the verb on ``proposed_action`` —
+    was rejected with a concrete defect: ``book``'s closure pulls in the
+    required-documents diff, so cancelling an appointment would open a
+    missing-documents task for the appointment being cancelled. The verb would
+    then have to be special-cased inside the documents step anyway, putting it
+    in two places instead of one.
+    """
+
+    def test_cancel_closes_over_nothing_else(self):
+        """No routing: the department comes from the appointment being
+        cancelled. No document diff: nothing is being prepared for."""
+        assert validate_plan(["cancel"]) == [CANCEL]
+
+    def test_reschedule_keeps_follow_up_and_nothing_else(self):
+        """The reminder moves with the appointment, so there is something to
+        summarise — but the department is unchanged and the required documents
+        were settled when it was booked."""
+        assert validate_plan(["reschedule"]) == [RESCHEDULE, FOLLOW_UP]
+
+    def test_cancelling_never_drags_the_document_diff_along(self):
+        """The defect that decided the design, pinned so it cannot come back."""
+        assert DOCUMENTS not in validate_plan(["cancel"])
+
+    def test_cancelling_never_drags_routing_along(self):
+        assert ROUTE not in validate_plan(["cancel"])
+
+    def test_the_verbs_come_back_in_canonical_order(self):
+        assert validate_plan(["follow_up", "reschedule"]) == [RESCHEDULE, FOLLOW_UP]
+
+
+class TestOnlyOneAppointmentVerbPerPlan:
+    """A plan naming two verbs has no answer to "what is being confirmed?".
+
+    ``_commit_proposal`` dispatches on a single ``proposed_action``, so a plan
+    carrying both ``book`` and ``cancel`` would commit one of them and silently
+    drop the other. Rejected at validation, where it becomes a re-plan rather
+    than a half-executed request.
+    """
+
+    @pytest.mark.parametrize(
+        "proposed",
+        [
+            ["book", "cancel"],
+            ["book", "reschedule"],
+            ["cancel", "reschedule"],
+            ["book", "cancel", "reschedule"],
+        ],
+    )
+    def test_two_verbs_are_rejected(self, proposed):
+        with pytest.raises(PlanRejected):
+            validate_plan(proposed)
+
+    def test_the_rejection_says_which_verbs_collided(self):
+        with pytest.raises(PlanRejected) as caught:
+            validate_plan(["book", "cancel"])
+        message = str(caught.value)
+        assert "book" in message and "cancel" in message
+
+    def test_one_verb_with_its_closure_is_still_one_verb(self):
+        """``book`` closes over route/documents/follow_up. Those are not verbs
+        and must not trip the guard."""
+        assert validate_plan(["book"]) == [ROUTE, BOOK, DOCUMENTS, FOLLOW_UP]
+
+    def test_a_verb_alongside_non_verb_steps_is_fine(self):
+        assert validate_plan(["cancel", "follow_up"]) == [CANCEL, FOLLOW_UP]
+
+    def test_a_plan_with_no_verb_at_all_is_fine(self):
+        assert validate_plan(["documents"]) == [DOCUMENTS]

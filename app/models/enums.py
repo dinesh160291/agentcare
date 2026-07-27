@@ -67,8 +67,22 @@ class PlanStep(StrEnum):
 
     ROUTE = "route"
     BOOK = "book"
+    #: The other two appointment verbs are steps of their own rather than
+    #: ``BOOK`` carrying a mode. ``BOOK``'s closure pulls in the
+    #: required-documents diff, so a cancel modelled as a book would open a
+    #: missing-documents task for the appointment it is cancelling.
+    RESCHEDULE = "reschedule"
+    CANCEL = "cancel"
     DOCUMENTS = "documents"
     FOLLOW_UP = "follow_up"
+
+
+#: The three verbs that mutate an appointment. Exactly one may appear in a
+#: plan: the pending proposal is a single ``ProposedAction``, so a plan naming
+#: two of them has no answer to "what is the patient confirming?".
+APPOINTMENT_VERBS: frozenset[PlanStep] = frozenset(
+    {PlanStep.BOOK, PlanStep.RESCHEDULE, PlanStep.CANCEL}
+)
 
 
 class ProposedAction(StrEnum):
@@ -77,6 +91,16 @@ class ProposedAction(StrEnum):
     BOOK = "book"
     RESCHEDULE = "reschedule"
     CANCEL = "cancel"
+
+
+#: The plan step each proposal verb belongs to. One mapping, so the dispatch in
+#: the orchestrator and the step bookkeeping cannot disagree about which verb
+#: is in flight.
+STEP_FOR_PROPOSED_ACTION: dict[ProposedAction, PlanStep] = {
+    ProposedAction.BOOK: PlanStep.BOOK,
+    ProposedAction.RESCHEDULE: PlanStep.RESCHEDULE,
+    ProposedAction.CANCEL: PlanStep.CANCEL,
+}
 
 
 class AppointmentStatus(StrEnum):

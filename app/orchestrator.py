@@ -41,10 +41,12 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.errors import BudgetExceeded, ValidationFailed
 from app.models import (
+    APPOINTMENT_VERBS,
     EscalationKind,
     MessageClass,
     PatientProfile,
     PlanStep,
+    ProposedAction,
     TERMINAL_WORKFLOW_STATUSES,
     TraceAuthor,
     User,
@@ -53,7 +55,13 @@ from app.models import (
     WorkflowStatus,
 )
 from app.safety import SafetyVerdict, escalate, keyword_screen, llm_screen
-from app.tools import book_appointment, create_escalation
+from app.tools import (
+    book_appointment,
+    cancel_appointment,
+    create_escalation,
+    list_patient_appointments,
+    reschedule_appointment,
+)
 from app.trace import TraceWriter
 from app.workflow.confirmation import ConfirmationAnswer, read_confirmation
 from app.workflow.mapping import Consequence, apply_consequence, validate_class
@@ -162,12 +170,26 @@ def _task_for(step: PlanStep, run: WorkflowRun, *, message: str, extra: dict) ->
     }
     if step is PlanStep.ROUTE:
         task["request_text"] = run.request_text or message
-    if step is PlanStep.BOOK:
+    if step in APPOINTMENT_VERBS:
         task["request_text"] = run.request_text or message
         task["proposed_slot_id"] = run.proposed_slot_id
         task["appointment_id"] = (run.state or {}).get("appointment_id")
+        task["committed"] = (run.state or {}).get("committed_action")
+    if step in (PlanStep.RESCHEDULE, PlanStep.CANCEL):
+        # Which appointments the patient actually has. The specialist gets no
+        # history, so "my appointment" means nothing to it without this — and
+        # guessing the referent is the one thing story 20 forbids.
+        task["appointments"] = _live_appointments(run)
     task.update(extra)
     return json.dumps({k: v for k, v in task.items() if v is not None}, sort_keys=True)
+
+
+def _live_appointments(run: WorkflowRun) -> list[dict]:
+    """The patient's changeable appointments, for the two verbs that need one."""
+    session = Session.object_session(run)
+    if session is None:  # pragma: no cover - a detached run is a caller bug
+        return []
+    return list_patient_appointments(session, patient_id=run.patient_id, live_only=True)
 
 
 async def _screen(
@@ -1083,10 +1105,13 @@ def _settle_step(
         run.state = state
         return False, True
 
-    if step is PlanStep.BOOK:
-        if (run.state or {}).get("appointment_id"):
+    if step in APPOINTMENT_VERBS:
+        # Done when *this* verb committed. Checking only for an appointment id
+        # would report a reschedule complete before it ran, because the
+        # appointment it moves already existed.
+        if (run.state or {}).get("committed_action") == step.value:
             return False, True
-        if run.proposed_slot_id is not None:
+        if run.proposed_action is not None:
             # Waiting on the patient. Not a failure — the point of the step.
             return True, False
         return False, False
@@ -1143,21 +1168,46 @@ async def _commit_proposal(
 ) -> TurnResult:
     """The patient confirmed. Code commits; the agent only words the receipt.
 
-    A resume is a fresh proposal, not a replay: the slot is re-checked inside
-    the booking transaction, and a slot taken in the meantime returns the
-    patient to selection rather than failing silently.
-    """
-    slot_id = run.proposed_slot_id
-    settings = get_settings()
+    **The commit dispatches on what was proposed.** ``run.proposed_action`` is
+    typed state written at proposal time, and reading it here is the whole
+    difference between a system with three appointment verbs and one with one:
+    hard-coding ``book_appointment`` meant a cancellation, once confirmed,
+    booked something. The three tools all return the same shape, so everything
+    downstream of the call is common to all of them.
 
-    correlation = writer.tool_call(
-        "book_appointment", args={"slot_id": slot_id}, agent_name="orchestrator"
-    )
-    booked = book_appointment(
-        session, user, slot_id=slot_id, reason=run.request_text or "", run=run
-    )
+    A resume is a fresh proposal, not a replay: the target is re-checked inside
+    the mutating transaction, and a slot taken in the meantime returns the
+    patient to selection rather than failing silently — for every verb, not
+    just the one that happened to be built first.
+    """
+    settings = get_settings()
+    action = run.proposed_action
+    slot_id = run.proposed_slot_id
+    appointment_id = run.proposed_appointment_id
+
+    if action is ProposedAction.RESCHEDULE:
+        tool_name = "reschedule_appointment"
+        args = {"appointment_id": appointment_id, "new_slot_id": slot_id}
+        call = lambda: reschedule_appointment(  # noqa: E731
+            session, user, appointment_id, new_slot_id=slot_id, run=run
+        )
+    elif action is ProposedAction.CANCEL:
+        tool_name = "cancel_appointment"
+        args = {"appointment_id": appointment_id}
+        call = lambda: cancel_appointment(  # noqa: E731
+            session, user, appointment_id, run=run
+        )
+    else:
+        tool_name = "book_appointment"
+        args = {"slot_id": slot_id}
+        call = lambda: book_appointment(  # noqa: E731
+            session, user, slot_id=slot_id, reason=run.request_text or "", run=run
+        )
+
+    correlation = writer.tool_call(tool_name, args=args, agent_name="orchestrator")
+    booked = call()
     writer.tool_result(
-        correlation, name="book_appointment", result=booked, agent_name="orchestrator"
+        correlation, name=tool_name, result=booked, agent_name="orchestrator"
     )
 
     if not booked.get("ok"):
@@ -1185,6 +1235,11 @@ async def _commit_proposal(
     appointment_id = (booked.get("appointment") or {}).get("appointment_id")
     state = dict(run.state or {})
     state["appointment_id"] = appointment_id
+    # Which verb actually landed. The step bookkeeping reads this rather than
+    # the mere presence of an appointment id: a reschedule and a cancel both
+    # act on an appointment that already existed, so "there is an id" says
+    # nothing about whether this run's step is done.
+    state["committed_action"] = (action or ProposedAction.BOOK).value
     run.state = state
     run.clear_proposal()
 

@@ -60,6 +60,17 @@ REBOOK_CUES = (
     "book", "schedule", "make it", "instead", "change it to", "switch to",
     "i need a", "i want a", "can i get a",
 )
+#: The other two appointment verbs, read as verb-plus-noun rather than as
+#: phrases. A bare "cancel" is not enough: it is also the exact token that
+#: *declines a proposal*, and "cancel that request" is a withdrawal of the
+#: whole run. What separates the three is what is being cancelled, so the noun
+#: is required and the withdrawal cues are checked first.
+CANCEL_VERBS = ("cancel", "call off", "drop my", "scrap")
+RESCHEDULE_VERBS = (
+    "reschedule", "re-schedule", "move", "postpone", "push back", "bring forward",
+    "change the time", "change the date", "shift", "rearrange", "different day",
+)
+APPOINTMENT_NOUNS = ("appointment", "booking", "visit", "consultation", "slot")
 #: How the understudy reads a document's type off its text. Ordered, because
 #: the first match wins and the more specific labels have to come first: an
 #: X-ray report mentioning a referral is still an X-ray report.
@@ -143,8 +154,81 @@ def wants_booking(text: str) -> bool:
     return _has(text, BOOKING_CUES)
 
 
+def wants_cancellation(text: str) -> bool:
+    """A request to cancel an *appointment* — not to abandon the conversation.
+
+    Verb plus noun, and withdrawal wins the tie. "cancel that request" closes
+    the run the patient is in the middle of; "cancel my appointment" closes an
+    appointment that already exists. Reading the second as the first would
+    leave the appointment standing while the reply said it was dealt with.
+    """
+    if _has(text, WITHDRAWAL_CUES):
+        return False
+    return _has(text, CANCEL_VERBS) and _has(text, APPOINTMENT_NOUNS)
+
+
+def wants_reschedule(text: str) -> bool:
+    if _has(text, WITHDRAWAL_CUES):
+        return False
+    return _has(text, RESCHEDULE_VERBS) and _has(text, APPOINTMENT_NOUNS)
+
+
 def mentions_documents(text: str) -> bool:
     return _has(text, DOCUMENT_CUES)
+
+
+def _pick_appointment(
+    candidates: list[dict[str, Any]], request_text: str
+) -> dict[str, Any] | None:
+    """Which appointment the patient meant, or ``None`` if it is not clear.
+
+    ``None`` is a real answer here, and the caller must ask rather than choose.
+    A wrong guess at a *booking* costs a declined proposal; a wrong guess at a
+    cancellation is the wrong visit called off, and PRD story 20 asks for
+    "explicit confirmation of exactly which appointment" — which is worth
+    nothing if the referent was picked by coincidence.
+
+    One candidate needs no picking. More than one is resolved only by something
+    the patient actually wrote — a department, a doctor, or a date — and only
+    when exactly one candidate matches it.
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    lowered = (request_text or "").lower()
+    for key in ("department_name", "doctor_name"):
+        matched = [
+            row for row in candidates if str(row.get(key) or "").lower() in lowered
+        ]
+        if len(matched) == 1:
+            return matched[0]
+
+    matched = [
+        row
+        for row in candidates
+        if row.get("start") and str(row["start"])[:10] in lowered
+    ]
+    if len(matched) == 1:
+        return matched[0]
+    return None
+
+
+def _which_one(candidates: list[dict[str, Any]], step: str) -> str:
+    """Ask which appointment, listing them from the rows themselves."""
+    verb = "cancel" if step == "cancel" else "move"
+    lines = [
+        f"{index}. {row.get('department_name')} with {row.get('doctor_name')}"
+        + (f" on {str(row['start'])[:10]} at {str(row['start'])[11:16]}" if row.get("start") else "")
+        for index, row in enumerate(candidates, start=1)
+    ]
+    listing = "\n".join(lines)
+    return (
+        f"You have more than one upcoming appointment, so I want to be sure "
+        f"which one to {verb}:\n{listing}\n"
+        f"Which of these did you mean? I haven't changed anything yet."
+    )
 
 
 def parse_task(text: str) -> dict[str, Any]:
@@ -272,7 +356,15 @@ class MockLlm(AgentCareLlm):
         avoids.
         """
         steps: list[str] = []
-        if wants_booking(text):
+        # The three appointment verbs are mutually exclusive: `validate_plan`
+        # rejects a plan naming two, because one pending proposal can only
+        # confirm one thing. Reschedule is read before cancel so that "move my
+        # appointment" is not heard as calling it off.
+        if wants_reschedule(text):
+            steps.append("reschedule")
+        elif wants_cancellation(text):
+            steps.append("cancel")
+        elif wants_booking(text):
             steps.append("book")
         if mentions_documents(text):
             steps.append("documents")
@@ -375,6 +467,10 @@ class MockLlm(AgentCareLlm):
         # answering the question they were asked. The cost asymmetry decides
         # the tie — a wrongly superseded cooperation loses the booking the
         # patient wanted, so the doubtful case falls through to continuation.
+        if wants_reschedule(text):
+            return "conflicting", ["reschedule"]
+        if wants_cancellation(text):
+            return "conflicting", ["cancel"]
         if wants_booking(text) and _has(text, REBOOK_CUES):
             return "conflicting", ["book"]
         return "continuation", []
@@ -463,6 +559,10 @@ class MockLlm(AgentCareLlm):
     def _appointment(
         self, llm_request: LlmRequest, done: set[str], task: dict[str, Any]
     ) -> LlmResponse:
+        step = str(task.get("step") or "book")
+        if step in ("reschedule", "cancel"):
+            return self._change_appointment(llm_request, done, task, step)
+
         confirmation = latest_tool_result(llm_request, "render_confirmation")
         if confirmation is not None:
             return self._from_confirmation(confirmation.payload)
@@ -500,6 +600,122 @@ class MockLlm(AgentCareLlm):
             "propose_appointment", {"slot_id": offered[0]["slot_id"]}
         )
 
+    def _change_appointment(
+        self,
+        llm_request: LlmRequest,
+        done: set[str],
+        task: dict[str, Any],
+        step: str,
+    ) -> LlmResponse:
+        """Policy for the two verbs that act on an appointment already on file.
+
+        The shape differs from booking in one way that matters: booking starts
+        from a department and finds a time, while these start from an
+        *appointment* and have to establish which one. Getting that wrong is
+        not a wasted turn — it is cancelling the wrong visit — so when the
+        patient's words do not pick one out, this asks instead of choosing,
+        and records no proposal at all.
+        """
+        confirmation = latest_tool_result(llm_request, "render_confirmation")
+        if confirmation is not None:
+            return self._from_confirmation(confirmation.payload)
+
+        # Committed. State the outcome from the row, never from what the
+        # mutating call happened to return.
+        if task.get("committed") == step and task.get("appointment_id"):
+            return function_call_response(
+                "render_confirmation", {"appointment_id": task["appointment_id"]}
+            )
+
+        tool = "propose_cancellation" if step == "cancel" else "propose_reschedule"
+        proposed = latest_tool_result(llm_request, tool)
+        if proposed is not None:
+            return self._from_change_proposal(proposed.payload, step)
+
+        candidates = task.get("appointments") or []
+        if not candidates:
+            return text_response(
+                "You don't have any upcoming appointments to change at the moment. "
+                "Would you like to book one?"
+            )
+
+        target = _pick_appointment(candidates, str(task.get("request_text") or ""))
+        if target is None:
+            # More than one, and nothing in the request singles one out. Ask.
+            return text_response(_which_one(candidates, step))
+
+        if step == "cancel":
+            return function_call_response(
+                "propose_cancellation", {"appointment_id": target["appointment_id"]}
+            )
+
+        if "resolve_date" not in done:
+            return function_call_response(
+                "resolve_date", {"phrase": task.get("request_text", "")}
+            )
+
+        if "find_slots_for_reschedule" not in done:
+            window = latest_tool_result(llm_request, "resolve_date")
+            args: dict[str, Any] = {"appointment_id": target["appointment_id"]}
+            if window is not None and window.payload.get("resolved"):
+                args["start"] = window.payload["start"]
+                args["end"] = window.payload["end"]
+                if window.payload.get("part_of_day"):
+                    args["part_of_day"] = window.payload["part_of_day"]
+            return function_call_response("find_slots_for_reschedule", args)
+
+        slots = latest_tool_result(llm_request, "find_slots_for_reschedule")
+        offered = (slots.payload.get("slots") if slots else None) or []
+        # The time it already holds is not an alternative to itself.
+        offered = [s for s in offered if s["slot_id"] != target.get("slot_id")]
+        if not offered:
+            return self._from_empty_slots(slots.payload if slots else {})
+        return function_call_response(
+            "propose_reschedule",
+            {
+                "appointment_id": target["appointment_id"],
+                "slot_id": offered[0]["slot_id"],
+            },
+        )
+
+    @staticmethod
+    def _from_change_proposal(payload: dict[str, Any], step: str) -> LlmResponse:
+        """Ask the patient to confirm, naming the appointment in full.
+
+        Every fact comes from ``render_confirmation``'s re-read of the row —
+        the same seam the booking receipt uses — because "exactly which
+        appointment" is worth nothing if the sentence describing it was
+        assembled from the model's memory.
+        """
+        if not payload.get("accepted"):
+            return text_response(str(payload.get("problem", "I couldn't do that.")))
+
+        facts = payload["proposed"]
+        when = (
+            f"{facts['weekday']} {facts['date']} at {facts['time']}"
+            if facts.get("weekday")
+            else "its current time"
+        )
+        if step == "cancel":
+            return text_response(
+                f"I can cancel your {facts['department_name']} appointment with "
+                f"{facts['doctor_name']} on {when} (reference "
+                f"{facts['reference_code']}). Shall I? Reply 'yes' to confirm — "
+                "nothing is cancelled until you do."
+            )
+        new_slot = payload.get("new_slot") or {}
+        moving_to = (
+            f"{new_slot['start'][:10]} at {new_slot['start'][11:16]} "
+            f"with {new_slot['doctor_name']}"
+            if new_slot.get("start")
+            else "the new time"
+        )
+        return text_response(
+            f"I can move your {facts['department_name']} appointment "
+            f"(reference {facts['reference_code']}) from {when} to "
+            f"{moving_to}. Reply 'yes' to confirm — nothing moves until you do."
+        )
+
     @staticmethod
     def _from_empty_slots(payload: dict[str, Any]) -> LlmResponse:
         problem = payload.get("problem")
@@ -525,14 +741,24 @@ class MockLlm(AgentCareLlm):
     @staticmethod
     def _from_confirmation(payload: dict[str, Any]) -> LlmResponse:
         """The consequential reply. Every fact comes from the persisted row."""
+        facts = payload.get("facts") or {}
+        # The reminder promise is a fact too, and it is only true while the
+        # appointment is live: cancelling retires the reminder in the same
+        # transaction, so promising one on a cancelled visit would be the
+        # stale-fact bug the receipt discipline exists to prevent, arriving in
+        # the receipt itself. Read the status rather than assume it.
+        tail = (
+            " You will get a reminder the day before."
+            if facts.get("status") in ("pending", "confirmed")
+            else ""
+        )
         sentence = payload.get("sentence")
         if sentence:
-            return text_response(f"{sentence} You will get a reminder the day before.")
-        facts = payload.get("facts") or {}
+            return text_response(f"{sentence}{tail}")
         return text_response(
             f"Your appointment with {facts.get('doctor_name')} is "
             f"{facts.get('status')} for {facts.get('weekday')} {facts.get('date')} "
-            f"at {facts.get('time')}."
+            f"at {facts.get('time')}.{tail}"
         )
 
     # --- Document ---------------------------------------------------------

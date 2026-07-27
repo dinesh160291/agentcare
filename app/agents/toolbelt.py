@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 from app import clock
 from app.errors import ClassRejected, PlanRejected
 from app.models import (
+    Appointment,
     FollowUpTaskType,
     PatientDocument,
     PlanStep,
@@ -39,6 +40,7 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
+from app.tools.appointments import LIVE_STATUSES
 from app.trace import TraceWriter
 from app.tools import (
     apply_verification,
@@ -49,6 +51,7 @@ from app.tools import (
     get_slot,
     list_departments,
     list_open_tasks,
+    list_patient_appointments,
     list_patient_documents,
     list_patient_reminders,
     list_unverified_documents,
@@ -85,6 +88,9 @@ class TurnProposals:
     department_name: str | None = None
     routing_confidence: str | None = None
     proposed_slot_id: int | None = None
+    #: Set only by a reschedule or cancellation proposal — the appointment the
+    #: patient is being asked about, never one the model picked for them.
+    proposed_appointment_id: int | None = None
     rejections: list[str] = field(default_factory=list)
 
 
@@ -352,6 +358,56 @@ class Toolbelt:
             state its details. Every fact in your reply must come from here."""
             return render_confirmation(self.session, appointment_id)
 
+        def list_my_appointments() -> dict:
+            """List this patient's changeable appointments. Use this before
+            proposing a reschedule or a cancellation: you must name exactly
+            which appointment, and you may never guess which one they mean."""
+            return {
+                "appointments": list_patient_appointments(
+                    self.session, patient_id=self.patient_id, live_only=True
+                )
+            }
+
+        def find_slots_for_reschedule(
+            appointment_id: int, start: str = "", end: str = "", part_of_day: str = ""
+        ) -> dict:
+            """Find free times to move an existing appointment to.
+
+            Separate from find_available_slots because a reschedule keeps the
+            appointment's own department, and a reschedule run never went
+            through routing so the run does not carry one."""
+            appointment = self.session.get(Appointment, appointment_id)
+            if appointment is None or appointment.patient_id != self.patient_id:
+                return {
+                    "slots": [],
+                    "total_matching": 0,
+                    "problem": f"Appointment {appointment_id} is not this patient's.",
+                }
+            return find_available_slots(
+                self.session,
+                department_id=appointment.department_id,
+                start=self._as_date(start),
+                end=self._as_date(end),
+                part_of_day=part_of_day or None,
+            )
+
+        def propose_reschedule(appointment_id: int, slot_id: int) -> dict:
+            """Propose moving an existing appointment to a new time. This
+            changes nothing: it records what the patient is being asked to
+            confirm."""
+            return self._propose_change(
+                ProposedAction.RESCHEDULE,
+                appointment_id=appointment_id,
+                slot_id=slot_id,
+            )
+
+        def propose_cancellation(appointment_id: int) -> dict:
+            """Propose cancelling one specific appointment. This cancels
+            nothing: it records what the patient is being asked to confirm."""
+            return self._propose_change(
+                ProposedAction.CANCEL, appointment_id=appointment_id, slot_id=None
+            )
+
         resolve_date_tool.__name__ = "resolve_date"
         find_available_slots_tool.__name__ = "find_available_slots"
         render_confirmation_tool.__name__ = "render_confirmation"
@@ -360,6 +416,10 @@ class Toolbelt:
             find_available_slots_tool,
             propose_appointment,
             render_confirmation_tool,
+            list_my_appointments,
+            find_slots_for_reschedule,
+            propose_reschedule,
+            propose_cancellation,
         ]
 
     def _propose_appointment(self, slot_id: int) -> dict:
@@ -424,6 +484,120 @@ class Toolbelt:
             )
 
         return {"accepted": True, "proposed": found}
+
+    def _propose_change(
+        self,
+        action: ProposedAction,
+        *,
+        appointment_id: int,
+        slot_id: int | None,
+    ) -> dict:
+        """Record a typed reschedule or cancellation proposal on the run.
+
+        Every check here is the deterministic half of "name exactly which
+        appointment". Code cannot know which appointment the patient *meant* —
+        that is language, and it is the model's job — but it can refuse to
+        record a proposal against an appointment that is not this patient's, is
+        not changeable, or does not exist. What the model is left free to get
+        wrong is the choice among the patient's own live appointments, and the
+        confirmation step is what stands under that.
+        """
+        run = self.run
+        if run is None:
+            return {"accepted": False, "problem": "There is no active request."}
+
+        appointment = self.session.get(Appointment, appointment_id)
+        # Ownership is checked as a refusal rather than a raise: this is a
+        # model slip, not an attack, and it is recoverable. A patient's token
+        # never reaches here — `patient_id` is bound from the session.
+        if appointment is None or appointment.patient_id != self.patient_id:
+            self.writer.validation(
+                "appointment_change_proposal",
+                accepted=False,
+                detail={"appointment_id": appointment_id, "problem": "not this patient's"},
+            )
+            return {
+                "accepted": False,
+                "problem": (
+                    f"Appointment {appointment_id} is not one of this patient's. "
+                    "Call list_my_appointments and use an id from it."
+                ),
+            }
+
+        if appointment.status not in LIVE_STATUSES:
+            return {
+                "accepted": False,
+                "problem": (
+                    f"That appointment is {appointment.status.value} and can no "
+                    "longer be changed."
+                ),
+            }
+
+        if action is ProposedAction.RESCHEDULE:
+            found = get_slot(self.session, slot_id) if slot_id else {"found": False}
+            if not found.get("found"):
+                return {"accepted": False, "problem": f"Slot {slot_id} does not exist."}
+            if not found.get("available"):
+                return {
+                    "accepted": False,
+                    "problem": "That time is no longer available. Offer another.",
+                }
+            # A reschedule moves the time, not the department: the required
+            # documents and the routing decision were settled when it was
+            # booked, and its plan closes over neither of them.
+            if found["department_id"] != appointment.department_id:
+                self.writer.validation(
+                    "appointment_change_proposal",
+                    accepted=False,
+                    detail={
+                        "appointment_id": appointment_id,
+                        "problem": "slot is in a different department",
+                    },
+                )
+                return {
+                    "accepted": False,
+                    "problem": (
+                        "That time is in a different department. Rescheduling "
+                        "keeps the same department; book a new appointment "
+                        "instead."
+                    ),
+                }
+
+        self.writer.validation(
+            "appointment_change_proposal",
+            accepted=True,
+            detail={"action": action.value, "appointment_id": appointment_id,
+                    "slot_id": slot_id},
+        )
+
+        new_slot = get_slot(self.session, slot_id) if slot_id else None
+
+        run.proposed_action = action
+        run.proposed_appointment_id = appointment_id
+        run.proposed_slot_id = slot_id
+        self.proposals.proposed_slot_id = slot_id
+        self.proposals.proposed_appointment_id = appointment_id
+
+        if run.status is WorkflowStatus.IN_PROGRESS:
+            transition(
+                self.session,
+                run,
+                to=WorkflowStatus.PENDING_CONFIRMATION,
+                trigger=f"{action.value}_proposed",
+                writer=self.writer,
+                actor=self.user,
+                detail={"appointment_id": appointment_id, "slot_id": slot_id},
+            )
+
+        return {
+            # What the patient holds now, re-read from the row — so the
+            # sentence naming "exactly which appointment" is not assembled
+            # from anything the model remembered.
+            "accepted": True,
+            "proposed": render_confirmation(self.session, appointment_id)["facts"],
+            # And, for a reschedule, what they are being moved to.
+            "new_slot": new_slot,
+        }
 
     # --- Document ---------------------------------------------------------
 

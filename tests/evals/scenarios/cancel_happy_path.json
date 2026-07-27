@@ -1,0 +1,29 @@
+{
+  "name": "cancel-happy-path",
+  "pins": "PRD story 20: cancelling names exactly which appointment, and nothing is cancelled until the patient confirms. The plan is `cancel` alone - no routing, and above all no required-documents diff, which would open a task telling the patient to prepare for the visit they are calling off. This scenario exists because cancel had no path from a patient message at all until Phase 6a: the tools were built and tested and nothing could reach them.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I want to cancel my appointment",
+      "expect": {
+        "status": "pending_confirmation",
+        "plan": ["cancel"],
+        "proposed_action": "cancel",
+        "reply_contains": ["AC-000001", "Cardiology"],
+        "appointment_status": {"1": "confirmed"},
+        "appointments_created": 0
+      }
+    },
+    {
+      "message": "yes",
+      "expect": {
+        "status": "completed",
+        "proposed_action": null,
+        "appointment_status": {"1": "cancelled"},
+        "appointments_created": 0,
+        "reply_contains": ["AC-000001", "cancelled"],
+        "reply_excludes": ["reminder the day before"]
+      }
+    }
+  ]
+}

@@ -25,6 +25,10 @@ from app.agents.toolbelt import Toolbelt, TurnProposals
 SPECIALIST_FOR_STEP = {
     "route": routing,
     "book": appointment,
+    # All three appointment verbs are the Appointment specialist's work — what
+    # differs is the tool it reaches for, not who owns the step.
+    "reschedule": appointment,
+    "cancel": appointment,
     "documents": documents,
     "follow_up": followup,
 }

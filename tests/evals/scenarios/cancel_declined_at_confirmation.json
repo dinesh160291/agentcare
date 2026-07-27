@@ -1,0 +1,24 @@
+{
+  "name": "cancel-declined-at-confirmation",
+  "pins": "The decline path for the most destructive verb. 'no' at a cancellation proposal must leave the appointment exactly where it was AND clear the proposal - a dead proposal that stays confirmable is a loop with no exit, and here the loop ends in a cancelled visit. `proposed_action: null` is the half that `status` cannot show: a run back in in_progress still holding a cancel proposal would commit it on the next stray 'yes'.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I want to cancel my appointment",
+      "expect": {
+        "status": "pending_confirmation",
+        "proposed_action": "cancel",
+        "appointment_status": {"1": "confirmed"}
+      }
+    },
+    {
+      "message": "no",
+      "expect": {
+        "status": "in_progress",
+        "proposed_action": null,
+        "appointment_status": {"1": "confirmed"},
+        "appointments_created": 0
+      }
+    }
+  ]
+}

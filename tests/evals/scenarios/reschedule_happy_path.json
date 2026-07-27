@@ -1,0 +1,28 @@
+{
+  "name": "reschedule-happy-path",
+  "pins": "A reschedule moves an appointment; it never creates a second one and never cancels the first. The plan is `reschedule` plus `follow_up` - the department and the required documents were settled when it was booked, so neither is re-derived, but the reminder moves with the appointment and there is something to summarise. `appointments_created: 0` alongside a still-confirmed row is the pair that says 'moved' rather than 'replaced'.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "please reschedule my appointment to next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "plan": ["reschedule", "follow_up"],
+        "proposed_action": "reschedule",
+        "reply_contains": ["AC-000001"],
+        "appointment_status": {"1": "confirmed"},
+        "appointments_created": 0
+      }
+    },
+    {
+      "message": "yes",
+      "expect": {
+        "status": "completed",
+        "proposed_action": null,
+        "appointment_status": {"1": "confirmed"},
+        "appointments_created": 0,
+        "reply_contains": ["AC-000001"]
+      }
+    }
+  ]
+}
