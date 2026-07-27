@@ -61,10 +61,14 @@ def _init_state() -> None:
     # this browser tab has seen, and it is rebuilt from replies the API sent.
     st.session_state.setdefault("transcript", [])
     st.session_state.setdefault("last_run_id", None)
+    # A turn the patient has asked for but that has not been sent yet. It is
+    # what lets the screen paint their message before the round trip starts —
+    # see ``ui/views/patient_chat.py``.
+    st.session_state.setdefault("pending", None)
 
 
 def sign_out() -> None:
-    for key in ("token", "user", "session_id", "transcript", "last_run_id"):
+    for key in ("token", "user", "session_id", "transcript", "last_run_id", "pending"):
         st.session_state.pop(key, None)
     _init_state()
 

@@ -128,6 +128,15 @@ CSS = f"""
   .ac-msg-user {{
       border-left: 2px solid {DIVIDER}; padding: 2px 0 2px 12px;
   }}
+  /* The reply while it is typing. ``st.write_stream`` renders Streamlit's own
+     markdown, which this cannot class directly — but ``st.container(key=...)``
+     stamps ``st-key-<key>`` on the wrapper, so the finished reply and the
+     typing one can be given the same rule and measure. Without this the words
+     visibly re-flow the instant the effect ends. */
+  .st-key-ac_stream p {{
+      font-size: 15px; line-height: 1.6; margin: 0;
+      border-left: 2px solid {ACCENT}; padding: 2px 0 2px 12px;
+  }}
   .ac-alarm {{
       border: 1px solid #a33a2a; border-left: 3px solid #a33a2a;
       background: #fdf3f2; color: #7a2b20;

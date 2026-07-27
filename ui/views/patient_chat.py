@@ -15,9 +15,26 @@ exact tokens, then the model's decline-or-re-ask.
 The transcript in ``session_state`` is a display buffer for this browser tab.
 The conversation itself lives in the backend's session store and survives a
 restart — which is why the run card beside it is fetched, not remembered.
+
+**A turn is sent across two script runs, not one.** A message used to be posted
+inside the same run that read it, so the whole screen sat still for as long as
+five agents took, and then everything repainted at once — the sent message
+included, which read as a flicker rather than as a send. Now the first run only
+records what the patient asked for and reruns; the second paints that message
+and a status line *before* the call, so the wait happens under something rather
+than under nothing. The sidebar card is rendered last for the same reason: by
+then the turn has committed, so it needs no second rerun to catch up.
+
+The typing effect is cosmetic and is honest about it — the reply is complete
+before the first word appears. Real token streaming would need SSE through the
+API and would split one LLM response across many trace rows, which is the
+pairing invariant the trace's well-formedness check exists to hold.
 """
 
 from __future__ import annotations
+
+import re
+import time
 
 import streamlit as st
 
@@ -37,38 +54,66 @@ DEMO_PROMPTS = [
 AWAITING = "pending_confirmation"
 
 
+#: Seconds between words of the typing effect. Small enough that a long
+#: receipt does not outlast a reader's patience.
+TYPING_DELAY = 0.016
+
+
 def _remember(who: str, text: str, result: dict | None = None) -> None:
     st.session_state.transcript.append({"who": who, "text": text, "result": result})
 
 
-def _send_message(text: str) -> None:
+# --- phase one: record what was asked for, and repaint --------------------
+
+
+def _queue_message(text: str) -> None:
+    """Show the patient's words now; send them on the next script run."""
     _remember("You", text)
-    ok, result = act(
-        lambda: client().send_message(
-            token(), message=text, session_id=st.session_state.session_id
-        )
-    )
-    if not ok:
-        _remember("AgentCare", f"Something went wrong: {result.detail}")
-        return
-    st.session_state.session_id = result["session_id"]
-    st.session_state.last_run_id = result.get("run_id")
-    _remember("AgentCare", result["reply"], result)
+    st.session_state.pending = {"kind": "message", "text": text}
 
 
-def _send_action(action: str) -> None:
+def _queue_action(action: str) -> None:
     """A button press. No free text, so nothing here reads language."""
-    ok, result = act(
-        lambda: client().send_action(
-            token(), action=action, session_id=st.session_state.session_id
+    _remember("You", "✓ Confirm" if action == "confirm" else "✕ Decline")
+    st.session_state.pending = {"kind": "action", "action": action}
+
+
+# --- phase two: send it, under a status the patient can see ---------------
+
+
+def _send(pending: dict) -> dict | None:
+    """Post the queued turn. Returns the entry to render, or ``None``."""
+    if pending["kind"] == "action":
+        call = lambda: client().send_action(  # noqa: E731
+            token(), action=pending["action"], session_id=st.session_state.session_id
         )
-    )
+    else:
+        call = lambda: client().send_message(  # noqa: E731
+            token(), message=pending["text"], session_id=st.session_state.session_id
+        )
+
+    ok, result = act(call)
     if not ok:
         _remember("AgentCare", f"Something went wrong: {result.detail}")
-        return
-    _remember("You", "✓ Confirm" if action == "confirm" else "✕ Decline")
+        return None
+
+    if pending["kind"] == "message":
+        st.session_state.session_id = result["session_id"]
     st.session_state.last_run_id = result.get("run_id")
     _remember("AgentCare", result["reply"], result)
+    return st.session_state.transcript[-1]
+
+
+def _typewriter(text: str):
+    """Yield a finished reply one word at a time.
+
+    Cosmetic, and deliberately so: the whole reply is already in hand. What
+    this buys is that a long receipt arrives at a readable pace instead of
+    landing as a wall — not any claim about how it was produced.
+    """
+    for word in re.findall(r"\S+\s*", text):
+        yield word
+        time.sleep(TYPING_DELAY)
 
 
 def _run_card() -> None:
@@ -106,7 +151,7 @@ def _run_card() -> None:
                 )
 
 
-def _render_turn(entry: dict) -> None:
+def _render_turn(entry: dict, *, stream: bool = False) -> None:
     who = entry["who"]
     result = entry.get("result") or {}
     is_agent = who == "AgentCare"
@@ -121,10 +166,17 @@ def _render_turn(entry: dict) -> None:
             unsafe_allow_html=True,
         )
 
-    st.markdown(
-        f'<p class="ac-msg {css}">{theme.esc(entry["text"])}</p>',
-        unsafe_allow_html=True,
-    )
+    if stream:
+        # Keyed so the stylesheet can give Streamlit's own markdown the same
+        # left rule and measure as ``.ac-msg-agent``; without it the reply
+        # would visibly change shape the moment the typing finished.
+        with st.container(key="ac_stream"):
+            st.write_stream(_typewriter(entry["text"]))
+    else:
+        st.markdown(
+            f'<p class="ac-msg {css}">{theme.esc(entry["text"])}</p>',
+            unsafe_allow_html=True,
+        )
 
     if is_agent and result:
         bits = []
@@ -173,10 +225,10 @@ def _confirmation_controls() -> None:
 
     left, right, _ = st.columns([1, 1, 4])
     if left.button("✓ Confirm", type="primary", key="confirm_proposal"):
-        _send_action("confirm")
+        _queue_action("confirm")
         st.rerun()
     if right.button("✕ Decline", key="decline_proposal"):
-        _send_action("decline")
+        _queue_action("decline")
         st.rerun()
 
     st.markdown(
@@ -190,7 +242,6 @@ def _confirmation_controls() -> None:
 # --- the page ------------------------------------------------------------
 
 header("Chat", "Ask for an appointment, a change, an upload, or a status.")
-_run_card()
 
 if not st.session_state.transcript:
     theme.empty(
@@ -201,18 +252,39 @@ if not st.session_state.transcript:
 for entry in st.session_state.transcript:
     _render_turn(entry)
 
+# Everything above is already on screen — including the message queued by the
+# run that led here — so the wait now happens under a status rather than under
+# a still page.
+# ``.get``, not attribute access: the view-render sweep loads this file on its
+# own, without ``ui/app.py``'s initialiser, and a page that only works when
+# something else ran first is a page with a hidden prerequisite.
+pending = st.session_state.get("pending")
+if pending:
+    st.session_state.pending = None
+    with st.status("AgentCare is working…", expanded=False) as status:
+        fresh = _send(pending)
+        status.update(label="Done", state="complete")
+    if fresh is not None:
+        _render_turn(fresh, stream=True)
+    else:
+        _render_turn(st.session_state.transcript[-1])
+
 _confirmation_controls()
 
 with st.expander("Demo prompts"):
     for index, prompt in enumerate(DEMO_PROMPTS):
         if st.button(prompt, key=f"demo_{index}"):
-            _send_message(prompt)
+            _queue_message(prompt)
             st.rerun()
 
 typed = st.chat_input("Describe what you need…")
 if typed:
-    _send_message(typed)
+    _queue_message(typed)
     st.rerun()
+
+# Last, not first: by this point the turn above has committed, so the card
+# reads the run's new state without needing a second rerun to catch up.
+_run_card()
 
 st.markdown(
     '<p class="ac-foot">AgentCare handles administration only — it never '
