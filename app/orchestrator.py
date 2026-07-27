@@ -72,6 +72,13 @@ from app.workflow.plan import (
     record_replan,
     validate_plan,
 )
+from app.workflow.replies import (
+    promises_action,
+    render_alternatives,
+    render_proposal,
+    render_reask,
+    render_receipt,
+)
 from app.workflow.state_machine import create_run, transition
 
 # Code-authored replies. They are templates on purpose: a guard's output and a
@@ -318,11 +325,69 @@ def _settle_confirmation(
         detail={"non_answers": run.non_answer_count, "cap": cap},
     )
 
-    if stalled:
-        # Code takes the wording from here: zero further model turns spent on
-        # re-phrasing a question that has already been asked three times.
+    # The facts are code's either way. What the cap governs is whether the
+    # model gets to put a sentence in front of them.
+    facts = render_reask(session, run)
+
+    # A re-ask that announces an action is describing a turn that is already
+    # over: nothing runs after the reply, so the patient waits for something
+    # that will not arrive and then repeats themselves — which the counter
+    # above then reads as a stall. Live: "looks good. lets book that time" was
+    # answered with "I will proceed to find a suitable time for you. Please
+    # hold on", on a turn that was already holding one.
+    promised = bool(coordinator_reply) and promises_action(coordinator_reply)
+    if promised:
+        writer.guard_verdict(
+            "reply_promises_action",
+            passed=False,
+            detail={"reply": coordinator_reply[:200]},
+        )
+
+    lead = "" if (stalled or promised or not coordinator_reply) else coordinator_reply
+    return TurnResult(
+        reply=f"{lead}\n{facts}".strip(),
+        author=TraceAuthor.LLM if lead else TraceAuthor.TEMPLATE,
+        run_id=run.id,
+        status=run.status.value,
+        message_class=outcome.message_class,
+        **base,
+    )
+
+
+def _answer_while_holding(
+    session: Session,
+    *,
+    run: WorkflowRun,
+    belt: Toolbelt,
+    outcome,
+    base: dict,
+) -> TurnResult | None:
+    """The answer half of answer-and-stay, at the one state that lacked it.
+
+    ``None`` when this turn did neither of the two things, which leaves the
+    confirmation path exactly as it was.
+
+    The mapping table has always said a side question is answered and the run
+    stays put. At ``pending_confirmation`` the code went straight to
+    decline-or-re-ask, so the answering never happened: live, "show me more
+    available slots" got the re-ask nag, twice. Both branches below leave the
+    run in ``pending_confirmation``, and neither can commit — a re-proposal is
+    still a proposal, and the patient still has to say the word.
+
+    The reply is assembled rather than delegated because the facts are slot
+    ids, doctors and times, and a paraphrase of those is how a patient ends up
+    at the wrong clinic on the wrong day.
+    """
+    if belt.proposals.reproposed:
+        # The shortlist is only there if this turn also listed times. "The 2pm
+        # one", answering a list from three exchanges ago, moves the proposal
+        # with nothing fresh to show — so the fallback states what is now held,
+        # which is the fact that actually changed.
         return TurnResult(
-            reply=STALLED_REASK_REPLY,
+            reply=(
+                render_proposal(session, run, belt.proposals.offered_slots)
+                or render_reask(session, run)
+            ),
             author=TraceAuthor.TEMPLATE,
             run_id=run.id,
             status=run.status.value,
@@ -330,14 +395,17 @@ def _settle_confirmation(
             **base,
         )
 
-    return TurnResult(
-        reply=coordinator_reply or STALLED_REASK_REPLY,
-        author=TraceAuthor.LLM if coordinator_reply else TraceAuthor.TEMPLATE,
-        run_id=run.id,
-        status=run.status.value,
-        message_class=outcome.message_class,
-        **base,
-    )
+    if belt.proposals.answered_with_slots:
+        return TurnResult(
+            reply=render_alternatives(session, run, belt.proposals.offered_slots),
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            message_class=outcome.message_class,
+            **base,
+        )
+
+    return None
 
 
 def _budget_failure(
@@ -871,6 +939,11 @@ async def _continue_run(
     # This is the third and last step of the reading order, and the only one
     # the model takes part in.
     if awaiting_confirmation and run.status is WorkflowStatus.PENDING_CONFIRMATION:
+        answered = _answer_while_holding(
+            session, run=run, belt=belt, outcome=outcome, base=base
+        )
+        if answered is not None:
+            return answered
         return _settle_confirmation(
             session,
             run=run,
@@ -1042,6 +1115,21 @@ async def _execute_plan(
             writer=writer,
             actor=user,
         )
+
+    # A proposal now goes out with the shortlist it was drawn from. The typed
+    # proposal is still exactly one slot and the state machine has not moved:
+    # this only tells the patient that there were others and that asking for
+    # one is a thing they may do. Appended by code, from the slot payload, so
+    # it says the same thing under mock and under a live provider — which the
+    # specialist's own prose cannot promise.
+    if (
+        run.status is WorkflowStatus.PENDING_CONFIRMATION
+        and run.proposed_action is ProposedAction.BOOK
+        and belt.proposals.offered_slots
+    ):
+        shortlist = render_proposal(session, run, belt.proposals.offered_slots)
+        if shortlist:
+            said.append(shortlist)
 
     # The Coordinator's acknowledgement is only used when no specialist spoke:
     # "I'll find you an appointment" adds nothing next to "here is the time".
@@ -1283,6 +1371,23 @@ async def _commit_proposal(
         settings=settings,
         base=base,
     )
+
+    # The receipt is code's, not the model's. The specialists still ran — the
+    # missing-documents task, the follow-up sweep and the verification all
+    # happen in the calls above — but what the patient is *told* is assembled
+    # from rows here.
+    #
+    # One live receipt carried four defects at once: a mandatory document and
+    # an optional one welded into "still needed, which is optional"; "recorded
+    # for follow-up" beside "no outstanding follow-up tasks"; the reminder's
+    # fire date presented as the appointment's, which sends a patient to an
+    # empty clinic a day early; and a context dump nobody asked for. Every one
+    # of them is a fact surviving a paraphrase, so the paraphrase goes.
+    receipt = render_receipt(session, run)
+    if receipt:
+        result.reply = receipt
+        result.author = TraceAuthor.TEMPLATE
+
     result.message_class = MessageClass.CONTINUATION
     return result
 

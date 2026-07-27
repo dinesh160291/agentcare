@@ -40,6 +40,7 @@ from app.models import (
     EscalationKind,
     EscalationStatus,
     MessageClass,
+    Reminder,
     SlotStatus,
     TraceAuthor,
     TraceEvent,
@@ -986,3 +987,162 @@ class TestTheRowWinsOverSessionState:
 
         clock.freeze(clock.today())
         assert clock.today().isoformat() in prompts.instruction("coordinator")
+
+
+class TestTheProposalReplyOffersAChoice:
+    """A proposal goes out with the shortlist it was drawn from.
+
+    The typed proposal is still exactly one slot — the state machine is not
+    involved in any of this. What changed is that "no" stopped being the only
+    thing a patient could say to a time that did not suit them.
+    """
+
+    def test_three_times_are_named_and_the_first_is_the_one_held(self, patient):
+        result = turn(patient, BOOKING, "s-offer-1")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            held = session.get(AppointmentSlot, run.proposed_slot_id)
+            offered = run.state["offered_slot_ids"]
+        finally:
+            session.close()
+
+        lines = [
+            line for line in result.reply.splitlines() if line[:2] in ("1.", "2.", "3.")
+        ]
+        assert len(lines) == 3
+        assert "holding" in lines[0], "the held time is the first option"
+        assert offered[0] == held.id
+
+    def test_every_time_shown_is_recorded_as_offered(self, patient):
+        """The set a re-proposal is checked against is built here. If showing
+        and recording could come apart, the patient would be offered a time the
+        guard would then refuse."""
+        result = turn(patient, BOOKING, "s-offer-2")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            shown = {
+                session.get(AppointmentSlot, slot_id).start_time.strftime("%H:%M")
+                for slot_id in run.state["offered_slot_ids"]
+            }
+        finally:
+            session.close()
+
+        for time_text in shown:
+            assert time_text in result.reply
+
+    def test_the_options_are_distinct_times(self, patient):
+        """Three doctors free at 09:00 is one appointment three times, not a
+        choice — and offering it as one hides the 10:00 they would have taken."""
+        result = turn(patient, BOOKING, "s-offer-3")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            starts = [
+                session.get(AppointmentSlot, slot_id).start_time
+                for slot_id in run.state["offered_slot_ids"]
+            ]
+        finally:
+            session.close()
+
+        assert len(set(starts)) == len(starts)
+
+
+class TestTheReAskCarriesTheProposal:
+    """Item 4's guarantee, checked against the row rather than a fixed string."""
+
+    def test_it_names_the_doctor_and_day_being_held(self, patient):
+        turn(patient, BOOKING, "s-reask-1")
+        result = turn(patient, "looks good. lets book that time", "s-reask-1")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            slot = session.get(AppointmentSlot, run.proposed_slot_id)
+            doctor = slot.doctor.name
+            day = f"{slot.start_time:%A} {slot.start_time.day}"
+        finally:
+            session.close()
+
+        assert doctor in result.reply
+        assert day in result.reply
+
+    def test_it_promises_no_action(self, patient):
+        from app.workflow.replies import promises_action
+
+        turn(patient, BOOKING, "s-reask-2")
+        result = turn(patient, "looks good. lets book that time", "s-reask-2")
+
+        assert promises_action(result.reply) is False
+
+    def test_nothing_is_booked_by_any_of_it(self, patient):
+        """The rule underneath everything in this batch. Paraphrase never
+        commits — the improvements are around that, never through it."""
+        result = turn(patient, BOOKING, "s-reask-3")
+        for words in ("looks good. lets book that time", "that works for me"):
+            turn(patient, words, "s-reask-3")
+
+        session = fresh()
+        try:
+            assert appointments_for(session, result.run_id) == []
+            run = session.get(WorkflowRun, result.run_id)
+            assert run.status is WorkflowStatus.PENDING_CONFIRMATION
+        finally:
+            session.close()
+
+
+class TestTheReceiptIsAssembled:
+    """Item 2, end to end: what the patient is told after a commit."""
+
+    def test_it_is_code_authored(self, patient):
+        turn(patient, BOOKING, "s-receipt-1")
+        result = turn(patient, "yes", "s-receipt-1")
+        assert result.author is TraceAuthor.TEMPLATE
+
+    def test_the_only_date_in_it_is_the_appointments(self, patient):
+        """The reminder fires the day *before* the visit, and the live receipt
+        printed that date as the appointment's. A patient reading it arrives a
+        day early to an empty clinic."""
+        turn(patient, BOOKING, "s-receipt-2")
+        result = turn(patient, "yes", "s-receipt-2")
+
+        session = fresh()
+        try:
+            appointment = appointments_for(session, result.run_id)[0]
+            starts = appointment.slot.start_time
+            reminders = [
+                reminder.scheduled_at
+                for reminder in session.query(Reminder)
+                .filter(Reminder.appointment_id == appointment.id)
+                .all()
+            ]
+        finally:
+            session.close()
+
+        assert reminders, "a booking schedules a reminder; without one this proves nothing"
+        for fires in reminders:
+            if fires.date() != starts.date():
+                assert f"{fires.day} {fires:%B}" not in result.reply
+
+    def test_the_upload_pointer_rides_with_a_missing_document(self, patient):
+        """Item 6. Cardiology's rules leave something outstanding for the
+        seeded patient, and being told what is missing without being told
+        where to put it is a chore rather than an instruction."""
+        turn(patient, BOOKING, "s-receipt-3")
+        result = turn(patient, "yes", "s-receipt-3")
+
+        if "before your visit" in result.reply or "Optional but helpful" in result.reply:
+            assert "Documents page" in result.reply
+
+    def test_it_never_contradicts_itself_about_follow_up(self, patient):
+        """Live, one receipt said a thing was "recorded for follow-up" and that
+        there were "no outstanding follow-up tasks", in the same breath."""
+        turn(patient, BOOKING, "s-receipt-4")
+        result = turn(patient, "yes", "s-receipt-4")
+
+        lowered = result.reply.lower()
+        assert not ("no outstanding" in lowered and "recorded for follow" in lowered)

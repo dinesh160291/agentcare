@@ -1,0 +1,38 @@
+{
+  "name": "ask-for-other-times-then-confirm",
+  "pins": "The mapping table has always said a side question is answered and the run stays put. At `pending_confirmation` the code went straight to decline-or-re-ask, so the answer half had nowhere to happen: live, \"show me more available slots\" was met with the re-ask nag, twice. The question is now answered from `find_available_slots` while the proposal stands — and the pinned rule is untouched underneath it. Nothing commits until the exact token arrives, the run never leaves `pending_confirmation` in between, and the request text is byte-identical afterwards because a question is not part of the request.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a cardiology appointment next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "proposed_action": "book",
+        "appointments_created": 0,
+        "reply_contains": ["1.", "2.", "3.", "others"]
+      }
+    },
+    {
+      "message": "show me more available slots",
+      "expect": {
+        "status": "pending_confirmation",
+        "message_class": "side_question",
+        "proposed_action": "book",
+        "appointments_created": 0,
+        "request_text_unchanged": true,
+        "reply_author": "template",
+        "reply_contains": ["free", "holding", "Confirm"],
+        "reply_excludes": ["i've booked", "is confirmed", "i will proceed", "hold on"]
+      }
+    },
+    {
+      "message": "yes",
+      "expect": {
+        "status": "completed",
+        "appointments_created": 1,
+        "reply_author": "template",
+        "reply_contains": ["confirmed", "Reference"]
+      }
+    }
+  ]
+}

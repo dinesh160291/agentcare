@@ -33,6 +33,7 @@ from app import clock
 from app.errors import ClassRejected, PlanRejected
 from app.models import (
     Appointment,
+    AppointmentSlot,
     FollowUpTaskType,
     PatientDocument,
     PlanStep,
@@ -43,6 +44,7 @@ from app.models import (
 )
 from app.tools.appointments import LIVE_STATUSES
 from app.trace import TraceWriter
+from app.workflow.replies import offered_slot_ids, was_offered
 from app.tools import (
     apply_verification,
     diff_required_documents,
@@ -92,6 +94,16 @@ class TurnProposals:
     #: Set only by a reschedule or cancellation proposal — the appointment the
     #: patient is being asked about, never one the model picked for them.
     proposed_appointment_id: int | None = None
+    #: The slot payload the last availability search returned, verbatim. The
+    #: reply's shortlist is built from this rather than from the specialist's
+    #: prose, so what the patient is shown and what the re-proposal guard will
+    #: accept are the same list by construction.
+    offered_slots: list[dict] = field(default_factory=list)
+    #: This turn answered a question about other times while a proposal stood.
+    answered_with_slots: bool = False
+    #: This turn moved the proposal to a different slot the patient had been
+    #: shown. Never a commit — the run is still waiting on an exact answer.
+    reproposed: bool = False
     rejections: list[str] = field(default_factory=list)
 
 
@@ -225,6 +237,20 @@ class Toolbelt:
             exact word, or the Confirm button, can do that."""
             return self._submit_confirmation_verdict(verdict, reason)
 
+        def list_other_slots() -> dict:
+            """Show the patient other free times while still holding the one
+            they were offered. Use this when they ask what else is available.
+            This books nothing and changes nothing: the time they were offered
+            is still being held for them afterwards."""
+            return self._list_other_slots()
+
+        def propose_another_slot(slot_id: int) -> dict:
+            """Move the offer to a different time the patient has already been
+            shown — use it when they pick one of the other options. `slot_id`
+            must come from a list you have shown them in this conversation.
+            This books nothing: they still have to confirm."""
+            return self._propose_another_slot(slot_id)
+
         # The toolset itself says which decision is wanted. A Coordinator with
         # no active run cannot classify against one, and a Coordinator with a
         # live run must not quietly start a second — so the wrong tool is
@@ -240,7 +266,112 @@ class Toolbelt:
             and self.run.status is WorkflowStatus.PENDING_CONFIRMATION
         ):
             tools.append(submit_confirmation_verdict)
+            # Answering "what else is free?" is the *other* half of the mapping
+            # table's answer-and-stay, and it needs data. Both are read-only or
+            # proposal-only by construction, and neither is reachable outside
+            # this state — a Coordinator with nothing held has no other time to
+            # offer and no proposal to move.
+            if self.run.proposed_action is ProposedAction.BOOK:
+                tools.extend([list_other_slots, propose_another_slot])
         return tools
+
+    def _list_other_slots(self) -> dict:
+        """Free times other than the one being held. Read-only, always.
+
+        The proposal is not touched here — not cleared, not moved, not
+        re-timed. That is the whole point of the tool existing: the mapping
+        table has always said a side question is answer-and-stay, and the
+        confirmation path could only decline or re-ask, so the *answer* half
+        had nowhere to happen and a patient asking "what else is there?" got a
+        nag instead of an answer, twice.
+        """
+        run = self.run
+        if run is None:
+            return {"slots": [], "problem": "There is no active request."}
+
+        department_id = self._department_id()
+        if department_id is None:
+            return {"slots": [], "problem": "No department has been decided yet."}
+
+        # Anchored on the day being held, not on today. A patient who asked for
+        # next week and is holding the 3rd should be shown the 3rd's other
+        # times, not tomorrow's: the alternatives to an offer are the times
+        # near it, and a list starting from now answers a question nobody
+        # asked. It is also what makes "the 10am one" resolvable — the times
+        # they can name are the times they were shown.
+        held = (
+            self.session.get(AppointmentSlot, run.proposed_slot_id)
+            if run.proposed_slot_id
+            else None
+        )
+        found = find_available_slots(
+            self.session,
+            department_id=department_id,
+            start=held.start_time.date() if held else None,
+        )
+        others = [
+            slot
+            for slot in found.get("slots") or []
+            if slot.get("slot_id") != run.proposed_slot_id
+        ]
+        self.proposals.offered_slots = others
+        self.proposals.answered_with_slots = True
+        return {"slots": others, "total_matching": len(others)}
+
+    def _propose_another_slot(self, slot_id: int) -> dict:
+        """Move the offer to a slot the patient has actually been shown.
+
+        Two checks, and the order matters.
+
+        **Was it offered?** The id must be in the set this run built from
+        ``find_available_slots`` payloads. A model naming an id it recalls from
+        its context window is indistinguishable from one inventing an id —
+        both arrive as an integer — so the only safe source is a tool result.
+        The rejection is written to the trace, because a refused invention is
+        exactly the event a reviewer needs to see and it leaves no other mark.
+
+        **Is it still free?** A slot on the shown list can be taken between
+        being shown and being chosen. This is the commit-time slot-taken
+        discipline applied one step earlier: ``_propose_appointment`` runs the
+        same liveness check the original proposal ran, and a dead slot returns
+        fresh options rather than a proposal nobody can honour. The proposal
+        already held is left standing throughout — a failed swap must never
+        leave the patient holding nothing.
+        """
+        run = self.run
+        if run is None:
+            return {"accepted": False, "problem": "There is no active request."}
+
+        if not was_offered(run, slot_id):
+            self.writer.validation(
+                "reproposal_slot_offered",
+                accepted=False,
+                detail={
+                    "slot_id": slot_id,
+                    "offered": offered_slot_ids(run),
+                    "problem": "that slot was never shown to this patient",
+                },
+            )
+            return {
+                "accepted": False,
+                "problem": (
+                    "You may only offer a time this patient has already been "
+                    "shown. Call list_other_slots and use an id from it."
+                ),
+            }
+
+        self.writer.validation(
+            "reproposal_slot_offered", accepted=True, detail={"slot_id": slot_id}
+        )
+
+        result = self._propose_appointment(slot_id)
+        if not result.get("accepted"):
+            # Gone since it was shown. Say so with something to choose from —
+            # a refusal with no alternatives is where a conversation stops.
+            return {**result, **self._list_other_slots()}
+
+        self.proposals.reproposed = True
+        return result
 
     def _submit_confirmation_verdict(self, verdict: str, reason: str) -> dict:
         """Validate the model's read of a confirmation answer.
@@ -349,13 +480,15 @@ class Toolbelt:
                     "total_matching": 0,
                     "problem": "No department has been decided for this request yet.",
                 }
-            return find_available_slots(
+            found = find_available_slots(
                 self.session,
                 department_id=department_id,
                 start=self._as_date(start),
                 end=self._as_date(end),
                 part_of_day=part_of_day or None,
             )
+            self.proposals.offered_slots = list(found.get("slots") or [])
+            return found
 
         def propose_appointment(slot_id: int) -> dict:
             """Propose a specific time to the patient. This books nothing: it

@@ -28,6 +28,8 @@ from app.models import (
     Doctor,
     ProposedAction,
     SlotStatus,
+    TraceEvent,
+    TraceEventType,
     User,
     WorkflowRun,
     WorkflowStatus,
@@ -282,3 +284,148 @@ class TestTheAcceptedPath:
         assert result["accepted"] is True
         assert result["new_slot"]["slot_id"] == target.id
         assert run.proposed_slot_id == target.id
+
+
+class TestMovingTheOfferToAnotherSlot:
+    """The re-proposal guard: only a time this patient has actually been shown.
+
+    The tool exists so "the 2pm one" can move the offer without going anywhere
+    near a commit. What makes it safe is that the id cannot come from the
+    model's memory of the conversation — a slot id recalled from prose and a
+    slot id invented both arrive as an integer, and only one of them was ever
+    on a list the patient saw.
+
+    Two refusals, and the second is the one that would be easy to forget: a
+    slot on the shown list can be taken between being shown and being chosen.
+    That is the commit-time slot-taken discipline, one step earlier.
+    """
+
+    @pytest.fixture
+    def holding(self, seeded_db, run):
+        """A run holding a proposal, having shown three slots."""
+        offered = (
+            seeded_db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .join(Department, Department.id == Doctor.department_id)
+            .filter(
+                Department.name == "Cardiology",
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                AppointmentSlot.start_time > clock.now(),
+            )
+            .order_by(AppointmentSlot.start_time)
+            .limit(3)
+            .all()
+        )
+        assert len(offered) == 3
+        run.plan = ["route", "book"]
+        run.status = WorkflowStatus.PENDING_CONFIRMATION
+        run.proposed_action = ProposedAction.BOOK
+        run.proposed_slot_id = offered[0].id
+        run.state = {
+            "department_id": offered[0].doctor.department_id,
+            "offered_slot_ids": [slot.id for slot in offered],
+        }
+        seeded_db.flush()
+        return offered
+
+    def test_a_slot_that_was_shown_can_be_taken(self, seeded_db, asha, run, holding):
+        belt = belt_for(seeded_db, asha, run)
+        result = belt._propose_another_slot(holding[1].id)
+
+        assert result["accepted"] is True
+        assert run.proposed_slot_id == holding[1].id
+        assert run.status is WorkflowStatus.PENDING_CONFIRMATION
+
+    def test_a_slot_that_was_never_shown_is_refused(
+        self, seeded_db, asha, run, holding
+    ):
+        """The invented-id case. It must not become a proposal, and the old
+        proposal must survive: a patient left holding nothing because the model
+        named a number is worse off than one who was told no."""
+        unshown = slot_in(seeded_db, "Dermatology")
+        assert unshown.id not in run.state["offered_slot_ids"]
+        held = run.proposed_slot_id
+
+        belt = belt_for(seeded_db, asha, run)
+        result = belt._propose_another_slot(unshown.id)
+
+        assert result["accepted"] is False
+        assert run.proposed_slot_id == held
+        assert run.status is WorkflowStatus.PENDING_CONFIRMATION
+
+    def test_the_refusal_is_written_to_the_trace(self, seeded_db, asha, run, holding):
+        """A refused invention leaves no other mark. If it is not an event,
+        nobody reviewing the run can tell it happened."""
+        unshown = slot_in(seeded_db, "Dermatology")
+        belt = belt_for(seeded_db, asha, run)
+        belt._propose_another_slot(unshown.id)
+        seeded_db.flush()
+
+        rejections = [
+            event.payload
+            for event in seeded_db.query(TraceEvent).all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload.get("what") == "reproposal_slot_offered"
+            and event.payload.get("accepted") is False
+        ]
+        assert rejections, "the refusal must be an event, not merely a return value"
+        assert rejections[0]["detail"]["slot_id"] == unshown.id
+
+    def test_an_acceptance_is_written_too(self, seeded_db, asha, run, holding):
+        """Both directions. A guard that only records its refusals cannot be
+        told apart from one that never ran."""
+        belt = belt_for(seeded_db, asha, run)
+        belt._propose_another_slot(holding[2].id)
+        seeded_db.flush()
+
+        accepted = [
+            event.payload
+            for event in seeded_db.query(TraceEvent).all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload.get("what") == "reproposal_slot_offered"
+            and event.payload.get("accepted") is True
+        ]
+        assert accepted
+
+    def test_a_shown_slot_that_has_since_been_taken_is_refused(
+        self, seeded_db, asha, run, holding
+    ):
+        """Being on the list is not the same as being free. The liveness check
+        is ``_propose_appointment``'s own — the same one the original proposal
+        ran — rather than a second copy that could drift from it."""
+        holding[1].status = SlotStatus.BOOKED
+        seeded_db.flush()
+        held = run.proposed_slot_id
+
+        belt = belt_for(seeded_db, asha, run)
+        result = belt._propose_another_slot(holding[1].id)
+
+        assert result["accepted"] is False
+        assert run.proposed_slot_id == held
+
+    def test_a_dead_slot_comes_back_with_something_to_choose_from(
+        self, seeded_db, asha, run, holding
+    ):
+        """A refusal with no alternatives is where a conversation stops."""
+        holding[1].status = SlotStatus.BOOKED
+        seeded_db.flush()
+
+        belt = belt_for(seeded_db, asha, run)
+        result = belt._propose_another_slot(holding[1].id)
+
+        assert result["slots"], "the patient is told no and shown nothing else"
+
+    def test_listing_other_times_never_touches_the_proposal(
+        self, seeded_db, asha, run, holding
+    ):
+        """The whole of answer-and-stay, at the tool: read-only means the run
+        is byte-identical afterwards except for what it has now shown."""
+        before = (run.proposed_slot_id, run.proposed_action, run.status)
+
+        belt = belt_for(seeded_db, asha, run)
+        listed = belt._list_other_slots()
+
+        assert (run.proposed_slot_id, run.proposed_action, run.status) == before
+        assert all(
+            slot["slot_id"] != run.proposed_slot_id for slot in listed["slots"]
+        ), "the time being held is not an alternative to itself"

@@ -1,0 +1,46 @@
+{
+  "name": "assent-paraphrase-is-asked-again",
+  "pins": "\"Looks good. lets book that time\" is agreement, and it is still not consent — only an exact token or the button books anything, and that rule is untouched. What changed is everything around it. The phrase contains the verb \"book\", which read as a *new request*: the run the patient was agreeing to was cancelled as superseded and the search began again from nothing, which is where the live \"I will proceed to find a suitable time for you. Please hold on\" came from — a promise of an action on a turn that was already over. So: the run survives, no second run is spawned, nothing is booked, and the re-ask states what is being held instead of announcing an errand.\n\nNote what is deliberately *not* pinned: the reply's author. The model may still put a sentence in front of the facts, and does — what code guarantees is that the facts are there and that no errand is announced, not that the model stayed silent. The words \"holding\" and \"Confirm\" appear only in the code-assembled re-ask, so their presence is the proof that code wrote the part that matters.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a cardiology appointment next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "runs_for_patient": 1,
+        "reply_contains": ["1.", "2.", "3."]
+      }
+    },
+    {
+      "message": "looks good. lets book that time",
+      "expect": {
+        "status": "pending_confirmation",
+        "message_class": "continuation",
+        "proposed_action": "book",
+        "appointments_created": 0,
+        "runs_for_patient": 1,
+        "reply_contains": ["holding", "Confirm"],
+        "reply_excludes": [
+          "i will proceed",
+          "please hold",
+          "hold on",
+          "one moment",
+          "let me check",
+          "i've closed your earlier request",
+          "i've booked",
+          "is confirmed"
+        ]
+      }
+    },
+    {
+      "message": "that works for me",
+      "expect": {
+        "status": "pending_confirmation",
+        "appointments_created": 0,
+        "runs_for_patient": 1,
+        "reply_contains": ["holding", "Confirm"],
+        "reply_excludes": ["i can help with hospital administration"]
+      }
+    }
+  ]
+}

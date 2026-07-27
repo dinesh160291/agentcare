@@ -30,6 +30,8 @@ tools its job needs, so the tools it was handed identify the job.
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime
 from typing import Any, AsyncGenerator
 
 from google.adk.models import LlmRequest, LlmResponse
@@ -109,6 +111,29 @@ SIDE_QUESTION_CUES = (
     "what documents", "what docs", "which documents", "what do i have",
     "when is my", "what time is my", "do i have",
 )
+#: "What else is free?" — a question, not an answer to ours. Kept apart from
+#: ``DECLINE_CUES`` because the two look alike and mean opposite things: "a
+#: different time" turns the offer down, while "show me more slots" asks to see
+#: the alternatives *before* deciding, and the offer is still standing after
+#: it. Read as a side question, so the run's request text is untouched.
+SLOT_QUESTION_CUES = (
+    "show me more", "more slots", "more available", "other slots", "other times",
+    "what else", "any other", "other options", "alternatives", "what other",
+    "see more", "any more",
+)
+#: Agreement that is not an exact token, and therefore **not a confirmation**.
+#: The tokens are read in code before any of this and nothing here can book
+#: anything — these exist so an assenting patient is *understood* while still
+#: being asked for the word. Two live misreads made the list necessary: "that
+#: works for me" carries no administrative noun and was answered with the
+#: off-topic scope reply, and "looks good. lets book that time" contains the
+#: verb "book" and was read as a *new request*, superseding the run the patient
+#: was agreeing to and starting the search again from nothing.
+ASSENT_CUES = (
+    "that works", "works for me", "looks good", "sounds good", "lets book",
+    "let's book", "book that", "go ahead", "fine by me", "suits me",
+    "that's fine", "thats fine", "yes please", "happy with that", "great",
+)
 ADMIN_CUES = BOOKING_CUES + DOCUMENT_CUES + ROUTING_CUES + FOLLOWUP_CUES
 
 #: The mock's safety judgement, and it is deliberately *not* a copy of the
@@ -145,9 +170,71 @@ SCOPE_TEXT = (
 )
 
 
+#: "the second one", "option 2", "the 2pm one", "the 14:00 slot". A patient
+#: picking off a list names it by position or by time; anything else is not a
+#: pick, and treating it as one would answer a hesitation with a booking offer.
+_OPTION_WORDS = re.compile(
+    r"\b(first|second|third|1st|2nd|3rd|option\s*[123]|number\s*[123])\b"
+)
+_OPTION_TIME = re.compile(r"\b(\d{1,2}\s*(?:am|pm)|\d{1,2}[:.]\d{2})\b")
+
+
+def _names_an_option(text: str) -> bool:
+    lowered = (text or "").lower()
+    return bool(_OPTION_WORDS.search(lowered) or _OPTION_TIME.search(lowered))
+
+
+def _pick_offered(text: str, slots: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Which of the shown slots the patient named, if any.
+
+    By time first, then by position. A time is the stronger signal: "the 2pm
+    one" says which slot regardless of how the list happened to be ordered,
+    while "the second" only means anything against this exact list.
+    """
+    lowered = (text or "").lower()
+    for slot in slots:
+        start = datetime.fromisoformat(slot["start"])
+        hour12 = start.hour % 12 or 12
+        suffix = "am" if start.hour < 12 else "pm"
+        forms = {
+            f"{start:%H:%M}",
+            f"{start.hour}:{start.minute:02d}",
+            f"{hour12}{suffix}",
+            f"{hour12} {suffix}",
+        }
+        if start.minute:
+            forms.add(f"{hour12}:{start.minute:02d}{suffix}")
+        if any(form in lowered for form in forms):
+            return slot
+
+    for words, index in (
+        (("first", "1st", "option 1", "option1", "number 1"), 0),
+        (("second", "2nd", "option 2", "option2", "number 2"), 1),
+        (("third", "3rd", "option 3", "option3", "number 3"), 2),
+    ):
+        if any(re.search(rf"\b{word}\b", lowered) for word in words):
+            return slots[index] if index < len(slots) else None
+    return None
+
+
 def _has(text: str, cues: tuple[str, ...]) -> bool:
     lowered = text.lower()
     return any(cue in lowered for cue in cues)
+
+
+def _has_word(text: str, cues: tuple[str, ...]) -> bool:
+    """``_has``, but only on whole words.
+
+    Substring matching is right for most of these lists — "book" should match
+    "booking" — and wrong for short ones. "erm" is inside "d**erm**atology", so
+    "actually book me a dermatology appointment instead" read as a *hesitation*
+    while a time was being held. It reached the same class anyway until
+    hesitation started deciding something, which is how a latent false positive
+    becomes a bug: not when it is introduced, but when something starts
+    depending on it.
+    """
+    lowered = text.lower()
+    return any(re.search(rf"\b{re.escape(cue)}\b", lowered) for cue in cues)
 
 
 def wants_booking(text: str) -> bool:
@@ -401,12 +488,55 @@ class MockLlm(AgentCareLlm):
             "side_question",
             "complementary",
         ):
+            # Before answering "how did they answer?", check whether they asked
+            # something instead. A patient who wants to see the other times has
+            # not answered at all, and reading them as a non-answer is what
+            # produced the same nag twice.
+            asked = self._other_times(llm_request, available, done, text)
+            if asked is not None:
+                return asked
             verdict, reason = self._confirmation_verdict(text)
             return function_call_response(
                 "submit_confirmation_verdict", {"verdict": verdict, "reason": reason}
             )
 
         return self._from_classification(classified.payload)
+
+    def _other_times(
+        self, llm_request: LlmRequest, available: set[str], done: set[str], text: str
+    ) -> LlmResponse | None:
+        """List the other free times, or move the offer onto one of them.
+
+        ``None`` when the patient did neither, which leaves the confirmation
+        read exactly as it was — the branch has to be silent about "hmm,
+        maybe", or a hesitation would be answered with a timetable.
+
+        The list is fetched again rather than remembered. Tool results are
+        scoped to the current turn on purpose (a persistent session otherwise
+        lets turn 2 answer with turn 1's result), so the options shown last
+        turn are not visible this turn — and re-reading them is right anyway:
+        a slot can be taken between being shown and being chosen.
+        """
+        if "list_other_slots" not in available:
+            return None
+        if not (_has(text, SLOT_QUESTION_CUES) or _names_an_option(text)):
+            return None
+
+        if latest_tool_result(llm_request, "propose_another_slot") is not None:
+            return text_response("")
+
+        listed = latest_tool_result(llm_request, "list_other_slots")
+        if listed is None:
+            return function_call_response("list_other_slots", {})
+
+        picked = _pick_offered(text, listed.payload.get("slots") or [])
+        if picked is None:
+            # They asked to see the times, or named one that is not on the
+            # list. Either way the reply is the code-assembled shortlist.
+            return text_response("")
+        return function_call_response(
+            "propose_another_slot", {"slot_id": picked["slot_id"]}
+        )
 
     @staticmethod
     def _confirmation_verdict(text: str) -> tuple[str, str]:
@@ -454,11 +584,14 @@ class MockLlm(AgentCareLlm):
         if _has(text, WITHDRAWAL_CUES):
             return "withdrawal", []
         answering = awaiting_confirmation and (
-            _has(text, HEDGE_CUES) or _has(text, DECLINE_CUES)
+            _has_word(text, HEDGE_CUES)
+            or _has(text, DECLINE_CUES)
+            or _has(text, ASSENT_CUES)
+            or _names_an_option(text)
         )
         if not answering and not _has(text, ADMIN_CUES):
             return "off_topic", []
-        if _has(text, SIDE_QUESTION_CUES):
+        if _has(text, SIDE_QUESTION_CUES) or _has(text, SLOT_QUESTION_CUES):
             return "side_question", []
         if mentions_documents(text) and not wants_booking(text):
             return "complementary", ["documents"]
@@ -471,6 +604,18 @@ class MockLlm(AgentCareLlm):
             return "conflicting", ["reschedule"]
         if wants_cancellation(text):
             return "conflicting", ["cancel"]
+        # Someone answering the question they were asked is not making a new
+        # request, whatever verbs they reached for. "Looks good, lets book that
+        # time" contains "book" and reads as a fresh booking to the rule below
+        # — which cancelled the run the patient had just agreed to and began
+        # searching again, live. The two verbs above stay ahead of this: "cancel
+        # my appointment" while a time is being held is a genuinely different
+        # request, not an answer. Everything else follows the file's own tie-
+        # break — a wrongly superseded cooperation costs the patient the
+        # booking they wanted, so the doubtful case falls through to
+        # continuation.
+        if answering:
+            return "continuation", []
         if wants_booking(text) and _has(text, REBOOK_CUES):
             return "conflicting", ["book"]
         return "continuation", []

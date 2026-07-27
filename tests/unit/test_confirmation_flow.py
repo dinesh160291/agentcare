@@ -40,7 +40,6 @@ from app.models import (
 from app.orchestrator import (
     DECLINED_REPLY,
     NOTHING_TO_CONFIRM_REPLY,
-    STALLED_REASK_REPLY,
     apply_patient_action,
     run_workflow,
 )
@@ -51,6 +50,8 @@ from app.providers.base import (
     function_call_response,
     text_response,
 )
+from app.trace import assert_well_formed
+from app.workflow.replies import render_reask
 
 PATIENT_EMAIL = "asha.patient@example.invalid"
 BOOKING = "I need a cardiology appointment next week"
@@ -210,8 +211,6 @@ class TestTheConfirmButton:
         the same rules. Until there were typed actions, nothing exercised the
         claim — and a checker that only understood chatty turns would pass the
         system's least deterministic flows while ignoring its most."""
-        from app.trace import assert_well_formed
-
         turn(patient, BOOKING, "s-btn-grammar")
         result = press(patient, "confirm", "s-btn-grammar")
 
@@ -308,12 +307,27 @@ class TestStallContainment:
             session.close()
 
     def test_at_the_cap_the_re_ask_becomes_code_templated(self, patient):
+        """Still exact equality, against what code actually writes now.
+
+        The stalled wording used to be a bare constant. It is the facts-
+        carrying re-ask instead — a patient who has been asked three times is
+        the one who most needs telling *what* they are being asked about — so
+        the pin moved to ``render_reask`` rather than being loosened to a
+        substring, which would have stopped noticing whether code or the model
+        wrote it at all.
+        """
         cap = get_settings().max_confirmation_non_answers
-        turn(patient, BOOKING, "s-stall-2")
+        result = turn(patient, BOOKING, "s-stall-2")
 
         replies = [turn(patient, "hmm, maybe", "s-stall-2") for _ in range(cap + 1)]
 
-        assert replies[-1].reply == STALLED_REASK_REPLY
+        session = fresh()
+        try:
+            expected = render_reask(session, session.get(WorkflowRun, result.run_id))
+        finally:
+            session.close()
+
+        assert replies[-1].reply == expected
         assert replies[-1].author is TraceAuthor.TEMPLATE
 
     def test_the_templated_re_ask_costs_no_model_wording(self, patient):
