@@ -37,7 +37,9 @@ from app.models import (
     User,
     WorkflowRun,
 )
-from app.orchestrator import run_workflow
+from app.models import AuditEvent
+from app.orchestrator import apply_patient_action, run_workflow
+from app.tools.tasks import list_open_escalations
 from app.trace import assert_well_formed
 
 SCENARIO_DIR = Path(__file__).parent / "scenarios"
@@ -76,6 +78,16 @@ KNOWN_EXPECTATIONS = frozenset(
         # leaves the proposal confirmable is a loop with no exit, and the
         # status alone does not show it.
         "proposed_action",
+        # How many times an action was audited for this patient. A double-click
+        # that commits twice leaves both rows behind; the appointment's *final*
+        # state cannot see the intermediate one, and the whole point of the
+        # bug was that the second commit looked like a success.
+        "audit_actions",
+        # The staff queue, counted across every run rather than the current
+        # one. A superseded run's escalation is invisible to `escalations`,
+        # which reads the run the turn ended on — and an abandoned request
+        # sitting in the queue is exactly what that blind spot hid.
+        "open_escalations",
     }
 )
 
@@ -164,7 +176,18 @@ def run_scenario(scenario: dict) -> ScenarioResult:
         finally:
             session.close()
 
-        outcome = asyncio.run(run_workflow(user, turn["message"], session_id))
+        # A turn is either something the patient typed or a button they pressed.
+        # The two are separate front doors and are only distinguishable in the
+        # trace, so a scenario about the buttons has to press them: posting the
+        # word "confirm" through the message door reads the exact token and
+        # commits identically, which would leave the scenario describing the
+        # code rather than checking it.
+        if "action" in turn:
+            outcome = asyncio.run(
+                apply_patient_action(user, turn["action"], session_id)
+            )
+        else:
+            outcome = asyncio.run(run_workflow(user, turn["message"], session_id))
         previous_run_id = outcome.run_id or previous_run_id
 
         session = SessionLocal()
@@ -236,6 +259,23 @@ def _check(result, index, expect, outcome, session, before, created, patient_id)
                 f"proposed_action: expected {expect['proposed_action']!r}, "
                 f"got {actual!r}"
             )
+
+    if "open_escalations" in expect:
+        queued = len(list_open_escalations(session))
+        if queued != expect["open_escalations"]:
+            fail(f"open_escalations: expected {expect['open_escalations']}, got {queued}")
+
+    if "audit_actions" in expect:
+        for action, expected_count in expect["audit_actions"].items():
+            actual = (
+                session.query(AuditEvent)
+                .filter(AuditEvent.action == action)
+                .count()
+            )
+            if actual != expected_count:
+                fail(
+                    f"audit_actions[{action}]: expected {expected_count}, got {actual}"
+                )
 
     if "cancellation_reason" in expect and outcome.run_id:
         run = session.get(WorkflowRun, outcome.run_id)

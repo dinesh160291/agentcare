@@ -1,0 +1,35 @@
+{
+  "name": "confirm-pressed-twice",
+  "pins": "A second Confirm click is a no-op. Live, it was not: the reschedule step re-entered after its own commit, auto-proposed the earliest free slot, and the second click moved an appointment the patient had chosen to a time they were never shown - two `appointment_rescheduled` audits eighteen seconds apart. Three things are pinned together, because any one of them alone can pass while the bug stands. `audit_actions` counts the commits, and is the only assertion that can see the intermediate move at all: the appointment's final status is `confirmed` either way. `proposed_action: null` after the first click says the run did not put itself back up for confirmation. And the third turn's reply is the nothing-to-confirm template, which is what a stale click is supposed to produce.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "please reschedule my appointment to next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "proposed_action": "reschedule",
+        "appointments_created": 0
+      }
+    },
+    {
+      "action": "confirm",
+      "expect": {
+        "status": "completed",
+        "proposed_action": null,
+        "appointment_status": {"1": "confirmed"},
+        "appointments_created": 0,
+        "audit_actions": {"appointment_rescheduled": 1}
+      }
+    },
+    {
+      "action": "confirm",
+      "expect": {
+        "appointment_status": {"1": "confirmed"},
+        "appointments_created": 0,
+        "audit_actions": {"appointment_rescheduled": 1, "patient_action_stale": 1},
+        "reply_contains": ["nothing waiting for your confirmation"],
+        "reply_author": "template"
+      }
+    }
+  ]
+}

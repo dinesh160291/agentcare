@@ -64,7 +64,12 @@ from app.tools import (
 )
 from app.trace import TraceWriter
 from app.workflow.confirmation import ConfirmationAnswer, read_confirmation
-from app.workflow.mapping import Consequence, apply_consequence, validate_class
+from app.workflow.mapping import (
+    Consequence,
+    apply_consequence,
+    mentions_domain_subject,
+    validate_class,
+)
 from app.workflow.plan import (
     advance_plan,
     is_plan_complete,
@@ -76,6 +81,7 @@ from app.workflow.replies import (
     promises_action,
     render_outstanding,
     render_alternatives,
+    render_change_proposal,
     render_proposal,
     render_reask,
     render_receipt,
@@ -445,7 +451,13 @@ def _budget_failure(
 
     It can blow before a run exists (in the safety screen, or in the
     Coordinator on a first message), and there is then nothing to transition to
-    ``failed``. The turn still has to say so.
+    ``failed``. The turn still has to say so — and, since both branches answer
+    with ``FAILED_REPLY`` and that template promises staff have been told, both
+    branches have to make it true. So a run is created here purely to have
+    something to fail and to key the escalation to, on the same reasoning the
+    safety module gives for its born-escalated run: every escalation points at
+    a run through a non-nullable key, and one nullable column for one path is a
+    worse trade than one row.
     """
     if run is None:
         write_audit(
@@ -455,11 +467,22 @@ def _budget_failure(
             actor=user,
             metadata={"stage": stage},
         )
-        return TurnResult(
-            reply=FAILED_REPLY,
-            author=TraceAuthor.TEMPLATE,
-            budget_exhausted=True,
-            **base,
+        # Born ``in_progress`` and failed a line later, rather than born
+        # ``failed``: the state machine refuses the latter, and it is right to
+        # — "runs are born in_progress, or escalated" is a pinned rule, and the
+        # failure edge it would bypass is the one that writes the transition
+        # this turn needs in its trace.
+        profile = _patient_profile(session, user)
+        run = create_run(
+            session,
+            patient_id=profile.id,
+            status=WorkflowStatus.IN_PROGRESS,
+            trigger=f"turn_budget_exhausted_{stage}",
+            writer=writer,
+            request_text="",
+            plan=[],
+            session_id=base.get("session_id"),
+            actor=user,
         )
     return _fail_run(
         session,
@@ -826,11 +849,36 @@ async def _turn(
     # off-topic. Safety has already had its turn, so a message that produced no
     # plan is off-topic — and only a supported intent may spawn a workflow.
     plan = belt.proposals.plan
+    names_a_subject = mentions_domain_subject(message)
     writer.guard_verdict(
         "scope_gate",
         passed=plan is not None,
-        detail={"steps": [step.value for step in plan] if plan else []},
+        detail={
+            "steps": [step.value for step in plan] if plan else [],
+            "domain_subject": names_a_subject,
+        },
     )
+    if plan is None and names_a_subject:
+        # No plan, but the message names an appointment, a document or a
+        # reminder — so it is not out of scope, and refusing it as though it
+        # were tells the patient to go away and rephrase. Live, "can you tell
+        # me my appointments" was refused twice while a different wording of
+        # the same question worked.
+        #
+        # Code cannot invent the plan the Coordinator did not produce; picking
+        # steps here would put the deterministic layer in the planning bin. So
+        # the honest answer is the one that asks for more, and the difference
+        # between that and ``SCOPE_REPLY`` is the difference between "tell me
+        # more" and "I don't do that".
+        write_audit(
+            session,
+            action="scope_gate_vetoed",
+            entity_type="workflow_run",
+            actor=user,
+            metadata={"reason": "message names a subject this system administers"},
+        )
+        return TurnResult(reply=NO_PLAN_REPLY, author=TraceAuthor.TEMPLATE, **base)
+
     if plan is None:
         # No run, no tools fired, no escalation. Off-topic is noise, not a
         # human-review case, and a queue full of noise is a queue nobody reads.
@@ -1095,6 +1143,9 @@ async def _execute_plan(
     stops the plan mid-way on purpose, and the run resumes when they answer.
     """
     steps_run: list[str] = []
+    #: Set when code replaces what the specialists said. The author on the
+    #: outbound event has to name whoever actually wrote the words.
+    code_authored = False
     # Each specialist's reply is kept, not overwritten. The booking receipt and
     # the missing-documents list are both things the patient needs; letting the
     # last step win would silently drop whichever mattered most.
@@ -1104,6 +1155,37 @@ async def _execute_plan(
         step = next_step(run)
         if step is None:
             break
+
+        # A verb that has committed is done, and re-entering it is not a retry:
+        # it is a *second proposal* for a request the patient has already
+        # settled. Live, the reschedule step ran again immediately after its own
+        # commit, called `find_slots_for_reschedule` with no window, proposed the
+        # earliest free slot, and put the run back into `pending_confirmation` —
+        # so the patient's second Confirm click moved a 4 August 11:00
+        # appointment they had chosen to a 28 July 09:00 one they were never
+        # shown. Two `appointment_rescheduled` audits, eighteen seconds apart.
+        #
+        # `_settle_step` has always known this, but it runs *after* the
+        # specialist: by the time it read `committed_action` the proposal had
+        # already been made and accepted. The check belongs here, before the
+        # dispatch, where re-entry is still preventable rather than merely
+        # detectable.
+        if (
+            step in APPOINTMENT_VERBS
+            and (run.state or {}).get("committed_action") == step.value
+        ):
+            writer.validation(
+                "step_already_committed",
+                accepted=True,
+                detail={"step": step.value, "run_id": run.id},
+            )
+            # Still recorded as run. The plan advanced through it this turn —
+            # what changed is that code settled it instead of a specialist, and
+            # a turn that reports having skipped its own booking step describes
+            # something that did not happen.
+            steps_run.append(step.value)
+            advance_plan(run, step)
+            continue
 
         specialist = SPECIALIST_FOR_STEP[step.value]
         task = _task_for(step, run, message=message, extra={})
@@ -1197,10 +1279,33 @@ async def _execute_plan(
         if shortlist:
             said.append(shortlist)
 
+    # A reschedule proposal holds two times of the same shape — the one the
+    # patient has and the one being offered — and the model welded them: "I
+    # found your appointment ... at 9:00 AM. Would you like me to reschedule
+    # it?", where 9:00 was the *new* slot and the appointment was at 10:00. The
+    # sentence named no new time at all, so it read as a request to approve
+    # moving an appointment to the hour it already occupied.
+    #
+    # Replaced rather than appended, unlike the booking shortlist above: there
+    # the model's sentence and the code's list say different things, and here
+    # they say the same thing twice with different numbers in it.
+    if run.status is WorkflowStatus.PENDING_CONFIRMATION and run.proposed_action in (
+        ProposedAction.RESCHEDULE,
+        ProposedAction.CANCEL,
+    ):
+        change = render_change_proposal(session, run)
+        if change:
+            said = [change]
+            # And the trace has to say who wrote it. Code-authored replies are
+            # not invisible: leaving the author at `llm` because a specialist
+            # happened to speak earlier in the turn would vouch for a sentence
+            # the model did not produce.
+            code_authored = True
+
     # The Coordinator's acknowledgement is only used when no specialist spoke:
     # "I'll find you an appointment" adds nothing next to "here is the time".
     if said:
-        reply, from_model = " ".join(said), True
+        reply, from_model = " ".join(said), not code_authored
     else:
         reply, from_model = _guarded(fallback_reply, writer=writer, fallback=NO_PLAN_REPLY)
     return TurnResult(
@@ -1301,7 +1406,17 @@ def _fail_run(
     plan: list[str],
     steps_run: list[str],
 ) -> TurnResult:
-    """Exhausted budget: the run fails, loudly and on the record."""
+    """Exhausted budget: the run fails, loudly and on the record.
+
+    And in front of a human. ``FAILED_REPLY`` says "I've flagged it for them",
+    and until this escalation existed that was a sentence about nothing: a live
+    run failed on its re-plan budget and left **zero** escalation rows, so the
+    patient was told help was coming and the staff queue never heard of it. A
+    template that makes a promise has to be the thing that keeps it.
+
+    Deduped per run and kind like every other escalation, so a run that fails
+    twice is one item with two occurrences rather than two items.
+    """
     transition(
         session,
         run,
@@ -1310,6 +1425,17 @@ def _fail_run(
         writer=writer,
         actor=user,
         detail={"budget": reason},
+    )
+    create_escalation(
+        session,
+        workflow_run_id=run.id,
+        kind=EscalationKind.SYSTEM_FAILURE,
+        reason=(
+            f"The request could not be completed automatically ({reason}). "
+            "A person should pick it up."
+        ),
+        message=run.request_text or "",
+        actor=user,
     )
     return TurnResult(
         reply=FAILED_REPLY,
@@ -1422,10 +1548,16 @@ async def _commit_proposal(
         detail={"appointment_id": appointment_id},
     )
 
-    # The `book` step is deliberately *not* marked done here. Letting the plan
-    # run it is what makes the Appointment agent call `render_confirmation` —
-    # the seam that re-reads the persisted row — so the receipt states facts
-    # from the database rather than from what the booking call returned.
+    # The plan carries on from here, and `_execute_plan` settles the committed
+    # verb without dispatching its specialist again — `committed_action`, just
+    # written above, is what tells it so. The steps that have not run yet (the
+    # required-documents diff, the follow-up sweep) still do.
+    #
+    # This used to be the other way round: the verb was left unmarked on purpose,
+    # so that the Appointment agent would run once more and call
+    # `render_confirmation` — the seam that re-reads the persisted row. That
+    # reason is gone. The receipt is assembled below from rows, so re-running the
+    # specialist bought nothing and cost a second proposal.
     belt.run = run
     result = await _execute_plan(
         session,

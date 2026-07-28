@@ -18,6 +18,7 @@ Two behaviours here are not merely wiring:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
 import pytest
 
@@ -30,10 +31,13 @@ from app.models import (
     Department,
     Doctor,
     SlotStatus,
+    TraceAuthor,
     User,
     WorkflowRun,
     WorkflowStatus,
 )
+from app.providers.base import text_response
+from app.providers.mock import MockLlm
 from app.workflow.replies import clock_time
 from app.orchestrator import run_workflow
 
@@ -265,3 +269,74 @@ class TestTheCancelTokenCollision:
             seeded_db.get(Appointment, SEEDED_APPOINTMENT_ID).status
             is AppointmentStatus.CONFIRMED
         )
+
+
+class DriftingLlm(MockLlm):
+    """The mock, plus the sentence ``gpt-4o-mini`` actually produced.
+
+    Live: "I found your appointment with Dr. Deepa Krishnan in the ENT
+    department on Monday, 3 August 2026, at 9:00 AM. Would you like me to
+    reschedule it?" — where 9:00 was the **new** slot and the appointment was
+    at 10:00. Two facts of the same shape in one payload, welded into one, and
+    the sentence names no new time at all: a patient reading it is being asked
+    to approve moving an appointment to the hour it already occupies.
+
+    The mock keeps the two apart, which is why it cannot show this on its own.
+    """
+
+    model: str = "drifting-stub"
+
+    def _from_change_proposal(self, payload, step):  # noqa: ANN001
+        new_slot = payload.get("new_slot") or {}
+        when = str(new_slot.get("start") or "")
+        spoken = clock_time(datetime.fromisoformat(when)) if when else "9:00 AM"
+        return text_response(
+            f"I found your appointment with Dr. Nobody in the Wrong department "
+            f"at {spoken}. Would you like me to {step} it?"
+        )
+
+
+class TestAChangeProposalStatesBothTimesFromRows:
+    """Item 7. The model may wrap; it may not supply numbers."""
+
+    @pytest.fixture(autouse=True)
+    def _drift(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: DriftingLlm()
+        )
+
+    def test_the_models_sentence_never_reaches_the_patient(self, patient):
+        result = turn(patient, "please reschedule my appointment to next week", "s-drift-1")
+
+        assert "Dr. Nobody" not in result.reply
+        assert "Wrong department" not in result.reply
+        assert result.author is TraceAuthor.TEMPLATE
+
+    def test_both_times_are_present_and_the_right_way_round(self, patient):
+        """The assertion the live sentence fails: the time the patient *has*
+        and the time they are being *offered* are different facts, and the
+        reply has to carry both, each attached to its own clause."""
+        result = turn(patient, "please reschedule my appointment to next week", "s-drift-2")
+
+        session = SessionLocal()
+        try:
+            appointment = session.get(Appointment, SEEDED_APPOINTMENT_ID)
+            run = session.get(WorkflowRun, result.run_id)
+            leaving = clock_time(appointment.slot.start_time)
+            arriving = clock_time(
+                session.get(AppointmentSlot, run.proposed_slot_id).start_time
+            )
+        finally:
+            session.close()
+
+        assert f"currently" in result.reply
+        assert leaving in result.reply.split("I can move it to")[0]
+        assert arriving in result.reply.split("I can move it to")[1]
+
+    def test_the_reference_code_survives(self, patient):
+        """Story 20 rides along: a destructive change names exactly which
+        appointment, and a template that dropped the code would be a quieter
+        version of the same ambiguity."""
+        result = turn(patient, "I want to cancel my appointment", "s-drift-3")
+        assert "AC-000001" in result.reply
+        assert "Dr. Nobody" not in result.reply

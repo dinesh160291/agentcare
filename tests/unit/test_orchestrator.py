@@ -49,8 +49,14 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
-from app.orchestrator import SCOPE_REPLY, active_run, run_workflow
+from app.orchestrator import (
+    SCOPE_REPLY,
+    active_run,
+    apply_patient_action,
+    run_workflow,
+)
 from app.workflow.replies import clock_time
+from app.providers.mock import MockLlm
 from app.providers.base import (
     AgentCareLlm,
     available_tool_names,
@@ -1160,3 +1166,365 @@ class TestTheReceiptIsAssembled:
 
         lowered = result.reply.lower()
         assert not ("no outstanding" in lowered and "recorded for follow" in lowered)
+
+
+class ReproposingLlm(MockLlm):
+    """The mock, deprived of the one hint ``gpt-4o-mini`` ignored.
+
+    The specialist's typed task carries ``committed`` — which verb has already
+    landed — and the mock reads it and states the outcome instead of proposing
+    again. The live model was handed the same field and proposed anyway.
+
+    That difference is the whole reason this stub exists. A field in a JSON
+    task is a *proposal-side* mitigation: advisory, and only as good as the
+    model's attention. This is what declining the advice looks like, and
+    without it the mock cannot reproduce the defect at all — the scenario for
+    it passes with the guard removed.
+    """
+
+    model: str = "reproposing-stub"
+
+    def _change_appointment(self, llm_request, done, task, step):  # noqa: ANN001
+        return super()._change_appointment(
+            llm_request,
+            done,
+            {key: value for key, value in task.items() if key != "committed"},
+            step,
+        )
+
+
+def _audit_count(session, action: str) -> int:
+    return session.query(AuditEvent).filter(AuditEvent.action == action).count()
+
+
+class TestACommittedVerbIsNotReEntered:
+    """Item 1, against a provider that behaves the way the live one did.
+
+    The live shape: Confirm committed a reschedule to the 4 August 11:00 slot
+    the patient had chosen; the reschedule step then ran *again* in the same
+    turn, called ``find_slots_for_reschedule`` with no window, proposed the
+    earliest free slot, and put the run back into ``pending_confirmation``. The
+    patient — seeing a receipt and a fresh proposal card — clicked Confirm a
+    second time and their appointment moved to 28 July 09:00, a time nothing
+    had ever offered them. Two ``appointment_rescheduled`` audits, eighteen
+    seconds apart.
+
+    The audit count is the assertion that can see it. The appointment's final
+    status is ``confirmed`` either way, and its slot after one bad move looks
+    exactly like a slot after one good one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _repropose(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: ReproposingLlm()
+        )
+
+    def _held_slot(self, session) -> int:
+        return session.get(Appointment, SEEDED_APPOINTMENT_ID).slot_id
+
+    def test_the_run_does_not_put_itself_back_up_for_confirmation(self, patient):
+        first = turn(patient, "please reschedule my appointment to next week", "s-twice-1")
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+        result = asyncio.run(apply_patient_action(patient, "confirm", "s-twice-1"))
+
+        assert result.status != WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert run.proposed_action is None
+            assert run.proposed_slot_id is None
+        finally:
+            session.close()
+
+    def test_a_second_click_moves_nothing(self, patient):
+        turn(patient, "please reschedule my appointment to next week", "s-twice-2")
+        asyncio.run(apply_patient_action(patient, "confirm", "s-twice-2"))
+
+        session = fresh()
+        try:
+            after_first = self._held_slot(session)
+        finally:
+            session.close()
+
+        asyncio.run(apply_patient_action(patient, "confirm", "s-twice-2"))
+
+        session = fresh()
+        try:
+            assert self._held_slot(session) == after_first
+            assert _audit_count(session, "appointment_rescheduled") == 1
+        finally:
+            session.close()
+
+    def test_the_second_click_says_there_is_nothing_to_confirm(self, patient):
+        """Layer (c), which is what makes a double-click harmless even if the
+        two layers above it were ever to regress."""
+        turn(patient, "please reschedule my appointment to next week", "s-twice-3")
+        asyncio.run(apply_patient_action(patient, "confirm", "s-twice-3"))
+        second = asyncio.run(apply_patient_action(patient, "confirm", "s-twice-3"))
+
+        assert second.author is TraceAuthor.TEMPLATE
+        assert "nothing waiting for your confirmation" in second.reply.lower()
+
+    def test_the_specialist_is_not_dispatched_for_the_committed_verb(self, patient):
+        """The mechanism, not just the outcome: the step settles from
+        ``committed_action`` without a second LLM request for it."""
+        turn(patient, "please reschedule my appointment to next week", "s-twice-4")
+        result = asyncio.run(apply_patient_action(patient, "confirm", "s-twice-4"))
+
+        session = fresh()
+        try:
+            requests = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.LLM_REQUEST
+                and event.agent_name == "appointment"
+            ]
+            settled = _validations(session, result.turn_id, "step_already_committed")
+        finally:
+            session.close()
+
+        assert requests == []
+        assert len(settled) == 1
+
+
+class TestAFailedRunReachesAHuman:
+    """Item 4. ``FAILED_REPLY`` says "I've flagged it for them" — so something
+    has to have been flagged.
+
+    Live, a run failed on its re-plan budget and left **zero** escalation rows.
+    The patient was told staff had been told; staff had not been told. A
+    template that makes a promise is the thing that has to keep it, and until
+    this existed the sentence was about nothing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _loop_forever(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: LoopingLlm()
+        )
+
+    def test_it_opens_a_system_failure_escalation(self, patient, settings):
+        result = turn(patient, BOOKING, "s-failesc-1")
+        assert result.budget_exhausted is True
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert run.status is WorkflowStatus.FAILED
+            kinds = [escalation.kind for escalation in run.escalations]
+        finally:
+            session.close()
+
+        assert kinds == [EscalationKind.SYSTEM_FAILURE]
+
+    def test_the_queue_a_human_reads_actually_shows_it(self, patient, settings):
+        """The row existing and the row being *in the queue* are different
+        claims, and only the second one is the promise the template made."""
+        turn(patient, BOOKING, "s-failesc-2")
+
+        session = fresh()
+        try:
+            queued = [
+                escalation
+                for escalation in session.query(Escalation).all()
+                if escalation.status in (EscalationStatus.OPEN, EscalationStatus.ACKNOWLEDGED)
+            ]
+        finally:
+            session.close()
+
+        assert [escalation.kind for escalation in queued] == [
+            EscalationKind.SYSTEM_FAILURE
+        ]
+
+    def test_repeated_failures_are_one_item_with_two_occurrences(
+        self, patient, settings
+    ):
+        """Bounded like every other escalation. A system failing twice must not
+        be able to fill the queue a human is supposed to read."""
+        turn(patient, BOOKING, "s-failesc-3")
+        turn(patient, BOOKING, "s-failesc-3")
+
+        session = fresh()
+        try:
+            rows = (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.SYSTEM_FAILURE)
+                .all()
+            )
+            counts = sorted(row.occurrence_count for row in rows)
+        finally:
+            session.close()
+
+        # A second failing turn either re-fails the same run or opens its own;
+        # either way the queue grows by records, not by noise.
+        assert sum(counts) == 2
+
+
+class TestADeadRunLeavesNothingBehind:
+    """Item 3, through the seam. The derivation invariant applied to a run's
+    own leftovers: an escalation a human would work on, and a proposal on a row
+    whose status says it is over."""
+
+    def test_withdrawing_closes_the_review_it_was_waiting_for(self, patient):
+        turn(patient, "book an appointment, my kid has ear pain", "s-dead-1")
+        turn(patient, "actually never mind, forget it", "s-dead-1")
+
+        session = fresh()
+        try:
+            open_rows = [
+                escalation
+                for escalation in session.query(Escalation).all()
+                if escalation.status in (EscalationStatus.OPEN, EscalationStatus.ACKNOWLEDGED)
+            ]
+            resolved = session.query(Escalation).all()
+        finally:
+            session.close()
+
+        assert open_rows == []
+        assert resolved[0].resolution_note == "Withdrawn by the patient."
+
+    def test_a_withdrawn_run_keeps_no_proposal(self, patient):
+        turn(patient, BOOKING, "s-dead-2")
+        result = turn(patient, "actually never mind, forget it", "s-dead-2")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert run.status is WorkflowStatus.CANCELLED
+            assert run.proposed_action is None
+            assert run.proposed_slot_id is None
+            assert run.proposed_appointment_id is None
+        finally:
+            session.close()
+
+    def test_a_safety_escalation_survives_a_withdrawal(self, patient):
+        """The exemption, end to end. ``escalated`` is terminal for automation,
+        so the withdrawal cannot even reach the mapping — and if it ever could,
+        the queue item would still be there."""
+        turn(patient, "I'm having chest pain and my left arm is numb", "s-dead-3")
+        turn(patient, "actually never mind, forget it", "s-dead-3")
+
+        session = fresh()
+        try:
+            safety = (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.SAFETY)
+                .all()
+            )
+        finally:
+            session.close()
+
+        assert len(safety) == 1
+        assert safety[0].status is EscalationStatus.OPEN
+
+
+class UnplanningLlm(AgentCareLlm):
+    """Safe on the screen, silent on the plan. The live Coordinator's failure
+    mode, isolated: it answers the safety screen and then says something
+    conversational instead of calling ``submit_plan``."""
+
+    model: str = "unplanning-stub"
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        available = available_tool_names(llm_request)
+        if "submit_safety_verdict" in available:
+            yield function_call_response(
+                "submit_safety_verdict",
+                {"category": "safe", "rationale": "stub: administrative"},
+            )
+            return
+        yield text_response("stub: no plan")
+
+
+class TestTheScopeGateDoesNotRefuseItsOwnSubject:
+    """Item 6 at the gate — which is where the live refusals happened.
+
+    "can you tell me my appointments" produced three ``scope_gate_refused``
+    audits across one session and no run at all, while a differently-worded ask
+    for the same thing worked. The Coordinator failing to plan for a message is
+    a different fact from the message being out of scope, and the two had the
+    same answer.
+
+    Code cannot supply the plan the Coordinator did not produce — that would
+    put the deterministic layer in the planning bin — so what changes is the
+    reply: "tell me more", not "I don't do that".
+    """
+
+    @pytest.fixture
+    def unplanning(self, monkeypatch):
+        """A Coordinator that submits no plan — which is what the live one did.
+
+        The mock plans "can you tell me my appointments" happily, so under it
+        the gate is never reached and these assertions would pass however the
+        gate behaved. gpt-4o-mini produced no plan for that wording and a plan
+        for another, which is the whole defect: a message's scope must not
+        depend on which sentence the model happened to find plannable.
+        """
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: UnplanningLlm()
+        )
+
+    def test_a_message_naming_appointments_is_not_refused(self, patient, unplanning):
+        result = turn(patient, "can you tell me my appointments", "s-veto-1")
+        assert result.reply != SCOPE_REPLY
+        assert result.author is TraceAuthor.TEMPLATE
+
+    def test_it_is_never_answered_with_a_scope_refusal_audit(self, patient, unplanning):
+        turn(patient, "can you tell me my appointments", "s-veto-2")
+
+        session = fresh()
+        try:
+            refused = (
+                session.query(AuditEvent)
+                .filter(AuditEvent.action == "scope_gate_refused")
+                .count()
+            )
+            vetoed = (
+                session.query(AuditEvent)
+                .filter(AuditEvent.action == "scope_gate_vetoed")
+                .count()
+            )
+        finally:
+            session.close()
+
+        assert refused == 0
+        assert vetoed == 1
+
+    def test_a_genuinely_off_topic_message_is_byte_identical(self, patient):
+        """The direction that must not move. A veto that swallowed these would
+        have traded a working refusal for a system that refuses nothing."""
+        for index, message in enumerate(
+            ("what's the weather like?", "how is nvidia stock doing", "who won the fifa final")
+        ):
+            result = turn(patient, message, f"s-veto-off-{index}")
+            assert result.reply == SCOPE_REPLY
+            assert result.author is TraceAuthor.GUARD
+
+        session = fresh()
+        try:
+            assert (
+                session.query(AuditEvent)
+                .filter(AuditEvent.action == "scope_gate_refused")
+                .count()
+                == 3
+            )
+            assert session.query(WorkflowRun).count() == 0
+        finally:
+            session.close()
+
+    def test_the_gate_records_which_way_it_went(self, patient, unplanning):
+        result = turn(patient, "can you tell me my appointments", "s-veto-4")
+
+        session = fresh()
+        try:
+            gate = _guard(session, result.turn_id, "scope_gate")
+        finally:
+            session.close()
+
+        assert gate["detail"]["domain_subject"] is True

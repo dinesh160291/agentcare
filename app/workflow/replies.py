@@ -290,6 +290,73 @@ def render_alternatives(
     )
 
 
+def render_change_proposal(session: Session, run: WorkflowRun) -> str:
+    """What the patient is asked before a reschedule or a cancellation.
+
+    A reschedule proposal has **two** times in it — the one they have and the
+    one being offered — and they are the whole content of the question. The
+    model was given both, in one tool payload, and welded them: "I found your
+    appointment with Dr. Deepa Krishnan in the ENT department on Monday, 3
+    August 2026, at 9:00 AM. Would you like me to reschedule it?" The 9:00 was
+    the *new* slot. The appointment was at 10:00, and the sentence names no new
+    time at all — so a patient reading it is being asked to approve a move to
+    the time they already have.
+
+    That is not a wording that could have been better. Two facts of the same
+    shape, in one sentence, is exactly what a paraphrase loses — the same
+    failure as the receipt printing the reminder's date as the visit's. So the
+    facts are assembled here, from the appointment row and the slot row, and
+    the specialist's sentence is not used.
+
+    Returns "" when there is no change proposal on the run, so callers can use
+    it as a test as well as a renderer.
+    """
+    action = run.proposed_action
+    if action is None or action.value not in ("reschedule", "cancel"):
+        return ""
+    if not run.proposed_appointment_id:
+        return ""
+
+    appointment = session.get(Appointment, run.proposed_appointment_id)
+    if appointment is None or appointment.slot is None:
+        return ""
+
+    facts = render_confirmation(session, appointment.id)["facts"]
+    current_day, current_time = _when(appointment.slot.start_time)
+    # The reference code is not decoration. Story 20: a destructive action is
+    # never ambiguous, and a patient with two appointments has to be able to
+    # tell from the sentence alone which one is about to move or disappear.
+    who = (
+        f"{facts['department_name']} appointment with {facts['doctor_name']} "
+        f"({facts['reference_code']})"
+    )
+
+    if action.value == "cancel":
+        return (
+            f"Your {who} is on {current_day} at {current_time}. "
+            'Say "yes" and I\'ll cancel it — nothing changes until you do.'
+        )
+
+    new_slot = (
+        session.get(AppointmentSlot, run.proposed_slot_id)
+        if run.proposed_slot_id
+        else None
+    )
+    if new_slot is None:
+        return ""
+    new_day, new_time = _when(new_slot.start_time)
+    moved = (
+        f"the same day at {new_time}"
+        if new_day == current_day
+        else f"{new_day} at {new_time}"
+    )
+    return (
+        f"Your {who} is currently {current_day} at {current_time}. "
+        f"I can move it to {moved}. "
+        'Say "yes" and I\'ll make the change — nothing moves until you do.'
+    )
+
+
 def _proposed_facts(session: Session, run: WorkflowRun) -> str | None:
     """The held slot, as a sentence. ``None`` if there is nothing held."""
     if not run.proposed_slot_id:
@@ -484,6 +551,7 @@ __all__ = [
     "promises_action",
     "record_offered",
     "render_alternatives",
+    "render_change_proposal",
     "render_options",
     "render_outstanding",
     "render_proposal",
