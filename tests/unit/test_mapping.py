@@ -39,6 +39,7 @@ from app.workflow.mapping import (
     CLASSIFICATION_ORDER,
     Consequence,
     apply_consequence,
+    mentions_domain_subject,
     primary_intent,
     validate_class,
 )
@@ -213,6 +214,88 @@ class TestComplementaryCannotCarryTheSameIntent:
         assert verdict.message_class is M.CONTINUATION
 
 
+class TestADifferentAppointmentVerbIsAlwaysConflicting:
+    """Item 5. Booking, moving and cancelling are three things one run cannot
+    be doing at once — ``validate_plan`` refuses a plan naming two of them —
+    so a message asking for one while the run pursues another is a different
+    request whatever the model called it.
+
+    The class the live model chose was **continuation**, which is why this is
+    checked for continuation and not only for complementary: guarding the class
+    the model was least likely to pick left the one it actually picked
+    unguarded, and the reschedule was fed into a booking run that was waiting
+    for staff.
+    """
+
+    def test_a_reschedule_during_a_booking_run_is_downgraded(self, seeded_db, writer):
+        """The live message, the live class, the live run shape."""
+        run = make_run(seeded_db, status=S.PENDING_REVIEW, plan=("route", "book"))
+        verdict = validate_class(
+            "continuation",
+            run=run,
+            incoming_steps=[PlanStep.RESCHEDULE],
+            writer=writer,
+        )
+
+        assert verdict.message_class is M.CONFLICTING
+        assert verdict.adjusted is True
+        assert verdict.proposed is M.CONTINUATION
+
+    def test_it_applies_to_complementary_too(self, seeded_db, writer):
+        run = make_run(seeded_db, plan=("route", "book"))
+        verdict = validate_class(
+            "complementary", run=run, incoming_steps=[PlanStep.CANCEL], writer=writer
+        )
+        assert verdict.message_class is M.CONFLICTING
+
+    def test_the_same_verb_is_left_alone(self, seeded_db, writer):
+        """The rule is *difference*. A continuation carrying the run's own verb
+        is exactly what a continuation is, and turning that into a supersede
+        would cancel every run its patient talked to."""
+        run = make_run(seeded_db, plan=("reschedule", "follow_up"))
+        verdict = validate_class(
+            "continuation",
+            run=run,
+            incoming_steps=[PlanStep.RESCHEDULE],
+            writer=writer,
+        )
+        assert verdict.message_class is M.CONTINUATION
+        assert verdict.adjusted is False
+
+    def test_a_document_upload_during_a_booking_is_untouched(self, seeded_db, writer):
+        """Narrow on purpose: *both* intents must be appointment verbs. "Here's
+        my old ECG" during a booking is `documents` against `book`, and stays
+        as cooperative as it ever was — that cooperation is the expensive one
+        to get wrong."""
+        run = make_run(seeded_db, plan=("route", "book"))
+        for proposed in ("continuation", "complementary"):
+            verdict = validate_class(
+                proposed,
+                run=run,
+                incoming_steps=[PlanStep.DOCUMENTS],
+                writer=writer,
+            )
+            assert verdict.message_class is MessageClass(proposed)
+
+    def test_the_adjustment_is_traced(self, seeded_db, writer):
+        run = make_run(seeded_db, plan=("route", "book"))
+        validate_class(
+            "continuation",
+            run=run,
+            incoming_steps=[PlanStep.RESCHEDULE],
+            writer=writer,
+        )
+        event = (
+            seeded_db.query(TraceEvent)
+            .filter(TraceEvent.event_type == TraceEventType.VALIDATION)
+            .one()
+        )
+        assert event.payload["accepted"] is False
+        assert event.payload["detail"]["applied"] == "conflicting"
+        assert event.payload["detail"]["active_intent"] == "book"
+        assert event.payload["detail"]["intent"] == "reschedule"
+
+
 class TestPrimaryIntent:
     def test_booking_is_the_widest_intent(self):
         assert primary_intent(["route", "book", "documents"]) is PlanStep.BOOK
@@ -225,6 +308,16 @@ class TestPrimaryIntent:
 
     def test_an_empty_plan_has_no_intent(self):
         assert primary_intent([]) is None
+
+    def test_a_reschedule_plan_reports_reschedule_not_its_closure(self):
+        """``reschedule`` closes over ``follow_up``, so a ranking that did not
+        know the verb called the whole request a follow-up — and "different
+        from `book`" was then true for the wrong reason, which is how a
+        reschedule got fed into a booking run as a continuation."""
+        assert primary_intent(["reschedule", "follow_up"]) is PlanStep.RESCHEDULE
+
+    def test_a_cancel_plan_reports_cancel(self):
+        assert primary_intent(["cancel"]) is PlanStep.CANCEL
 
 
 class TestOffTopicConsequence:
@@ -595,3 +688,104 @@ class TestConflictingAtReviewRequiresDifference:
         )
 
         assert outcome.consequence is Consequence.SUPERSEDE
+
+
+class TestDomainNounsVetoTheOffTopicVerdict:
+    """Item 6, at the seam where the rule lives.
+
+    Whether a message is about appointments is a fact about the message, not a
+    judgement the model gets to make twice differently. Live, "can you tell me
+    my appointments" was scope-refused twice while another wording of the same
+    question went straight through.
+
+    Both directions are pinned here, and the second matters as much as the
+    first: a veto that also swallowed "nvidia stock" would have replaced a
+    working refusal with a system that never refuses anything.
+    """
+
+    def test_the_live_message_is_not_off_topic(self):
+        assert mentions_domain_subject("can you tell me my appointments") is True
+
+    def test_the_named_vocabulary_all_counts(self):
+        for message in (
+            "where do I upload my document",
+            "did I get a reminder for that",
+            "what's my booking reference",
+            "I want to reschedule",
+            "cancel it please",
+            "show me my appointments",
+        ):
+            assert mentions_domain_subject(message) is True, message
+
+    def test_genuinely_off_topic_messages_stay_off_topic(self):
+        """Byte-identical behaviour for the messages the gate exists for."""
+        for message in (
+            "what's the weather like today?",
+            "how is nvidia stock doing",
+            "who won the fifa world cup",
+            "tell me a joke",
+            "what do you think of my haircut",
+        ):
+            assert mentions_domain_subject(message) is False, message
+
+    def test_it_matches_at_word_starts_not_anywhere(self):
+        """The `erm`-inside-`dermatology` trap, avoided by construction. A
+        substring match would make any word ending in one of these a domain
+        subject."""
+        assert mentions_domain_subject("discancellation") is False
+        assert mentions_domain_subject("a cancellation") is True
+
+    def test_empty_input_is_not_a_subject(self):
+        assert mentions_domain_subject("") is False
+        assert mentions_domain_subject(None) is False
+
+    def test_the_consequence_is_downgraded_not_the_class(self, seeded_db, writer):
+        """The trace has to keep describing the message that arrived. The class
+        stays `off_topic` — it is what the model said — and only what it may do
+        changes, to the read-only class that touches exactly as little."""
+        run = make_run(seeded_db, text="I need a cardiology appointment")
+        before_text, before_state = run.request_text, dict(run.state or {})
+
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.OFF_TOPIC),
+            writer=writer,
+            message="can you tell me my appointments",
+        )
+
+        assert outcome.message_class is M.OFF_TOPIC
+        assert outcome.consequence is Consequence.ANSWER_AND_STAY
+        assert outcome.spawns_new_run is False
+        assert run.request_text == before_text
+        assert dict(run.state or {}) == before_state
+
+    def test_a_real_off_topic_message_still_gets_the_scope_reply(
+        self, seeded_db, writer
+    ):
+        run = make_run(seeded_db, text="I need a cardiology appointment")
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.OFF_TOPIC),
+            writer=writer,
+            message="how is nvidia stock doing",
+        )
+        assert outcome.consequence is Consequence.SCOPE_REPLY
+
+    def test_the_veto_is_traced(self, seeded_db, writer):
+        run = make_run(seeded_db)
+        apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.OFF_TOPIC),
+            writer=writer,
+            message="show me my appointments",
+        )
+        events = [
+            event
+            for event in seeded_db.query(TraceEvent).all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload["what"] == "off_topic_vetoed"
+        ]
+        assert len(events) == 1

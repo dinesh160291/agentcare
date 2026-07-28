@@ -1,0 +1,27 @@
+{
+  "name": "a-different-verb-supersedes-a-review",
+  "pins": "A *different* appointment verb is a different request. \"My kid has ear pain\" routes with low confidence and queues for review; \"lets reschedule my ENT appointment\" is not that request rephrased and not a cooperation with it - it supersedes. Live it did neither: the model called it a continuation, `primary_intent` ranked `reschedule` as `follow_up` because the verb was missing from the ranking, and the re-check only ever guarded `complementary` - so the reschedule was fed into the *booking* run, routing re-ran on the two requests welded together, and a `pending_review` row ended up carrying `proposed_action = reschedule`. The class is code's here, not the model's: the pair to hold is this scenario and `assent-cannot-supersede-a-review`, where the same intent still stays queued.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "book an appointment, my kid has ear pain",
+      "expect": {
+        "status": "pending_review",
+        "escalations": 1,
+        "open_escalations": 1,
+        "runs_for_patient": 1,
+        "proposed_action": null
+      }
+    },
+    {
+      "message": "lets reschedule my ENT appointment",
+      "expect": {
+        "message_class": "conflicting",
+        "runs_for_patient": 2,
+        "appointments_created": 0,
+        "open_escalations": 0,
+        "reply_contains": ["closed your earlier request"]
+      }
+    }
+  ]
+}
