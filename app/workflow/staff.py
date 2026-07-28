@@ -33,6 +33,7 @@ transition impossible rather than merely discouraged.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -558,13 +559,107 @@ def _rediff_for(session: Session, *, document: PatientDocument, staff: User) -> 
     return updated
 
 
+#: The closed set of visit corrections. The sweep decides that a visit is over;
+#: only a human can say whether the patient turned up.
+VISIT_DECISIONS = ("completed", "missed")
+
+#: Which appointment statuses a visit correction may act on. Deliberately the
+#: two the sweep and this function produce, and nothing else: a `confirmed`
+#: appointment has not happened yet, and marking a future visit missed would
+#: record a no-show for an afternoon that has not arrived.
+_CORRECTABLE = (AppointmentStatus.COMPLETED, AppointmentStatus.MISSED)
+
+
+def apply_visit_decision(
+    session: Session,
+    *,
+    staff: User,
+    appointment_id: int,
+    action: str,
+) -> dict[str, Any]:
+    """Flip a swept appointment between ``completed`` and ``missed``.
+
+    PRD story 32a. The poll job's sweep can only see that an appointment's end
+    time has passed — whether the patient actually attended is not a fact the
+    clock knows, so the sweep's optimism is corrected here by someone who does.
+
+    **Audit only, no trace.** This is a staff action with no workflow run
+    behind it, and the trace/audit split says the timeline belongs to turns.
+    A visit correction is a fact about a row, so it lives in the row's history.
+
+    The missed-visit task is the derived row and it moves both ways: flipping
+    to ``missed`` opens one, flipping back closes it. Without the second half
+    a mis-click would leave a patient permanently listed as a no-show needing
+    follow-up, which is the derivation invariant's failure mode exactly.
+    """
+    _require_staff(staff)
+
+    chosen = str(action or "").strip().lower()
+    if chosen not in VISIT_DECISIONS:
+        raise ValidationFailed(
+            f"{action!r} is not a visit decision. Use one of: "
+            f"{', '.join(VISIT_DECISIONS)}."
+        )
+
+    appointment = session.get(Appointment, appointment_id)
+    if appointment is None:
+        raise RecordNotFound("Appointment", appointment_id)
+
+    if appointment.status not in _CORRECTABLE:
+        raise ValidationFailed(
+            f"Appointment {appointment_id} is {appointment.status.value}. Only a "
+            "visit that has already been swept can be marked completed or missed."
+        )
+
+    target = (
+        AppointmentStatus.MISSED if chosen == "missed" else AppointmentStatus.COMPLETED
+    )
+    previous = appointment.status
+    appointment.status = target
+    session.flush()
+
+    write_audit(
+        session,
+        action=f"appointment_marked_{target.value}",
+        entity_type="Appointment",
+        entity_id=appointment_id,
+        actor=staff,
+        metadata={"from": previous.value, "reference_code": appointment.reference_code},
+    )
+
+    # The missed-visit task, opened and closed by the same upsert. Passing an
+    # empty `missing` is how `close_when_empty_key` is told the subject is
+    # settled — the same mechanism the missing-documents task uses, rather than
+    # a second way of closing a task.
+    upsert_followup_task(
+        session,
+        patient_id=appointment.patient_id,
+        task_type=FollowUpTaskType.MISSED_VISIT,
+        appointment_id=appointment_id,
+        details={
+            "reference_code": appointment.reference_code,
+            "missing": ["Visit not attended"] if target is AppointmentStatus.MISSED else [],
+        },
+        close_when_empty_key="missing",
+        actor=staff,
+    )
+
+    return {
+        "appointment_id": appointment_id,
+        "status": target.value,
+        "previous_status": previous.value,
+    }
+
+
 __all__ = [
     "DOCUMENT_RESOLUTIONS",
+    "VISIT_DECISIONS",
     "REVIEW_OUTCOMES",
     "SAFETY_OUTCOMES",
     "STAFF_DECISIONS",
     "StaffDecision",
     "apply_staff_decision",
+    "apply_visit_decision",
     "resolve_document",
     "resolve_escalation",
 ]

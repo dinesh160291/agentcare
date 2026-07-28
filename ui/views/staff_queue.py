@@ -10,7 +10,7 @@ from __future__ import annotations
 import streamlit as st
 
 from ui import theme
-from ui.shell import client, fetch, header, token
+from ui.shell import act, client, fetch, header, token
 
 LIVE_STATES = ("in_progress", "pending_confirmation", "pending_review")
 CLOSED_STATES = ("completed", "cancelled", "rejected", "failed", "escalated")
@@ -86,3 +86,50 @@ else:
         theme.empty(f"No runs are {chosen.replace('_', ' ')}.")
     for run in runs:
         _row(run)
+
+
+# --- visits the poll job has closed ---------------------------------------
+# The sweep can only see that an end time has passed. Whether the patient
+# turned up is not a fact the clock has, so `completed` is a default and this
+# is where a person corrects it — the only thing that opens a missed-visit
+# follow-up. Both statuses are listed: marking a no-show must not remove the
+# row you would use to undo it.
+
+st.markdown("#### Visits closed by the system")
+
+visits = fetch(lambda: client().swept_visits(token()), default=[]) or []
+
+if not visits:
+    theme.empty("No visits have been swept yet. They appear once their end time passes.")
+
+for visit in visits:
+    missed = visit.get("status") == "missed"
+    st.markdown(
+        theme.card(
+            f'<div style="display:flex;gap:10px;align-items:baseline;">'
+            f'<span class="ac-num" style="font-weight:600;">'
+            f'{theme.esc(visit.get("reference_code"))}</span>'
+            f'{theme.tag(visit.get("status"))}'
+            f'<span class="ac-dim">patient {visit.get("patient_id")}</span></div>'
+            + theme.facts(
+                [
+                    ("Department", visit.get("department_name")),
+                    ("Doctor", visit.get("doctor_name")),
+                    ("When", (visit.get("start") or "")[:16].replace("T", " ") or None),
+                ]
+            )
+        ),
+        unsafe_allow_html=True,
+    )
+    label = "Mark attended" if missed else "Mark missed"
+    action = "completed" if missed else "missed"
+    if st.button(label, key=f"visit_{visit['appointment_id']}"):
+        ok, result = act(
+            lambda: client().correct_visit(
+                token(), visit["appointment_id"], action=action
+            )
+        )
+        if ok:
+            st.rerun()
+        else:
+            st.error(str(result))

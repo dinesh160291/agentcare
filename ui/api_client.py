@@ -225,6 +225,17 @@ class ApiClient:
     def flagged_documents(self, token: str) -> list[dict]:
         return self._request("GET", "/staff/documents/flagged", token=token)
 
+    def swept_visits(self, token: str) -> list[dict]:
+        return self._request("GET", "/staff/visits", token=token)
+
+    def correct_visit(self, token: str, appointment_id: int, *, action: str) -> dict:
+        return self._request(
+            "POST",
+            f"/staff/appointments/{appointment_id}/visit",
+            token=token,
+            json={"action": action},
+        )
+
     def decide(
         self,
         token: str,

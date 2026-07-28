@@ -51,6 +51,10 @@ PROBES: dict[tuple[str, str], dict] = {
         "kind": STAFF_ONLY,
         "json": {"action": "approve"},
     },
+    ("POST", "/staff/appointments/{appointment_id}/visit"): {
+        "kind": STAFF_ONLY,
+        "json": {"action": "missed"},
+    },
     ("POST", "/staff/escalations/{escalation_id}/resolve"): {
         "kind": STAFF_ONLY,
         "json": {"status": "acknowledged"},

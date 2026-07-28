@@ -521,3 +521,74 @@ class TestTheStaffReviewScreensDoTheirWork:
         rendered = _rendered(at)
         assert "inbound" in rendered and "outbound" in rendered
         assert "coordinator" in rendered
+
+
+class TestTheSweptVisitsSection:
+    """Phase 8's staff surface: the sweep's default, correctable by a person.
+
+    A screen that renders data it did not fetch scores as faked, so both tests
+    here change the world *behind the screen's back* and assert the screen
+    follows — the same discipline the rest of this file uses, and the only kind
+    of assertion that can tell a wired page from a decorated one.
+    """
+
+    def _sweep(self, seeded_db):
+        from datetime import timedelta
+
+        from app import clock
+        from app.models import Appointment
+        from app.scheduler import poll_once
+
+        end = seeded_db.get(Appointment, 1).slot.end_time
+        with clock.frozen_at(end + timedelta(minutes=1)):
+            poll_once()
+        seeded_db.expire_all()
+
+    def test_a_swept_visit_appears_only_after_the_sweep_runs(
+        self, wired_seeded, seeded_db
+    ):
+        before = _log_in(_app(), STAFF)
+        before.switch_page("views/staff_queue.py")
+        before.run()
+        assert "AC-000001" not in _rendered(before)
+
+        self._sweep(seeded_db)
+
+        after = _log_in(_app(), STAFF)
+        after.switch_page("views/staff_queue.py")
+        after.run()
+        assert "AC-000001" in _rendered(after)
+
+    def test_marking_it_missed_changes_the_row(self, wired_seeded, seeded_db):
+        """The button is not decoration: the assertion is on the database, from
+        a session the screen never touched."""
+        self._sweep(seeded_db)
+
+        staff = _log_in(_app(), STAFF)
+        staff.switch_page("views/staff_queue.py")
+        staff.run()
+        staff.button(key="visit_1").click().run()
+
+        assert not staff.exception
+        from app.models import Appointment, AppointmentStatus
+
+        seeded_db.expire_all()
+        assert seeded_db.get(Appointment, 1).status is AppointmentStatus.MISSED
+
+    def test_the_correction_is_reversible_from_the_same_list(
+        self, wired_seeded, seeded_db
+    ):
+        """A missed row that vanished from the list would make a mis-click
+        permanent. It stays, and the button flips to the other direction."""
+        self._sweep(seeded_db)
+
+        staff = _log_in(_app(), STAFF)
+        staff.switch_page("views/staff_queue.py")
+        staff.run()
+        staff.button(key="visit_1").click().run()
+        staff.button(key="visit_1").click().run()
+
+        from app.models import Appointment, AppointmentStatus
+
+        seeded_db.expire_all()
+        assert seeded_db.get(Appointment, 1).status is AppointmentStatus.COMPLETED

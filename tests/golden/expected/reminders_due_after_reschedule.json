@@ -3,7 +3,7 @@
     {
       "appointment_id": 1,
       "attempts": 0,
-      "message": "Reminder: appointment with Dr. Anita Rao on Thursday 06 August at 09:00.",
+      "message": "Reminder: appointment with Dr. Anita Rao on Thursday 06 August at 9:00 AM.",
       "patient_id": 1,
       "reminder_id": 1,
       "reminder_type": "appointment",

@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session  # noqa: E402
 from app import clock  # noqa: E402
 from app.auth.security import hash_password  # noqa: E402
 from app.config import get_settings  # noqa: E402
+from app.workflow.replies import clock_time  # noqa: E402
 from app.db import SessionLocal, create_all, drop_all, engine  # noqa: E402
 from app.models import (  # noqa: E402
     Appointment,
@@ -332,8 +333,13 @@ def seed(session: Session, *, anchor: date | None = None) -> None:
             scheduled_at=booked_slot.start_time - timedelta(hours=24),
             status=ReminderStatus.PENDING,
             message=(
+                # Through the one patient-facing formatter, like every other
+                # time this system says out loud. Phase 8 is what made this
+                # matter: the poll job now *delivers* this string, so a seeded
+                # "09:00" would reach a patient beside a chat saying 9:00 AM.
                 f"Reminder: appointment with {session.get(Doctor, booked_slot.doctor_id).name} "
-                f"on {booked_slot.start_time:%A %d %B at %H:%M}."
+                f"on {booked_slot.start_time:%A %d %B} at "
+                f"{clock_time(booked_slot.start_time)}."
             ),
         )
     )

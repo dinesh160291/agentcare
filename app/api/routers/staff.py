@@ -39,13 +39,16 @@ from app.api.schemas import (
     SlotRequest,
     StaffDecisionRequest,
     TraceEventOut,
+    VisitDecisionRequest,
 )
 from app.audit import write_audit
 from app.auth.dependencies import StaffUser
 from app.db import get_session
 from app.errors import RecordNotFound, ValidationFailed
 from app.models import (
+    Appointment,
     AppointmentSlot,
+    AppointmentStatus,
     AuditEvent,
     Department,
     Doctor,
@@ -56,13 +59,19 @@ from app.models import (
     WorkflowStatus,
 )
 from app.tools import (
+    describe_appointment,
     get_patient_context,
     list_departments,
     list_flagged_documents,
     list_open_escalations,
 )
 from app.trace import TraceWriter
-from app.workflow.staff import apply_staff_decision, resolve_document, resolve_escalation
+from app.workflow.staff import (
+    apply_staff_decision,
+    apply_visit_decision,
+    resolve_document,
+    resolve_escalation,
+)
 
 router = APIRouter(prefix="/staff", tags=["staff"])
 
@@ -163,6 +172,57 @@ def decide(
         "notification_id": decision.notification_id,
         "escalation_id": decision.escalation_id,
     }
+
+
+@router.get("/visits")
+def swept_visits(
+    staff: StaffUser,
+    session: DbSession,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
+    """Visits the sweep has closed, newest first, for staff to correct.
+
+    Both statuses on purpose: a screen that listed only ``completed`` would let
+    staff mark a no-show and then lose the row they had just acted on, with no
+    way back. ``missed`` is a correction, not a verdict, and the flip has to be
+    reversible from the same list it was made in.
+    """
+    rows = (
+        session.query(Appointment)
+        .filter(
+            Appointment.status.in_(
+                [AppointmentStatus.COMPLETED, AppointmentStatus.MISSED]
+            )
+        )
+        .order_by(Appointment.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [describe_appointment(session, row) for row in rows]
+
+
+@router.post("/appointments/{appointment_id}/visit")
+def correct_visit(
+    appointment_id: int,
+    payload: VisitDecisionRequest,
+    staff: StaffUser,
+    session: DbSession,
+) -> dict[str, Any]:
+    """Mark a swept appointment completed or missed. No model is involved.
+
+    The poll job's sweep can only see that an end time has passed; whether the
+    patient attended is not something a clock knows. This is the correction,
+    and it is the only thing that opens a missed-visit follow-up.
+
+    No ``TraceWriter`` here, deliberately: a visit correction has no workflow
+    run and therefore no turn, so it belongs in the audit ledger alone — the
+    same split the scheduler follows.
+    """
+    decision = apply_visit_decision(
+        session, staff=staff, appointment_id=appointment_id, action=payload.action
+    )
+    session.commit()
+    return decision
 
 
 @router.post("/escalations/{escalation_id}/resolve")

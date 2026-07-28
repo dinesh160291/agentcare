@@ -29,6 +29,10 @@ os.environ["UPLOAD_DIR"] = str(_TMP_ROOT / "uploads")
 os.environ["JWT_SECRET_KEY"] = "test-only-secret-not-a-real-credential"
 # A stray APP_TODAY in the developer's shell would silently freeze the suite.
 os.environ.pop("APP_TODAY", None)
+# The poll job is driven tick-by-tick from the scheduler tests. A background
+# thread ticking underneath the suite would deliver reminders no test asked
+# about and race every "nothing happened" assertion in the file.
+os.environ["SCHEDULER_ENABLED"] = "false"
 
 import pytest  # noqa: E402
 

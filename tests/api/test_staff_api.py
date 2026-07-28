@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from tests.api.conftest import auth_header
 
+from app.db import SessionLocal
 from app.models import (
     AppointmentSlot,
     AuditEvent,
@@ -593,3 +594,105 @@ class TestTheCapacityListingIsNotAOneWayDoor:
 
         seeded_db.expire_all()
         assert seeded_db.get(Department, 1).active is True
+
+
+class TestCorrectingASweptVisit:
+    """PRD 32a over HTTP: the sweep's default, corrected by a person.
+
+    The router owns the transaction here as everywhere else in this file, so
+    every assertion re-reads the row from a different session — a handler that
+    forgot to commit would otherwise return a cheerful 200 and change nothing.
+    """
+
+    def _swept(self, seeded_db):
+        """Run the sweep against a past-dated appointment, as the job would."""
+        from datetime import timedelta
+
+        from app import clock
+        from app.models import Appointment
+        from app.scheduler import poll_once
+
+        end = seeded_db.get(Appointment, 1).slot.end_time
+        with clock.frozen_at(end + timedelta(minutes=1)):
+            poll_once()
+        seeded_db.expire_all()
+
+    def test_staff_can_mark_a_swept_visit_missed(self, seeded_client, seeded_db):
+        self._swept(seeded_db)
+
+        response = seeded_client.post(
+            "/staff/appointments/1/visit",
+            json={"action": "missed"},
+            headers=auth_header(STAFF, "staff"),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "missed"
+
+        session = SessionLocal()
+        try:
+            from app.models import Appointment, AppointmentStatus
+
+            assert session.get(Appointment, 1).status is AppointmentStatus.MISSED
+        finally:
+            session.close()
+
+    def test_a_patient_is_refused(self, seeded_client, seeded_db):
+        self._swept(seeded_db)
+
+        response = seeded_client.post(
+            "/staff/appointments/1/visit",
+            json={"action": "missed"},
+            headers=auth_header(ASHA),
+        )
+
+        assert response.status_code == 403
+
+    def test_an_unswept_visit_is_refused(self, seeded_client, seeded_db):
+        """The appointment is still `confirmed` — it has not happened yet, and
+        a no-show recorded in advance is a claim about the future."""
+        response = seeded_client.post(
+            "/staff/appointments/1/visit",
+            json={"action": "missed"},
+            headers=auth_header(STAFF, "staff"),
+        )
+
+        assert response.status_code == 422
+
+    def test_the_action_vocabulary_is_closed_at_the_schema(
+        self, seeded_client, seeded_db
+    ):
+        """Refused before it reaches a session: a typo must never be one
+        `str.lower()` away from a state change."""
+        self._swept(seeded_db)
+
+        response = seeded_client.post(
+            "/staff/appointments/1/visit",
+            json={"action": "cancelled"},
+            headers=auth_header(STAFF, "staff"),
+        )
+
+        assert response.status_code == 422
+
+    def test_the_list_shows_swept_visits_and_hides_the_rest(
+        self, seeded_client, seeded_db
+    ):
+        """The list the correction is made from. It was broken — a wrong
+        argument count in the handler — and the whole API suite stayed green,
+        because nothing here read it; the Streamlit wiring test found it. So
+        this exists, and it asserts both directions."""
+        empty = seeded_client.get("/staff/visits", headers=auth_header(STAFF, "staff"))
+        assert empty.status_code == 200
+        assert empty.json() == []
+
+        self._swept(seeded_db)
+
+        listed = seeded_client.get("/staff/visits", headers=auth_header(STAFF, "staff"))
+        assert listed.status_code == 200
+        codes = [row["reference_code"] for row in listed.json()]
+        assert codes == ["AC-000001"]
+
+    def test_a_patient_cannot_read_the_visit_list(self, seeded_client, seeded_db):
+        self._swept(seeded_db)
+        response = seeded_client.get("/staff/visits", headers=auth_header(ASHA))
+        assert response.status_code == 403

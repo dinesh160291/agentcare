@@ -82,6 +82,16 @@ class Settings(BaseSettings):
 
     # --- Scheduler --------------------------------------------------------
     reminder_poll_seconds: int = 60
+    #: How many due reminders one tick will take. A bound on the *tick*, not on
+    #: the work: whatever is left is still due next time, and a tick that tried
+    #: to drain an unbounded backlog would hold its transactions open for as
+    #: long as the backlog took.
+    reminder_batch_size: int = 50
+    #: Whether the background poll thread runs at all. Off in tests, which call
+    #: ``poll_once`` directly — a thread ticking underneath a test would be a
+    #: source of writes nobody asked for, and every "nothing happened"
+    #: assertion would be racing it.
+    scheduler_enabled: bool = True
 
     # --- Observability ----------------------------------------------------
     log_level: str = "INFO"

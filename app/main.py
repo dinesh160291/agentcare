@@ -12,6 +12,8 @@ is the initialization step.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -27,6 +29,25 @@ from app.api.routers import (
 )
 from app.config import get_settings
 from app.db import create_all
+from app import scheduler
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ANN201, ARG001
+    """Start the poll job with the process, and stop it with the process.
+
+    In ``lifespan`` rather than at import: the scheduler is a *running
+    application's* concern, and a module that starts a background thread merely
+    by being imported would start one in every test collection and every
+    ``python -c "import app.main"``. ``scheduler.start()`` is itself a no-op
+    when configuration disables it, which is how the suite keeps the thread
+    off while still exercising this path.
+    """
+    scheduler.start()
+    try:
+        yield
+    finally:
+        scheduler.shutdown()
 
 
 def create_app() -> FastAPI:
@@ -34,7 +55,8 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="AgentCare",
-        version="0.6.0",
+        lifespan=lifespan,
+        version="0.8.0",
         description=(
             "Agentic patient administration — registration, routing, booking, "
             "documents, reminders, and follow-up. Administrative only: the "

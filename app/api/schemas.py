@@ -197,6 +197,15 @@ class StaffDecisionRequest(_Request):
     note: str = Field(default="", max_length=500)
 
 
+class VisitDecisionRequest(_Request):
+    """PRD 32a. The sweep says a visit is over; a human says whether it happened.
+
+    A closed pair, refused at the schema so a typo never reaches a session.
+    """
+
+    action: Literal["completed", "missed"]
+
+
 class EscalationResolution(_Request):
     """Safety escalations are acknowledged and resolved — never approved.
 
