@@ -701,5 +701,105 @@
         }
       }
     ]
+  },
+
+  {
+    "name": "a-selection-lands-at-in-progress",
+    "pins": "Round 6 item 1, and the worst of the session. A run at in_progress that had shown times could not hear an answer to them: the model called the reply a new request, the mapping correctly refused to supersede a run with itself, and the refusal answers with more times. Seven consecutive messages to one run each drew the identical availability list. Graded on the state machine, not the wording � a selection must leave the run holding a slot and waiting, on the run it started on.",
+    "patient": "asha.patient@example.invalid",
+    "turns": [
+      {
+        "message": "I need a cardiology appointment next week",
+        "expect": {"status": "pending_confirmation"}
+      },
+      {
+        "action": "decline",
+        "expect": {"status": "in_progress", "proposed_action": null}
+      },
+      {
+        "message": "option 2",
+        "expect": {
+          "same_run": true,
+          "status": "pending_confirmation",
+          "proposed_action": "book",
+          "appointments_created": 0,
+          "reply_excludes": ["Other times that are free"]
+        }
+      }
+    ]
+  },
+
+  {
+    "name": "a-booking-selection-is-not-a-new-request",
+    "pins": "Round 6 item 4. 'Lets book the 10am slot' was classified conflicting with steps [route, cancel] � a cancel plan for a message that says book, residue from two earlier cancel attempts in the history � and the supersede path built the replacement run from those steps unchecked. The run routed to General Medicine with low confidence and died in a staff queue. The message names a time the run had just offered, so it is a selection and never reaches classification at all.",
+    "patient": "rohan.patient@example.invalid",
+    "turns": [
+      {
+        "message": "I need a dermatology appointment next week",
+        "expect": {"status": "pending_confirmation"}
+      },
+      {
+        "action": "decline",
+        "expect": {"status": "in_progress"}
+      },
+      {
+        "message": "lets book the 1st slot",
+        "expect": {
+          "same_run": true,
+          "status": "pending_confirmation",
+          "proposed_action": "book",
+          "runs_for_patient": 1,
+          "reply_excludes": ["closed your earlier request", "member of staff"]
+        }
+      }
+    ]
+  },
+
+  {
+    "name": "cancelling-is-not-routed-to-a-department",
+    "pins": "Round 6 item 2. 'I want to cancel my appointment' was planned as [route, cancel] twice in one session; routing found no department words in a sentence that contains none, dropped to low confidence, and both runs stopped in front of staff for a patient who had a working cancel path. The department is a fact about the appointment being cancelled, never a question about the request, so validate_plan strips the routing step a model names anyway.",
+    "patient": "asha.patient@example.invalid",
+    "turns": [
+      {
+        "message": "I want to cancel my appointment",
+        "expect": {
+          "status": "pending_confirmation",
+          "plan": ["cancel"],
+          "proposed_action": "cancel",
+          "open_escalations": 0,
+          "reply_contains": ["AC-"]
+        }
+      },
+      {
+        "action": "confirm",
+        "expect": {
+          "status": "completed",
+          "appointment_status": {"1": "cancelled"},
+          "audit_actions": {"appointment_cancelled": 1}
+        }
+      }
+    ]
+  },
+
+  {
+    "name": "a-scare-does-not-consume-a-queued-request",
+    "pins": "Round 6 item 5. An unrelated safety trigger arriving over a run that was waiting for staff escalated *that* run � and escalated is terminal, so the queued ambiguous-routing request died without a human ever deciding it, while the surviving queue item's reason still described a department choice. The scare is not that request, so it gets a run of its own and the queue keeps both.",
+    "patient": "rohan.patient@example.invalid",
+    "turns": [
+      {
+        "message": "book an appointment, my kid has ear pain",
+        "expect": {"status": "pending_review", "escalation_kind": "low_confidence_routing"}
+      },
+      {
+        "message": "I have chest pain and my left arm hurts",
+        "expect": {
+          "same_run": false,
+          "status": "escalated",
+          "escalation_kind": "safety",
+          "runs_for_patient": 2,
+          "open_escalations": 2
+        }
+      }
+    ]
   }
 ]

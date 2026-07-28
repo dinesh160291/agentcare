@@ -374,6 +374,18 @@ class Toolbelt:
         """
         return self._list_other_slots(phrase)
 
+    def hold_offered_slot(self, slot_id: int) -> dict:
+        """Hold a slot the patient chose from a list this run showed them.
+
+        The code-driven twin of ``propose_another_slot``, and the same function
+        underneath — so a selection read by the orchestrator passes exactly the
+        checks a selection read by the model passes: the id must be in this
+        run's offered set, and the slot must still be free at the moment it is
+        held. Two paths to a proposal with two sets of rules would be one path
+        with rules and one without.
+        """
+        return self._propose_another_slot(slot_id)
+
     def _list_other_slots(self, phrase: str = "") -> dict:
         """Free times other than the one being held. Read-only, always.
 

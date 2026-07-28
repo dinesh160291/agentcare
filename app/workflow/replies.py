@@ -168,6 +168,36 @@ def was_offered(run: WorkflowRun, slot_id: int) -> bool:
     return slot_id in offered_slot_ids(run)
 
 
+def shortlist_slot_ids(run: WorkflowRun) -> list[int]:
+    """The last numbered list, in the order the patient read it."""
+    return list((run.state or {}).get("shortlist_slot_ids") or [])
+
+
+def record_shortlist(run: WorkflowRun, slots: Iterable[dict[str, Any]]) -> None:
+    """Remember the numbering, not just the membership.
+
+    :func:`record_offered` is a *union over the run* and deliberately so: "the
+    first one you showed me" arrives three exchanges later and a set that shrank
+    would refuse it. That makes it the wrong thing to answer "option 2" with —
+    a union has no second element, only a twentieth-of-twenty.
+
+    So the ordered list is kept beside it, replaced each time a list is drawn.
+    Rendering and recording are one step here for the same reason they are in
+    :func:`render_appointment_choice`: a patient answering "2" is answering the
+    list they were shown, and if the list is not code's the answer means
+    nothing. The union stays the authority on *whether* a slot may be proposed;
+    this only decides *which* slot a number refers to.
+
+    Replaced rather than accumulated, because a number always refers to the most
+    recent listing — the patient is reading the message in front of them.
+    """
+    state = dict(run.state or {})
+    state["shortlist_slot_ids"] = [
+        int(slot["slot_id"]) for slot in slots or [] if slot.get("slot_id") is not None
+    ]
+    run.state = state
+
+
 # --- rendering ------------------------------------------------------------
 
 
@@ -291,6 +321,7 @@ def render_proposal(session: Session, run: WorkflowRun, slots: Sequence[dict]) -
     if not options:
         return ""
     record_offered(run, shortlist)
+    record_shortlist(run, shortlist)
     return (
         "Here are the earliest times I can offer:\n"
         f"{options}\n\n"
@@ -317,6 +348,7 @@ def render_alternatives(
             + render_reask(session, run)
         )
     record_offered(run, shortlist)
+    record_shortlist(run, shortlist)
     return (
         f"Other times that are free:\n{options}\n\n" + render_reask(session, run)
     )
@@ -670,6 +702,8 @@ __all__ = [
     "offered_slot_ids",
     "promises_action",
     "record_offered",
+    "record_shortlist",
+    "shortlist_slot_ids",
     "render_alternatives",
     "render_appointment_choice",
     "render_change_proposal",

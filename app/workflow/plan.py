@@ -109,6 +109,25 @@ def validate_plan(proposed: object) -> list[PlanStep]:
     closed: set[PlanStep] = set()
     for step in steps:
         closed |= STEP_CLOSURE[step]
+
+    # A verb that acts on an existing appointment carries no routing step, and
+    # the closures above already say so — ``RESCHEDULE`` and ``CANCEL`` close
+    # over nothing that needs a department, because the department is a fact
+    # about the appointment being changed rather than a question about the
+    # request. What the closures cannot do is *remove* a step the model named
+    # outright, and that is the whole failure: "I want to cancel my
+    # appointment" came back as ``[route, cancel]`` twice in one live session,
+    # routing found no department words in a sentence that contains none, and
+    # both runs queued for a staff decision on a question the appointment had
+    # already answered. The patient had two live appointments and a working
+    # cancel path that was never reached.
+    #
+    # Stripped here rather than refused, because the plan is otherwise right:
+    # the model identified the verb correctly and only dragged a step along
+    # with it. Refusing would spend a re-plan to be told the same thing.
+    if closed & {PlanStep.RESCHEDULE, PlanStep.CANCEL}:
+        closed.discard(PlanStep.ROUTE)
+
     return _order(closed)
 
 

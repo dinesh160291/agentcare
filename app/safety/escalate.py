@@ -1,6 +1,6 @@
 """Turning a safety verdict into state a human owns.
 
-Three rules live here, and each one exists because the obvious implementation
+Four rules live here, and each one exists because the obvious implementation
 gets it wrong.
 
 **The run is born escalated when there is nothing else to key to.** An
@@ -18,6 +18,12 @@ things for a human to reconcile, for one person in trouble. So before creating
 anything, this module looks for the escalated run this session already
 produced, and attaches to it. Five triggers become one queue item with an
 occurrence count of five, each trigger separately audited.
+
+**A request waiting on a human is not the one to escalate.** Attaching to the
+active run is right while the system holds it, and wrong the moment staff do: a
+``pending_review`` run is a queue item, ``escalated`` is terminal, and folding a
+new scare into it destroys a request a person was about to decide on. That one
+state gets a run of its own.
 
 **A withdrawal cannot close it.** That is enforced by the state machine —
 ``escalated`` is terminal for automation — but the reason belongs here: the
@@ -111,6 +117,32 @@ def escalate(
         f"Safety screen ({verdict.source}) matched {verdict.rule!r}: "
         f"{category.value.replace('_', ' ')}."
     )
+
+    if run is not None and run.status is WorkflowStatus.PENDING_REVIEW:
+        # A run in front of staff is a queue item as well as a conversation, and
+        # escalating it consumes both. Live: "my kid has ear pain" was routed
+        # ambiguously and queued for a human; two messages later an unrelated
+        # scare arrived, the active run was the queued one, and it went
+        # `pending_review -> escalated` — which is terminal, so the ear-pain
+        # request died without a staff decision ever being made on it and
+        # without the patient being told.
+        #
+        # The scare is not that request, so it does not get that request's row.
+        # Handing it a run of its own leaves the queue item where a human left
+        # it, and the escalated run says what it is about. Only `pending_review`
+        # is spared: at `in_progress` or `pending_confirmation` the system holds
+        # the run, nothing is waiting on a person, and folding the scare into
+        # the conversation it interrupted is the right reading.
+        writer.guard_verdict(
+            "escalation_target",
+            passed=False,
+            detail={
+                "run_id": run.id,
+                "status": run.status.value,
+                "problem": "the active run is waiting for staff; it is not this one",
+            },
+        )
+        run = None
 
     if run is None:
         run = _open_escalated_run(

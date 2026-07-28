@@ -48,6 +48,7 @@ from app.models import (
 from app.tools.departments import resolve_department
 from app.tools.tasks import close_escalations_for_run
 from app.trace import TraceWriter
+from app.workflow.confirmation import normalise
 from app.workflow.plan import CANONICAL_ORDER, append_step
 from app.workflow.state_machine import transition
 
@@ -320,6 +321,11 @@ WITHDRAWAL_CUES: tuple[str, ...] = (
     "cancel the request",
     "cancel my request",
     "cancel this request",
+    "close that request",
+    "close the request",
+    "close my request",
+    "close this request",
+    "close the previous request",
     "withdraw",
     "call the whole thing off",
     "changed my mind",
@@ -330,6 +336,31 @@ def says_withdrawal(text: str) -> bool:
     """Whether the message actually contains a withdrawal cue."""
     lowered = (text or "").lower()
     return any(cue in lowered for cue in WITHDRAWAL_CUES)
+
+
+def says_only_withdrawal(text: str) -> bool:
+    """Whether the message is a withdrawal cue and *nothing else*.
+
+    :func:`says_withdrawal` asks whether a withdrawal may be applied — a
+    necessary condition on a class the model proposed. This asks the stronger
+    question of whether code may apply one **on its own**, and the two have to
+    be different tests because containment is not a safe basis for the
+    consequence that destroys the patient's work. "I changed my mind, I'd like
+    Tuesday instead" contains a cue and is a refinement; acting on the cue there
+    would delete a live request and tell the patient it was their idea.
+
+    So the rule is the confirmation reader's rule, for the confirmation
+    reader's reason: **exact match after normalisation, never containment.**
+    A message that is only the phrase is only the act. Anything with content
+    around it goes back to the model, and costs at most one more message.
+
+    The live case is "close the previous request", sent to a run that had been
+    answering it with availability lists for six turns. The Coordinator did
+    call it a withdrawal — and then called it something else in the same turn,
+    which is the lottery this replaces rather than argues with.
+    """
+    token = normalise(text)
+    return bool(token) and token in {normalise(cue) for cue in WITHDRAWAL_CUES}
 
 
 #: Things this system owns. A message naming one of them is asking about this
@@ -777,6 +808,7 @@ __all__ = [
     "mentions_domain_subject",
     "names_change_verb",
     "primary_intent",
+    "says_only_withdrawal",
     "says_withdrawal",
     "validate_class",
 ]

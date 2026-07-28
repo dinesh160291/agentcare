@@ -38,7 +38,7 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
-from app.providers.base import text_response
+from app.providers.base import function_call_response, text_response
 from app.providers.mock import MockLlm
 from app.workflow.replies import clock_time
 from app.orchestrator import run_workflow
@@ -454,3 +454,74 @@ class TestARescheduleRunKnowsItsOwnDepartment:
 
         assert offered, "nothing was offered; the search never ran"
         assert departments == {appointment.department_id}
+
+
+class RoutingCancelPlannerLlm(MockLlm):
+    """Plans ``[route, cancel]``, the way ``gpt-4o-mini`` planned it twice.
+
+    The mock plans ``[cancel]`` and always has, so the whole of item 2 is
+    invisible to it: the closure never adds routing, and only a model naming the
+    step outright can put it there. This stub is what that model looked like.
+    """
+
+    model: str = "routing-cancel-planner-stub"
+
+    def _plan(self, llm_request, done, text):  # noqa: ANN001
+        from app.providers.base import latest_tool_result
+
+        if latest_tool_result(llm_request, "submit_plan") is None and "cancel" in text.lower():
+            return function_call_response(
+                "submit_plan", {"steps": ["route", "cancel"]}
+            )
+        return super()._plan(llm_request, done, text)
+
+
+class TestACancellationIsNotRoutedToADepartment:
+    """Round 6, item 2 — the plan that dead-ended in a staff queue.
+
+    Live, twice in one session: "I want to cancel my appointment" was planned as
+    ``[route, cancel]``. Routing then looked for department words in a sentence
+    that contains none, dropped to low confidence, and both runs stopped in
+    front of staff — for a patient who had two live appointments and a cancel
+    path that worked and was never reached.
+
+    The department was never a question. It is a fact about the appointment
+    being cancelled, which is exactly why ``CANCEL``'s closure has never
+    included routing. What the closure could not do is *remove* a step the model
+    named itself, and that is now ``validate_plan``'s job.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _plans_a_route(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: RoutingCancelPlannerLlm()
+        )
+
+    def test_the_run_reaches_a_proposal_rather_than_a_queue(self, patient):
+        result = turn(patient, "I want to cancel my appointment", "s-noroute-1")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert result.plan == ["cancel"]
+
+    def test_the_proposal_names_the_appointment(self, patient):
+        result = turn(patient, "I want to cancel my appointment", "s-noroute-2")
+
+        assert "AC-000001" in result.reply
+        assert "Cardiology" in result.reply
+
+    def test_it_still_cancels_on_confirmation(self, patient, seeded_db):
+        turn(patient, "I want to cancel my appointment", "s-noroute-3")
+        turn(patient, "yes", "s-noroute-3")
+
+        seeded_db.expire_all()
+        assert (
+            seeded_db.get(Appointment, SEEDED_APPOINTMENT_ID).status
+            is AppointmentStatus.CANCELLED
+        )
+
+    def test_no_routing_agent_is_ever_asked(self, patient):
+        """The mechanism. Routing did not merely succeed differently — it never
+        ran, because the step is not in the plan for it to run from."""
+        result = turn(patient, "I want to cancel my appointment", "s-noroute-4")
+
+        assert "route" not in (result.steps_run or [])

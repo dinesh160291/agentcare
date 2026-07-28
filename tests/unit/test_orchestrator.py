@@ -33,7 +33,7 @@ from app import clock
 from app.db import SessionLocal
 from app.models import (
     Appointment,
-    AppointmentSlot,
+    AppointmentSlot,  # noqa: F401  (slot rows are read directly by the round-6 tests)
     AppointmentStatus,
     AuditEvent,
     DocumentStatus,
@@ -42,6 +42,7 @@ from app.models import (
     EscalationStatus,
     MessageClass,
     PatientDocument,
+    ProposedAction,
     Reminder,
     SlotStatus,
     TraceAuthor,
@@ -2275,3 +2276,440 @@ class TestClarifyingIntoAnotherDepartment:
             assert run.state["department_name"] == "General Medicine"
         finally:
             session.close()
+
+
+class TestASelectionAtInProgressReEntersTheProposal:
+    """Round 6, item 1 — the state that could not hear an answer.
+
+    A run at ``pending_confirmation`` holds a slot, and "lets book the 4pm one"
+    moves the offer. A run at ``in_progress`` holds nothing, and there the same
+    sentence had nowhere to land: the Coordinator called it a new request, the
+    mapping correctly refused to supersede a run with itself, and the refusal's
+    consequence is to answer with *more times*. So the reply asked for a time, a
+    time arrived, and the reply asked for a time again.
+
+    Live, run 4: seven consecutive messages — "okay lets book at 3pm then",
+    "lets do 3pm and book it", "option 2", "3pm will work for me", "2pm will
+    work for me", "confirm 2pm slot", "close the previous request" — each drew
+    the identical "Other times that are free... Nothing is booked yet. Tell me a
+    time" template. Run 9 died the same way in the same session. A patient
+    factually could not complete a booking from that state by any wording.
+
+    The state is reached here by declining a proposal, which is how run 4
+    reached it — a booking conflict cleared the proposal. Nothing below books
+    anything: the confirmation gate is untouched, and that gate is what makes
+    reading a selection this freely the cheap direction.
+    """
+
+    def _offered_and_waiting(self, patient, session_id: str) -> int:
+        """A run at ``in_progress`` that has already shown the patient times."""
+        first = turn(patient, BOOKING, session_id)
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        declined = asyncio.run(apply_patient_action(patient, "decline", session_id))
+        assert declined.status == WorkflowStatus.IN_PROGRESS.value
+        return declined.run_id
+
+    def _shortlist_times(self, run_id: int) -> list[str]:
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            return [
+                clock_time(session.get(AppointmentSlot, slot_id).start_time)
+                for slot_id in run.state["shortlist_slot_ids"]
+            ]
+        finally:
+            session.close()
+
+    def test_a_named_time_is_held_rather_than_re_listed(self, patient):
+        run_id = self._offered_and_waiting(patient, "s-select-1")
+        when = self._shortlist_times(run_id)[1]
+
+        result = turn(patient, f"okay lets book at {when.lower()} then", "s-select-1")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert result.run_id == run_id, "the run was replaced instead of advanced"
+        assert "Other times that are free" not in result.reply
+
+    def test_the_slot_held_is_the_one_the_patient_named(self, patient):
+        run_id = self._offered_and_waiting(patient, "s-select-2")
+        when = self._shortlist_times(run_id)[2]
+
+        turn(patient, f"{when.lower()} will work for me", "s-select-2")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            held = session.get(AppointmentSlot, run.proposed_slot_id)
+            assert clock_time(held.start_time) == when
+        finally:
+            session.close()
+
+    def test_a_list_number_is_answerable(self, patient):
+        """"option 2" means something only against a list somebody recorded,
+        which is why ``render_proposal`` writes the numbering down in the same
+        breath as drawing it — ``offered_slot_ids`` is a union over the whole
+        run and a union has no second element."""
+        run_id = self._offered_and_waiting(patient, "s-select-3")
+        expected = self._shortlist_times(run_id)[1]
+
+        result = turn(patient, "option 2", "s-select-3")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            held = session.get(AppointmentSlot, run.proposed_slot_id)
+            assert clock_time(held.start_time) == expected
+        finally:
+            session.close()
+
+    def test_the_xpm_slot_phrasing_lands(self, patient):
+        """Run 9's last message, on run 9's shape."""
+        run_id = self._offered_and_waiting(patient, "s-select-4")
+        when = self._shortlist_times(run_id)[0]
+
+        result = turn(patient, f"lets book the {when.lower()} slot", "s-select-4")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert result.run_id == run_id
+
+    def test_no_model_is_asked_what_a_selection_meant(self, patient):
+        """The mechanism, not only the outcome. Matching a number against a
+        list this run rendered needs no judgement, and a turn that needs no
+        model should not spend one — the same argument the listing questions
+        use for running before the Coordinator rather than after it."""
+        self._offered_and_waiting(patient, "s-select-5")
+
+        result = turn(patient, "option 1", "s-select-5")
+
+        session = fresh()
+        try:
+            agents = {
+                event.agent_name
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.LLM_REQUEST
+            }
+        finally:
+            session.close()
+        assert "coordinator" not in agents
+        assert "appointment" not in agents
+
+    def test_the_read_is_traced(self, patient):
+        """A selection nobody can see is a selection nobody can review."""
+        self._offered_and_waiting(patient, "s-select-6")
+        taken = turn(patient, "option 1", "s-select-6")
+
+        session = fresh()
+        try:
+            assert _guard(session, taken.turn_id, "slot_selection")["passed"] is True
+        finally:
+            session.close()
+
+    def test_a_question_is_not_a_selection(self, patient):
+        """The negative control. "What documents do I need" names no time and
+        no position, so it goes where it always went — and if this ever starts
+        holding slots, the reader has become a trap."""
+        run_id = self._offered_and_waiting(patient, "s-select-7")
+
+        result = turn(patient, "what documents do I need to bring?", "s-select-7")
+
+        assert result.status != WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            assert session.get(WorkflowRun, run_id).proposed_slot_id is None
+        finally:
+            session.close()
+
+    def test_a_withdrawal_is_honoured_rather_than_answered_with_times(self, patient):
+        """"close the previous request" was run 4's seventh message, and it drew
+        the same availability list as the six before it — a patient asking to be
+        let go, answered with more of what they were trying to leave.
+
+        Read exactly, never by containment: the message has to *be* the phrase.
+        """
+        run_id = self._offered_and_waiting(patient, "s-select-8")
+
+        result = turn(patient, "close the previous request", "s-select-8")
+
+        assert "Other times that are free" not in result.reply
+        assert result.status == WorkflowStatus.CANCELLED.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            assert run.status is WorkflowStatus.CANCELLED
+            assert run.proposed_slot_id is None
+        finally:
+            session.close()
+
+    def test_a_cue_inside_a_longer_sentence_does_not_close_the_run(self, patient):
+        """The other direction of the same rule, and the expensive one: "I
+        changed my mind, I'd like something later" contains a cue and is a
+        refinement. Applying it there would destroy a live request and tell the
+        patient it was their idea."""
+        run_id = self._offered_and_waiting(patient, "s-select-9")
+
+        turn(patient, "I changed my mind, can I have something later", "s-select-9")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            assert run.status is not WorkflowStatus.CANCELLED
+        finally:
+            session.close()
+
+    def test_the_confirmation_gate_is_untouched(self, patient):
+        """Nothing here books. A selection holds a time and asks; only an exact
+        token or the button commits it."""
+        run_id = self._offered_and_waiting(patient, "s-select-10")
+        turn(patient, "option 1", "s-select-10")
+
+        session = fresh()
+        try:
+            assert appointments_for(session, run_id) == []
+        finally:
+            session.close()
+
+
+class ChangePlanningLlm(MockLlm):
+    """The mock, classifying the way ``gpt-4o-mini`` classified two messages:
+    a new request, with steps naming a verb the patient did not.
+
+    It exists because the understudy reproduces neither failure. Asked about
+    "lets book the 10am slot" the mock classifies sensibly; asked for the steps
+    behind "lets reschedule my Ophthalmology appointment" it returns
+    ``[reschedule, follow_up]`` and always has. The live model returned
+    ``[route, cancel]`` for the first and ``[route, book, ...]`` for the second,
+    and both went into a fresh run unchecked — so a guard falsified only against
+    the mock is falsified against a provider that never makes the mistake.
+    """
+
+    model: str = "change-planning-stub"
+
+    def _classify(self, llm_request, available, done, text):  # noqa: ANN001
+        if latest_tool_result(llm_request, "classify_message") is None:
+            return function_call_response(
+                "classify_message",
+                {"message_class": "conflicting", "incoming_steps": ["route", "cancel"]},
+            )
+        return super()._classify(llm_request, available, done, text)
+
+
+class TestASupersedeGetsThePlanCheckAFirstMessageGets:
+    """Round 6, items 3 and 4 — the other door into ``create_run``.
+
+    ``_corrected_change_plan`` guards the plan of a run born from a first
+    message. A run born from a *supersede* was built straight from the model's
+    ``incoming_steps``, and that gap produced the session's two worst runs:
+
+    * run 6 — "lets reschedule my Ophthalmology appointment", arriving over a
+      live run, became a run whose plan said ``book``. The Appointment agent
+      then correctly proposed a *reschedule* under that ``book`` step, and the
+      mismatch is what let the step re-enter after the commit;
+    * run 10 — "lets book the 10am slot" became a ``[route, cancel]`` run that
+      routed to General Medicine with low confidence and died in a staff queue.
+
+    A correction that runs on one door and not the other is not a correction; it
+    is a coin flip on which door the message came through.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _misplan(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: ChangePlanningLlm()
+        )
+
+    def test_a_stated_reschedule_supersedes_into_a_reschedule_plan(self, patient):
+        turn(patient, BOOKING, "s-supersede-1")
+        result = turn(
+            patient, "lets reschedule my Ophthalmology appointment", "s-supersede-1"
+        )
+
+        session = fresh()
+        try:
+            plan = session.get(WorkflowRun, result.run_id).plan
+        finally:
+            session.close()
+        assert "reschedule" in plan
+        assert "book" not in plan
+
+    def test_the_replacement_run_never_routes_a_change(self, patient):
+        """Item 2's rule, reaching the run item 3 creates."""
+        turn(patient, BOOKING, "s-supersede-2")
+        result = turn(
+            patient, "lets reschedule my Ophthalmology appointment", "s-supersede-2"
+        )
+
+        session = fresh()
+        try:
+            assert "route" not in session.get(WorkflowRun, result.run_id).plan
+        finally:
+            session.close()
+
+    def test_a_booking_selection_is_not_superseded_into_a_cancel(self, patient):
+        """Run 9 to run 10, on run 9's shape: a routed run at ``in_progress``
+        that has shown times, and a message naming one of them. It never reaches
+        classification — which is the point, because the class that came back
+        was the wrong one and nothing downstream could tell."""
+        first = turn(patient, BOOKING, "s-supersede-3")
+        declined = asyncio.run(apply_patient_action(patient, "decline", "s-supersede-3"))
+        run_id = declined.run_id
+        assert first.run_id == run_id
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            slot_id = run.state["shortlist_slot_ids"][0]
+            when = clock_time(session.get(AppointmentSlot, slot_id).start_time)
+        finally:
+            session.close()
+
+        result = turn(patient, f"lets book the {when.lower()} slot", "s-supersede-3")
+
+        assert result.run_id == run_id, "a selection replaced the run it was answering"
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            assert run.status is WorkflowStatus.PENDING_CONFIRMATION
+            assert "cancel" not in (run.plan or [])
+        finally:
+            session.close()
+
+
+class BookPlanReschedulingLlm(MockLlm):
+    """Proposes a *reschedule* while the plan step is ``book``.
+
+    Run 6's actual shape, and reachable only with a provider that reads the
+    request text under a step that does not match it. The mock cannot: its
+    Appointment agent dispatches on ``task["step"]``, so a ``book`` step always
+    books. The live model dispatches on the sentence, and the appointment
+    toolset hands it ``propose_reschedule`` whatever the step says — which is
+    how a booking plan came to hold a reschedule proposal.
+
+    ``committed`` is stripped from the task for the same reason
+    :class:`ReproposingLlm` strips it: a hint is advisory, the live model
+    ignored it, and a stub that honours it cannot reproduce a defect that
+    depends on it being ignored.
+    """
+
+    model: str = "book-plan-rescheduling-stub"
+
+    def _appointment(self, llm_request, done, task):  # noqa: ANN001
+        if "list_my_appointments" not in done:
+            return function_call_response("list_my_appointments", {})
+        listed = latest_tool_result(llm_request, "list_my_appointments")
+        appointments = (listed.payload.get("appointments") if listed else None) or []
+        if not appointments:
+            return super()._appointment(llm_request, done, task)
+        return self._change_appointment(
+            llm_request,
+            done,
+            {
+                **{key: value for key, value in task.items() if key != "committed"},
+                "appointments": appointments,
+            },
+            "reschedule",
+        )
+
+
+class TestACommitSettlesTheStepWhateverThePlanCallsIt:
+    """Round 6, item 3 — a run whose plan verb and committed verb disagree.
+
+    Run 6's trace, in order: ``reschedule_appointment`` committed at seq 5; the
+    run transitioned ``pending_confirmation -> in_progress`` at seq 7, so the
+    transition was never the problem; and then the ``book`` step, still
+    incomplete and not matching ``committed_action == "reschedule"``, was
+    dispatched again. It proposed a second time at seq 22 and the run went back
+    to ``pending_confirmation`` at seq 24. The receipt for the commit that *had*
+    happened was rendered beside a fresh proposal card.
+
+    The Decline pressed next was therefore applicable — there really was an open
+    proposal — and answered "That's fine, nothing has been booked" about an
+    appointment that had already moved.
+
+    One run commits at most one appointment action, because ``validate_plan``
+    refuses a plan naming two. So a committed verb settles this run's single
+    appointment step whatever the plan happens to call it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _misverb(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: BookPlanReschedulingLlm()
+        )
+
+    def _proposed_under_a_book_plan(self, patient, session_id: str):
+        """An ordinary booking request, answered with a reschedule proposal.
+
+        No supersede is involved: the plan is the one a first message produces,
+        ``names_change_verb`` finds no change verb to correct it with, and the
+        specialist proposes the other verb anyway. That is the residue the
+        supersede fix cannot reach, and it is what this guard is for."""
+        result = turn(patient, BOOKING, session_id)
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert "book" in run.plan and "reschedule" not in run.plan
+            assert run.proposed_action is ProposedAction.RESCHEDULE
+        finally:
+            session.close()
+        return result
+
+    def test_a_chat_yes_leaves_no_open_proposal(self, patient):
+        proposed = self._proposed_under_a_book_plan(patient, "s-mismatch-1")
+
+        result = turn(patient, "yes", "s-mismatch-1")
+
+        assert result.status != WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, proposed.run_id)
+            assert run.proposed_action is None
+            assert run.proposed_slot_id is None
+        finally:
+            session.close()
+
+    def test_the_commit_is_not_followed_by_a_second_proposal(self, patient):
+        self._proposed_under_a_book_plan(patient, "s-mismatch-2")
+
+        turn(patient, "yes", "s-mismatch-2")
+
+        session = fresh()
+        try:
+            assert _audit_count(session, "appointment_rescheduled") == 1
+        finally:
+            session.close()
+
+    def test_a_decline_afterwards_does_not_claim_nothing_happened(self, patient):
+        """The sentence the patient was actually shown. "Nothing has been
+        booked" was false — the appointment had moved — and it was reachable
+        only because the run had been put back up for confirmation."""
+        self._proposed_under_a_book_plan(patient, "s-mismatch-3")
+        turn(patient, "yes", "s-mismatch-3")
+
+        declined = asyncio.run(apply_patient_action(patient, "decline", "s-mismatch-3"))
+
+        assert "nothing has been booked" not in declined.reply.lower()
+        assert "nothing waiting for your confirmation" in declined.reply.lower()
+
+    def test_the_step_settles_from_the_commit_and_says_so(self, patient):
+        """Verify-by-revert's target: the validation row naming both verbs. If
+        the guard ever narrows back to an exact match this is what disappears,
+        and the assertions above would go on passing for a while first."""
+        self._proposed_under_a_book_plan(patient, "s-mismatch-4")
+
+        result = turn(patient, "yes", "s-mismatch-4")
+
+        session = fresh()
+        try:
+            settled = _validations(session, result.turn_id, "step_already_committed")
+            assert len(settled) == 1
+            detail = settled[0].payload["detail"]
+        finally:
+            session.close()
+        assert detail["committed"] == "reschedule"
+        assert detail["step"] != detail["committed"], (
+            "this test is only meaningful while the plan and the commit disagree"
+        )

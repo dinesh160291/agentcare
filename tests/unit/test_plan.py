@@ -322,6 +322,44 @@ class TestTheOtherTwoAppointmentVerbs:
         assert validate_plan(["follow_up", "reschedule"]) == [RESCHEDULE, FOLLOW_UP]
 
 
+class TestRoutingIsStrippedFromAChangePlan:
+    """A verb acting on an existing appointment never carries a routing step.
+
+    The closures already said so; what they could not do is *remove* a step the
+    model named outright. Live, "I want to cancel my appointment" came back as
+    ``[route, cancel]`` **twice in one session** — routing then found no
+    department words in a sentence that contains none, dropped to low
+    confidence, and queued both runs for a staff decision on a question the
+    appointment being cancelled had already answered. The patient had two live
+    appointments and a working cancel path that was never reached.
+
+    Stripped rather than refused: the model got the verb right and only dragged
+    a companion along, so refusing would spend a re-plan to be told the same
+    thing.
+    """
+
+    def test_route_plus_cancel_yields_cancel_alone(self):
+        assert validate_plan(["route", "cancel"]) == [CANCEL]
+
+    def test_route_plus_reschedule_keeps_only_the_reschedule_closure(self):
+        assert validate_plan(["route", "reschedule"]) == [RESCHEDULE, FOLLOW_UP]
+
+    def test_the_order_the_model_names_them_in_does_not_matter(self):
+        assert validate_plan(["cancel", "route"]) == [CANCEL]
+
+    def test_a_booking_keeps_its_routing(self):
+        """The negative control, and the reason the rule is keyed to the verb
+        rather than applied to every plan: a new appointment genuinely needs a
+        department, and this must not touch it."""
+        assert validate_plan(["route", "book"]) == [ROUTE, BOOK, DOCUMENTS, FOLLOW_UP]
+
+    def test_a_routing_only_plan_is_untouched(self):
+        assert validate_plan(["route"]) == [ROUTE]
+
+    def test_routing_survives_beside_a_step_that_is_not_a_change_verb(self):
+        assert validate_plan(["route", "documents"]) == [ROUTE, DOCUMENTS]
+
+
 class TestOnlyOneAppointmentVerbPerPlan:
     """A plan naming two verbs has no answer to "what is being confirmed?".
 

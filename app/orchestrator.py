@@ -42,6 +42,8 @@ from app.db import SessionLocal
 from app.errors import BudgetExceeded, ProviderError, ValidationFailed
 from app.models import (
     APPOINTMENT_VERBS,
+    AppointmentSlot,
+    CancellationReason,
     EscalationKind,
     MessageClass,
     PatientProfile,
@@ -62,6 +64,7 @@ from app.tools import (
     list_patient_appointments,
     reschedule_appointment,
 )
+from app.tools.tasks import close_escalations_for_run
 from app.trace import TraceWriter
 from app.workflow.confirmation import ConfirmationAnswer, read_confirmation
 from app.workflow.mapping import (
@@ -70,8 +73,10 @@ from app.workflow.mapping import (
     mentions_domain_subject,
     names_change_verb,
     primary_intent,
+    says_only_withdrawal,
     validate_class,
 )
+from app.workflow.selection import Offer, read_selection
 from app.workflow.queries import QueryKind, answer_query, detect_query
 from app.workflow.plan import (
     advance_plan,
@@ -82,9 +87,11 @@ from app.workflow.plan import (
 )
 from app.workflow.replies import (
     claims_availability,
+    offered_slot_ids,
     promises_action,
     render_outstanding,
     listed_appointment_ids,
+    shortlist_slot_ids,
     render_alternatives,
     render_appointment_choice,
     render_change_proposal,
@@ -305,6 +312,134 @@ def _decline_proposal(
     )
     return TurnResult(
         reply=DECLINED_REPLY,
+        author=TraceAuthor.TEMPLATE,
+        run_id=run.id,
+        status=run.status.value,
+        message_class=MessageClass.CONTINUATION,
+        **base,
+    )
+
+
+def _offers(session: Session, slot_ids: list[int]) -> list[Offer]:
+    """Slot ids as (id, start) pairs, in the order given, skipping any gone."""
+    if not slot_ids:
+        return []
+    rows = {
+        row.id: row
+        for row in session.query(AppointmentSlot)
+        .filter(AppointmentSlot.id.in_(slot_ids))
+        .all()
+    }
+    return [
+        Offer(slot_id=slot_id, start=rows[slot_id].start_time)
+        for slot_id in slot_ids
+        if slot_id in rows
+    ]
+
+
+def _settle_selection(
+    session: Session,
+    *,
+    run: WorkflowRun,
+    belt: Toolbelt,
+    writer: TraceWriter,
+    user: User,
+    message: str,
+    base: dict,
+) -> TurnResult | None:
+    """A choice among times already shown, read in code before any model call.
+
+    ``None`` when the message is neither, which leaves the turn exactly as it
+    was — so every sentence this cannot read is handled by whatever handled it
+    before.
+
+    **Why it runs here.** A run at ``in_progress`` that has shown times had no
+    way to hear an answer to them. The Coordinator called "3pm will work for me"
+    a new request, the mapping correctly refused to supersede a run with itself,
+    and the refusal's consequence is to answer with more times — so the reply
+    asked for a time, a time arrived, and the reply asked again. Seven messages
+    in a row, live, and a second run in the same session died identically. The
+    selection machinery existed and worked at ``pending_confirmation``; it was
+    simply unreachable from one state earlier.
+
+    Before the Coordinator rather than after it, on the same reasoning the
+    listing questions use: a fallback for when classification goes wrong is
+    still a lottery, because the wrong class is as likely as no class. Reading a
+    number against a list this run rendered needs no model, and a turn that
+    needs no model should not spend one.
+
+    **It cannot commit.** The run lands in ``pending_confirmation`` holding the
+    slot, and only an exact "yes" or the ✅ button books it. That gate is what
+    makes reading generously safe here: a misread selection costs one decline,
+    where a misread confirmation would book against the patient's word.
+    """
+    # A message that is *only* a withdrawal phrase is the one thing that must
+    # not be read as a choice. Live, "close the previous request" drew the same
+    # availability list as the six selections before it — a patient asking to
+    # be let go, answered with more of what they were trying to leave.
+    if says_only_withdrawal(message):
+        writer.validation(
+            "withdrawal_cue",
+            accepted=True,
+            detail={"scope": "whole_message", "state": run.status.value},
+        )
+        transition(
+            session,
+            run,
+            to=WorkflowStatus.CANCELLED,
+            trigger="patient_withdrawal",
+            writer=writer,
+            reason=CancellationReason.WITHDRAWN,
+            actor=user,
+        )
+        close_escalations_for_run(
+            session, workflow_run_id=run.id, note="Withdrawn by the patient.", actor=user
+        )
+        run.clear_proposal()
+        return TurnResult(
+            reply=WITHDRAWN_REPLY,
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            message_class=MessageClass.WITHDRAWAL,
+            **base,
+        )
+
+    shortlist = _offers(session, shortlist_slot_ids(run))
+    offered = _offers(session, offered_slot_ids(run))
+    if not offered:
+        return None
+
+    slot_id = read_selection(message, shortlist=shortlist, offered=offered)
+    writer.guard_verdict(
+        "slot_selection",
+        passed=slot_id is not None,
+        detail={
+            "slot_id": slot_id,
+            "shortlist": [offer.slot_id for offer in shortlist],
+            "offered": len(offered),
+        },
+    )
+    if slot_id is None:
+        return None
+
+    held = belt.hold_offered_slot(slot_id)
+    if not held.get("accepted"):
+        # Taken between being shown and being chosen. The refusal carries fresh
+        # alternatives, so the patient gets something to choose from rather than
+        # a dead end — the same trade `_propose_another_slot` already makes for
+        # the model's version of this move.
+        return TurnResult(
+            reply=render_alternatives(session, run, held.get("slots") or []),
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            message_class=MessageClass.CONTINUATION,
+            **base,
+        )
+
+    return TurnResult(
+        reply=render_reask(session, run),
         author=TraceAuthor.TEMPLATE,
         run_id=run.id,
         status=run.status.value,
@@ -956,6 +1091,29 @@ async def _turn(
             )
         # UNREAD falls through: the model may re-ask or decline, never confirm.
 
+    # --- 1b. a choice among times already shown, also read in code ---------
+    # The state one step earlier had no reader at all: a run holding nothing but
+    # a list of times it had shown could not hear an answer to that list, so
+    # "3pm will work for me" went to the Coordinator, came back a new request,
+    # was correctly refused a supersede, and was answered with the same list
+    # again. Seven times in a row, live.
+    #
+    # Only at `in_progress`. At `pending_confirmation` a slot is already held
+    # and the existing path — the model's `slot_question` and
+    # `propose_another_slot` — works and is left exactly as it is.
+    if run is not None and run.status is WorkflowStatus.IN_PROGRESS:
+        selected = _settle_selection(
+            session,
+            run=run,
+            belt=belt,
+            writer=writer,
+            user=user,
+            message=message,
+            base=base,
+        )
+        if selected is not None:
+            return selected
+
     # --- 2. the Coordinator: classify against a live run, or plan a new one ---
     # One service for the whole turn — each instance builds its own engine, and
     # the conversation is the only thing that needs a durable one.
@@ -1261,7 +1419,28 @@ async def _continue_run(
         )
 
     if outcome.consequence is Consequence.SUPERSEDE:
+        # The replacement run gets the same plan check a first-message run gets.
+        # It did not, and the gap is a whole live failure: "lets reschedule my
+        # Ophthalmology appointment", arriving over a live run, superseded it —
+        # and the replacement's plan was built from `incoming_steps` verbatim,
+        # which gpt-4o-mini returned as `[route, book, ...]`. A plainly stated
+        # reschedule became a booking run, and the reschedule the Appointment
+        # agent then proposed committed under a `book` step it could never
+        # settle. A correction that runs on one door into `create_run` and not
+        # the other is not a correction; it is a coin flip on which door the
+        # message came through.
+        #
+        # Invisible to the mock, which proposes `[reschedule, follow_up]` here
+        # and always did — so this guard has to be falsified against steps a
+        # model actually got wrong, never against the understudy's.
         steps = belt.proposals.incoming_steps or [PlanStep.ROUTE]
+        corrected = _corrected_change_plan(
+            session,
+            validate_plan([s.value for s in steps]),
+            message=message,
+            patient_id=profile.id,
+            writer=writer,
+        )
         replacement = create_run(
             session,
             patient_id=profile.id,
@@ -1269,7 +1448,7 @@ async def _continue_run(
             trigger="superseded_previous_request",
             writer=writer,
             request_text=message,
-            plan=[step.value for step in validate_plan([s.value for s in steps])],
+            plan=[step.value for step in corrected],
             session_id=conversation_id,
             actor=user,
         )
@@ -1373,14 +1552,35 @@ async def _execute_plan(
         # already been made and accepted. The check belongs here, before the
         # dispatch, where re-entry is still preventable rather than merely
         # detectable.
-        if (
-            step in APPOINTMENT_VERBS
-            and (run.state or {}).get("committed_action") == step.value
-        ):
+        #
+        # **Any** committed verb settles the step, not only a matching one, and
+        # that difference is the whole of a live defect. A run's plan and the
+        # action it commits can name different verbs: run 6 was created by the
+        # supersede path with the plan `[route, book, ...]`, and the Appointment
+        # agent — correctly reading "lets reschedule my Ophthalmology
+        # appointment" — proposed a *reschedule* under the `book` step. The
+        # patient typed "yes", `_commit_proposal` moved the appointment and
+        # transitioned the run back to `in_progress`, and then this loop found
+        # `book` incomplete and `committed_action == "reschedule"`, saw no
+        # match, and dispatched the specialist again. It proposed a second time,
+        # the run went back to `pending_confirmation`, and the receipt for the
+        # commit that *had* happened was rendered beside a fresh proposal card.
+        # The Decline pressed next was applicable — there really was an open
+        # proposal — and answered "nothing has been booked" about an
+        # appointment that had already moved.
+        #
+        # One run commits at most one appointment action: `validate_plan`
+        # refuses a plan naming two verbs, precisely because one
+        # `ProposedAction` can only dispatch one. So a committed verb settles
+        # this run's single appointment step whatever the plan happens to call
+        # it, and both names are traced so a mismatch stays visible rather than
+        # becoming invisible by being handled.
+        committed = (run.state or {}).get("committed_action")
+        if step in APPOINTMENT_VERBS and committed:
             writer.validation(
                 "step_already_committed",
                 accepted=True,
-                detail={"step": step.value, "run_id": run.id},
+                detail={"step": step.value, "committed": committed, "run_id": run.id},
             )
             # Still recorded as run. The plan advanced through it this turn —
             # what changed is that code settled it instead of a specialist, and

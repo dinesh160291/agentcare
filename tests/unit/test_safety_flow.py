@@ -381,3 +381,143 @@ class TestTheScreensTerminalToolIsTheOneItActuallyHas:
         from app.safety.classifier import _Holder, _tools
 
         assert len(_tools(_Holder(), None)) == 1
+
+
+class TestAScareDoesNotConsumeARequestAwaitingStaff:
+    """Round 6, item 5 — the one state where attaching is the wrong move.
+
+    Attaching a safety trigger to the active run is right while the *system*
+    holds that run: the scare interrupted that conversation, and one queue item
+    for one frightened patient is the whole point of the dedup rule.
+
+    It is wrong the moment a *human* holds it. Live, run 8: "book an
+    appointment, my kid has ear pain" routed ambiguously and queued for review,
+    and two messages later an unrelated scare arrived. The active run was the
+    queued one, so it went ``pending_review -> escalated`` — which is terminal —
+    and the ear-pain request died there. No staff decision was ever made on it,
+    nothing told the patient, and the queue item that remained described a
+    department choice rather than the scare.
+
+    The scare is not that request, so it does not get that request's row.
+    """
+
+    AMBIGUOUS = "book an appointment, my kid has ear pain"
+    SESSION = "s-safety-queued"
+
+    def _queued(self, patient, session_id: str) -> int:
+        result = turn(patient, self.AMBIGUOUS, session_id)
+        assert result.status == WorkflowStatus.PENDING_REVIEW.value
+        return result.run_id
+
+    def test_the_queued_request_keeps_its_state(self, patient):
+        queued = self._queued(patient, self.SESSION)
+
+        turn(patient, EMERGENCY, self.SESSION)
+
+        session = fresh()
+        try:
+            assert session.get(WorkflowRun, queued).status is WorkflowStatus.PENDING_REVIEW
+        finally:
+            session.close()
+
+    def test_the_queued_request_keeps_its_own_escalation(self, patient):
+        """Its reason still describes the department choice, because that is
+        still what a human has to decide."""
+        queued = self._queued(patient, "s-safety-queued-2")
+
+        turn(patient, EMERGENCY, "s-safety-queued-2")
+
+        session = fresh()
+        try:
+            rows = (
+                session.query(Escalation)
+                .filter(Escalation.workflow_run_id == queued)
+                .all()
+            )
+            assert [row.kind for row in rows] == [EscalationKind.LOW_CONFIDENCE_ROUTING]
+            assert rows[0].status is EscalationStatus.OPEN
+        finally:
+            session.close()
+
+    def test_the_scare_gets_a_run_of_its_own(self, patient):
+        queued = self._queued(patient, "s-safety-queued-3")
+
+        result = turn(patient, EMERGENCY, "s-safety-queued-3")
+
+        assert result.run_id != queued
+        assert result.status == WorkflowStatus.ESCALATED.value
+        session = fresh()
+        try:
+            rows = (
+                session.query(Escalation)
+                .filter(Escalation.workflow_run_id == result.run_id)
+                .all()
+            )
+            assert [row.kind for row in rows] == [EscalationKind.SAFETY]
+        finally:
+            session.close()
+
+    def test_the_patient_still_gets_the_emergency_reply(self, patient):
+        self._queued(patient, "s-safety-queued-4")
+
+        result = turn(patient, EMERGENCY, "s-safety-queued-4")
+
+        assert result.reply == EMERGENCY_REPLY
+        assert result.author is TraceAuthor.GUARD
+
+    def test_repeats_still_attach_to_the_new_run(self, patient):
+        """The bound this must not break. Splitting the scare off is about
+        *whose* request it is, not about how many rows a repeated scare makes —
+        three triggers are still one queue item with three occurrences."""
+        self._queued(patient, "s-safety-queued-5")
+
+        for _ in range(3):
+            turn(patient, EMERGENCY, "s-safety-queued-5")
+
+        session = fresh()
+        try:
+            safety = (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.SAFETY)
+                .all()
+            )
+            assert len(safety) == 1
+            assert safety[0].occurrence_count == 3
+            assert session.query(WorkflowRun).count() == 2
+        finally:
+            session.close()
+
+    def test_the_split_is_traced(self, patient):
+        """A run that was spared is a decision, and a decision nobody can see
+        looks exactly like the escalation having found no run at all."""
+        self._queued(patient, "s-safety-queued-6")
+
+        result = turn(patient, EMERGENCY, "s-safety-queued-6")
+
+        session = fresh()
+        try:
+            verdicts = [
+                event.payload
+                for event in events_for(session, result.turn_id)
+                if event.event_type is TraceEventType.GUARD_VERDICT
+                and (event.payload or {}).get("guard") == "escalation_target"
+            ]
+        finally:
+            session.close()
+        assert len(verdicts) == 1
+        assert verdicts[0]["passed"] is False
+        assert verdicts[0]["detail"]["status"] == WorkflowStatus.PENDING_REVIEW.value
+
+    def test_a_run_the_system_still_holds_is_escalated_as_before(self, patient):
+        """The negative control, and the reason this is keyed to one state.
+        Nothing is waiting on a person at ``pending_confirmation``, so folding
+        the scare into the conversation it interrupted stays the right reading —
+        and the pinned rule that a safety trigger fires whatever the state must
+        not have quietly become "whatever the state, except two"."""
+        first = turn(patient, BOOKING, "s-safety-queued-7")
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+        result = turn(patient, EMERGENCY, "s-safety-queued-7")
+
+        assert result.run_id == first.run_id
+        assert result.status == WorkflowStatus.ESCALATED.value
