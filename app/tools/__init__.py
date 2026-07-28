@@ -45,6 +45,7 @@ from app.tools.documents import (
 from app.tools.patients import get_patient_context
 from app.tools.reminders import list_due_reminders, list_patient_reminders
 from app.tools.tasks import (
+    close_escalations_for_run,
     close_followup_tasks,
     create_escalation,
     list_open_escalations,
@@ -57,6 +58,7 @@ __all__ = [
     "book_appointment",
     "cancel_appointment",
     "checksum_bytes",
+    "close_escalations_for_run",
     "close_followup_tasks",
     "create_escalation",
     "describe_appointment",

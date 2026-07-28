@@ -19,6 +19,7 @@ from app.models import (
     WorkflowStatus,
 )
 from app.tools.tasks import (
+    close_escalations_for_run,
     close_followup_tasks,
     create_escalation,
     list_open_escalations,
@@ -259,3 +260,114 @@ class TestEscalationDedup:
                                      kind=EscalationKind.SAFETY, reason="r", message="m"))
         json.dumps(list_open_escalations(seeded_db))
         json.dumps(list_open_tasks(seeded_db, patient_id=1))
+
+
+class TestEscalationKindIsPartOfTheKey:
+    """One open record per *subject*, and a kind is a subject.
+
+    The live failure: a run queued for review with a ``low_confidence_routing``
+    escalation, then the patient sent two messages the safety screen fired on.
+    Keyed on the run alone, both were absorbed as occurrences of the routing
+    question — one queue item, ``low_confidence_routing``, count 3, whose reason
+    still described a department choice. Nothing in the queue said "safety", so
+    triage would never have treated it as one.
+    """
+
+    def test_a_different_kind_opens_its_own_record(self, seeded_db, run):
+        create_escalation(
+            seeded_db, workflow_run_id=run.id,
+            kind=EscalationKind.LOW_CONFIDENCE_ROUTING, reason="r", message="m",
+        )
+        result = create_escalation(
+            seeded_db, workflow_run_id=run.id,
+            kind=EscalationKind.SAFETY, reason="r2", message="m2",
+        )
+
+        assert result["created"] is True
+        assert seeded_db.query(Escalation).count() == 2
+
+    def test_the_safety_case_is_visible_as_safety_in_the_queue(self, seeded_db, run):
+        """The assertion that would have caught it. A count of two is not
+        enough — what triage needs is the *kind* on a row of its own."""
+        create_escalation(
+            seeded_db, workflow_run_id=run.id,
+            kind=EscalationKind.LOW_CONFIDENCE_ROUTING, reason="r", message="m",
+        )
+        create_escalation(
+            seeded_db, workflow_run_id=run.id,
+            kind=EscalationKind.SAFETY, reason="r2", message="chest pain",
+        )
+
+        queued = list_open_escalations(seeded_db)
+        safety = [item for item in queued if item["kind"] == "safety"]
+        assert len(safety) == 1
+        assert safety[0]["latest_message"] == "chest pain"
+
+    def test_repeats_of_the_same_kind_still_attach(self, seeded_db, run):
+        """The bound the dedup exists for is untouched: it now holds *within* a
+        kind, which is where the repetition actually happens."""
+        create_escalation(
+            seeded_db, workflow_run_id=run.id,
+            kind=EscalationKind.SAFETY, reason="r", message="chest pain",
+        )
+        for _ in range(4):
+            create_escalation(
+                seeded_db, workflow_run_id=run.id,
+                kind=EscalationKind.SAFETY, reason="r", message="chest pain",
+            )
+
+        rows = seeded_db.query(Escalation).all()
+        assert len(rows) == 1
+        assert rows[0].occurrence_count == 5
+
+
+class TestClosingADeadRunsEscalations:
+    """The derivation invariant, applied to the staff queue."""
+
+    def test_an_open_review_is_retired(self, seeded_db, run):
+        create_escalation(
+            seeded_db, workflow_run_id=run.id,
+            kind=EscalationKind.LOW_CONFIDENCE_ROUTING, reason="r", message="m",
+        )
+
+        closed = close_escalations_for_run(
+            seeded_db, workflow_run_id=run.id, note="Superseded by a later request."
+        )
+
+        assert closed == 1
+        row = seeded_db.query(Escalation).one()
+        assert row.status is EscalationStatus.RESOLVED
+        assert row.resolution_note == "Superseded by a later request."
+        assert list_open_escalations(seeded_db) == []
+
+    def test_a_safety_escalation_is_never_closed_this_way(self, seeded_db, run):
+        """"Actually, forget it" after a chest-pain message is exactly the
+        moment the system must not be helpful. The state machine already
+        refuses to move an escalated run; this is the second lock, on the queue
+        item rather than on the run."""
+        create_escalation(
+            seeded_db, workflow_run_id=run.id,
+            kind=EscalationKind.SAFETY, reason="r", message="chest pain",
+        )
+
+        closed = close_escalations_for_run(
+            seeded_db, workflow_run_id=run.id, note="Withdrawn by the patient."
+        )
+
+        assert closed == 0
+        assert seeded_db.query(Escalation).one().status is EscalationStatus.OPEN
+        assert len(list_open_escalations(seeded_db)) == 1
+
+    def test_another_runs_queue_item_is_untouched(self, seeded_db, run):
+        other = WorkflowRun(patient_id=2, status=WorkflowStatus.IN_PROGRESS)
+        seeded_db.add(other)
+        seeded_db.flush()
+        for run_id in (run.id, other.id):
+            create_escalation(
+                seeded_db, workflow_run_id=run_id,
+                kind=EscalationKind.LOW_CONFIDENCE_ROUTING, reason="r", message="m",
+            )
+
+        close_escalations_for_run(seeded_db, workflow_run_id=run.id, note="n")
+
+        assert len(list_open_escalations(seeded_db)) == 1

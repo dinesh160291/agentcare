@@ -256,7 +256,8 @@ def create_escalation(
     message: str | None = None,
     actor: User | None = None,
 ) -> dict[str, Any]:
-    """Open an escalation for a run, or attach to the one already open.
+    """Open an escalation for a run, or attach to the one already open **of the
+    same kind**.
 
     Attaching rather than multiplying keeps the staff queue readable. Five
     triggers on one run become one item with ``occurrence_count`` five — and
@@ -265,11 +266,22 @@ def create_escalation(
 
     Every trigger is audited separately, so nothing is lost by not creating a
     row for it.
+
+    **The kind is part of the key, and leaving it out was not a smaller version
+    of the same rule — it was a different one.** Keyed on the run alone, a
+    routing question that queued for review absorbed two later safety triggers
+    on the same run as mere *occurrences of itself*: one queue item reading
+    ``low_confidence_routing``, count 3, whose reason still described a
+    department choice. A human triaging that queue sees an ambiguous route and
+    no safety case at all. The growth rule is one open record per subject, and
+    two different kinds are two different subjects — the bound holds within a
+    kind, where the repetition it exists to absorb actually happens.
     """
     existing = (
         session.query(Escalation)
         .filter(
             Escalation.workflow_run_id == workflow_run_id,
+            Escalation.kind == kind,
             Escalation.status.in_(OPEN_ESCALATION_STATUSES),
         )
         .order_by(Escalation.id)
@@ -314,6 +326,53 @@ def create_escalation(
     )
     return {"created": True, "attached": False,
             "escalation": _serialise_escalation(escalation)}
+
+
+def close_escalations_for_run(
+    session: Session,
+    *,
+    workflow_run_id: int,
+    note: str,
+    actor: User | None = None,
+) -> int:
+    """Retire a dead run's open escalations. Returns how many were closed.
+
+    The derivation invariant, applied to the staff queue: an escalation is a
+    row derived from a run, so a transition that kills the run has to update it
+    in the *same* transaction. Live, a run was superseded with its review
+    escalation still open — a human would have picked up, and spent time on, a
+    request the patient had already replaced.
+
+    **Safety escalations are exempt, and that is not a detail.** "Actually,
+    forget it" after a chest-pain message is precisely the moment the system
+    must not be helpful, and a rule that tidies up after a cancelled run would
+    tidy that away too. The state machine already refuses to move an escalated
+    run, so this exemption is the second lock on the same door — worth having,
+    because the first one guards the run and this one guards the queue item.
+    """
+    escalations = (
+        session.query(Escalation)
+        .filter(
+            Escalation.workflow_run_id == workflow_run_id,
+            Escalation.kind != EscalationKind.SAFETY,
+            Escalation.status.in_(OPEN_ESCALATION_STATUSES),
+        )
+        .all()
+    )
+    for escalation in escalations:
+        escalation.status = EscalationStatus.RESOLVED
+        escalation.resolution_note = note
+        write_audit(
+            session,
+            action="escalation_closed",
+            entity_type="Escalation",
+            entity_id=escalation.id,
+            actor=actor,
+            actor_kind="user" if actor else "system",
+            metadata={"kind": escalation.kind.value, "note": note},
+        )
+    session.flush()
+    return len(escalations)
 
 
 def list_open_escalations(session: Session) -> list[dict[str, Any]]:

@@ -166,6 +166,11 @@ class EscalationKind(StrEnum):
     SAFETY = "safety"
     LOW_CONFIDENCE_ROUTING = "low_confidence_routing"
     UNSUPPORTED_REQUEST = "unsupported_request"
+    #: A run that failed on a budget. The failure template has always said "I've
+    #: flagged it for them"; until this existed it was a sentence about nothing,
+    #: and a patient whose request died twice was told twice that help was
+    #: coming while the staff queue stayed empty.
+    SYSTEM_FAILURE = "system_failure"
 
 
 class FollowUpTaskType(StrEnum):
