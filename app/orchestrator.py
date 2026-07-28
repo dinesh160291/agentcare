@@ -68,6 +68,8 @@ from app.workflow.mapping import (
     Consequence,
     apply_consequence,
     mentions_domain_subject,
+    names_change_verb,
+    primary_intent,
     validate_class,
 )
 from app.workflow.queries import QueryKind, answer_query, detect_query
@@ -482,6 +484,64 @@ def _answer_while_holding(
         )
 
     return None
+
+
+def _corrected_change_plan(
+    session: Session,
+    plan: list[PlanStep] | None,
+    *,
+    message: str,
+    patient_id: int,
+    writer: TraceWriter,
+) -> list[PlanStep] | None:
+    """A verb the patient stated is not the model's to reinterpret.
+
+    "Please reschedule my appointment to next week" reached routing and queued
+    for a staff decision on which department should own it — a question already
+    answered by the appointment being moved. The same sentence had worked hours
+    earlier, and nothing in between touched planning: two live replays of one
+    phrasing produced a correct plan, a ``[route, book]`` plan, and *no plan at
+    all*. It was never deterministic. A patient cannot be asked to keep
+    rephrasing until the dice land.
+
+    So where the message plainly names an appointment verb — verb **plus** an
+    appointment noun, withdrawal excluded, and only when the patient actually
+    has an appointment to act on — the plan is that verb's closure, and a plan
+    proposing anything else is corrected. Both directions are traced: an
+    agreement is worth as much as an override when the question is whether this
+    ran at all.
+
+    Deliberately narrow, and narrow in the direction that costs least. The
+    verb list holds no bare "change"; a patient with nothing booked is left
+    entirely to the model, because "reschedule my appointment" from someone who
+    has none is a booking request badly worded, and only the model can tell.
+    """
+    verb = names_change_verb(message)
+    if verb is None:
+        return plan
+    if not list_patient_appointments(session, patient_id=patient_id, live_only=True):
+        return plan
+
+    if plan is not None and primary_intent(plan) is verb:
+        writer.validation(
+            "plan_change_verb",
+            accepted=True,
+            detail={"verb": verb.value, "plan": [step.value for step in plan]},
+        )
+        return plan
+
+    corrected = validate_plan([verb.value])
+    writer.validation(
+        "plan_change_verb",
+        accepted=False,
+        detail={
+            "verb": verb.value,
+            "proposed": [step.value for step in plan] if plan else None,
+            "applied": [step.value for step in corrected],
+            "problem": "the message names an appointment verb the plan does not",
+        },
+    )
+    return corrected
 
 
 def _budget_failure(
@@ -938,7 +998,13 @@ async def _turn(
     # The Coordinator classifies three ways: supported intent, unsafe, or
     # off-topic. Safety has already had its turn, so a message that produced no
     # plan is off-topic — and only a supported intent may spawn a workflow.
-    plan = belt.proposals.plan
+    plan = _corrected_change_plan(
+        session,
+        belt.proposals.plan,
+        message=message,
+        patient_id=profile.id,
+        writer=writer,
+    )
     names_a_subject = mentions_domain_subject(message)
     writer.guard_verdict(
         "scope_gate",
@@ -955,9 +1021,12 @@ async def _turn(
         # me my appointments" was refused twice while a different wording of
         # the same question worked.
         #
-        # Code cannot invent the plan the Coordinator did not produce; picking
-        # steps here would put the deterministic layer in the planning bin. So
-        # the honest answer is the one that asks for more, and the difference
+        # Code cannot invent the plan the Coordinator did not produce — except
+        # where the patient named the verb outright and has something to apply
+        # it to, which `_corrected_change_plan` has already handled above. Every
+        # other unplanned message is genuinely undecided, and picking steps for
+        # it here would put the deterministic layer in the planning bin. So the
+        # honest answer is the one that asks for more, and the difference
         # between that and ``SCOPE_REPLY`` is the difference between "tell me
         # more" and "I don't do that".
         write_audit(
@@ -1110,6 +1179,26 @@ async def _continue_run(
             message_class=outcome.message_class,
             **base,
         )
+
+    # A supersede the mapping refused because the message was refining the run
+    # rather than replacing it. The model called it a new request, so it never
+    # asked for the times — code runs the search itself, with the patient's own
+    # words as the phrase, and `resolve_date` turns them into a window as it
+    # does everywhere else. Live, this message destroyed an Orthopedics booking
+    # in progress; the refusal alone would have left it un-destroyed and
+    # unanswered, which is half a fix.
+    #
+    # If nothing comes back — no department decided yet, nothing free in that
+    # window — this falls through deliberately. The re-ask below states what is
+    # being held, and at `in_progress` the plan carries on, so the turn ends on
+    # something the patient can act on either way.
+    if outcome.consequence is Consequence.REFINE:
+        belt.answer_with_other_slots(message)
+        answered = _answer_while_holding(
+            session, run=run, belt=belt, outcome=outcome, base=base
+        )
+        if answered is not None:
+            return answered
 
     # Text the exact tokens could not read, on a run that is still waiting.
     # This is the third and last step of the reading order, and the only one

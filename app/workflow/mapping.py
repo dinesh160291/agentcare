@@ -83,8 +83,13 @@ class Consequence(str, Enum):
     WITHDRAW = "withdraw"                # withdrawal
     #: Not a class of its own — what a *conflicting* message becomes when the
     #: run it would replace is waiting for staff and the message shows no
-    #: difference. See :func:`_supersede_needs_difference`.
+    #: difference. See :func:`_shows_no_difference`.
     STATUS_REPLY = "status_reply"
+    #: The same refusal, one state earlier. A message that carries the run's own
+    #: intent and names no new subject is *refining* the request it arrived in,
+    #: not replacing it — so the timing question rides to the slot search and
+    #: the run is left exactly where it was. Read-only, like a side question.
+    REFINE = "refine"
 
 
 CONSEQUENCE_FOR: dict[MessageClass, Consequence] = {
@@ -372,7 +377,54 @@ def mentions_domain_subject(text: str) -> bool:
     return bool(_DOMAIN_PATTERN.search(text or ""))
 
 
-def _supersede_needs_difference(
+#: The verbs that act on an appointment the patient already has, each with the
+#: plan step it names. Deliberately short, and deliberately *not* including
+#: "change": every live phrasing used "reschedule", and a bare "change" beside
+#: an appointment noun ("an appointment to change my dressing") would turn a
+#: booking into a reschedule, which is the expensive direction.
+_CHANGE_VERBS: tuple[tuple[PlanStep, str], ...] = (
+    (PlanStep.CANCEL, r"\bcancel(?:s|led|ling)?\b"),
+    (
+        PlanStep.RESCHEDULE,
+        r"\b(?:reschedul\w*|re-schedul\w*|rearrange\w*|move|moving|postpone\w*"
+        r"|push back|bring forward)\b",
+    ),
+)
+
+#: Verb **plus** appointment noun, never the verb alone — the same rule the
+#: withdrawal/cancel collision already forced. "Cancel" on its own declines a
+#: proposal; "cancel that request" withdraws a run; only "cancel my
+#: appointment" acts on an appointment.
+_APPOINTMENT_NOUN = re.compile(
+    r"\b(?:appointments?|bookings?|visits?)\b", re.IGNORECASE
+)
+
+
+def names_change_verb(text: str) -> PlanStep | None:
+    """The appointment verb this message plainly states, if it states one.
+
+    A fact about the message, in the same family as
+    :func:`mentions_domain_subject` and :func:`says_withdrawal`: it reads
+    words, decides nothing about consequence, and the caller may only use it to
+    check a plan the model already proposed.
+
+    Withdrawal is checked first and wins, because "cancel that request" and
+    "cancel my appointment" are different acts and reading the first as the
+    second leaves an appointment standing while the reply says it was dealt
+    with.
+    """
+    message = text or ""
+    if says_withdrawal(message):
+        return None
+    if not _APPOINTMENT_NOUN.search(message):
+        return None
+    for step, pattern in _CHANGE_VERBS:
+        if re.search(pattern, message, re.IGNORECASE):
+            return step
+    return None
+
+
+def _shows_no_difference(
     session: Session,
     run: WorkflowRun,
     *,
@@ -380,16 +432,29 @@ def _supersede_needs_difference(
     incoming_steps: Sequence[PlanStep] | None,
     writer: TraceWriter,
 ) -> bool:
-    """Would superseding this run throw away a review nobody replaced?
+    """Is this "conflicting" message actually a refinement of the run it arrived in?
 
-    **At `pending_review`, conflicting requires difference.** A run waiting on
-    staff is a queue item as well as a conversation, and cancelling it destroys
-    both — so a message that carries the run's own intent and names nothing new
-    must not be able to do it. The live shape: a low-confidence route queues for
-    review, the patient says "looks good, lets book that time", the assent
-    classifies as conflicting because it carries the same intent, and the
-    request a human was about to look at is gone. The patient watches a fresh
-    search start from nothing and is never told.
+    **Same intent, no new subject — so superseding it destroys the request the
+    patient is still making.** The rule started life scoped to
+    ``pending_review``, where the cost was loudest: a run waiting on staff is a
+    queue item as well as a conversation, and "looks good, lets book that time"
+    classified as conflicting, cancelled the request a human was about to look
+    at, and started a fresh search the patient was never told about.
+
+    It is the same mistake one state earlier, and round 5 found all three of
+    its shapes in one live transcript:
+
+    * "can you give me slots for next week?", asked during an Orthopedics
+      proposal, **superseded the booking** — a question about times destroyed
+      the request it was asking about;
+    * "do you have any more appointment for the next week?" at
+      ``pending_confirmation`` became a new run, routed nowhere in particular,
+      queued for review, and answered *"a member of staff will assist you with
+      that"* — a referral to a human for a question the slot table answers.
+
+    One cause, so one rule, and what changes with the state is only what the
+    refusal *becomes*: a status reply while staff hold the run, a slot answer
+    while the system does.
 
     Difference means one of two things, and both are decided here rather than
     proposed:
@@ -402,6 +467,8 @@ def _supersede_needs_difference(
     the same resolution routing uses everywhere else. No model argument, no
     keyword list: "a different subject" means what the table says it means, and
     a phrasing nobody anticipated cannot slip past a list that does not exist.
+    "Book me a dermatology appointment instead" names a department that is not
+    this run's and still supersedes, exactly as before.
 
     Unknown intent supersedes. If the Coordinator proposed no steps there is
     nothing to compare, and the conservative reading of "requires difference"
@@ -419,11 +486,12 @@ def _supersede_needs_difference(
             return False
 
     writer.validation(
-        "supersede_at_review",
+        "supersede_refused",
         accepted=False,
         detail={
             "intent": incoming.value,
-            "problem": "same intent and no new subject while awaiting staff review",
+            "problem": "same intent and no new subject as the active run",
+            "state": run.status.value,
             "subject": named.get("status"),
         },
     )
@@ -558,18 +626,22 @@ def apply_consequence(
         )
         consequence = Consequence.ANSWER_AND_STAY
 
-    if (
-        consequence is Consequence.SUPERSEDE
-        and run.status is WorkflowStatus.PENDING_REVIEW
-        and _supersede_needs_difference(
-            session,
-            run,
-            message=message,
-            incoming_steps=incoming_steps,
-            writer=writer,
-        )
+    # One rule, three states, two landings. Where staff hold the run the patient
+    # is told its position and nothing moves; where the system holds it the
+    # message is a refinement and gets answered with times. Superseding is
+    # refused either way, and the refusal is traced either way.
+    if consequence is Consequence.SUPERSEDE and _shows_no_difference(
+        session,
+        run,
+        message=message,
+        incoming_steps=incoming_steps,
+        writer=writer,
     ):
-        consequence = Consequence.STATUS_REPLY
+        consequence = (
+            Consequence.STATUS_REPLY
+            if run.status is WorkflowStatus.PENDING_REVIEW
+            else Consequence.REFINE
+        )
 
     if consequence is Consequence.WITHDRAW:
         transition(
@@ -603,11 +675,11 @@ def apply_consequence(
         # Part of the request, so routing and slot matching should read it.
         run.request_text = f"{run.request_text}\n{message}".strip()
 
-    # ANSWER_AND_STAY, SCOPE_REPLY and STATUS_REPLY deliberately do nothing. A
-    # side question is read-only, an off-topic message must leave the run —
-    # including its request text — byte-identical, and a status reply is a
-    # supersede that was refused: touching anything would be the very write the
-    # refusal exists to prevent.
+    # ANSWER_AND_STAY, SCOPE_REPLY, STATUS_REPLY and REFINE deliberately do
+    # nothing. A side question is read-only, an off-topic message must leave the
+    # run — including its request text — byte-identical, and a status reply and
+    # a refinement are both supersedes that were refused: touching anything
+    # would be the very write the refusal exists to prevent.
 
     return MappingOutcome(
         consequence=consequence,
@@ -627,6 +699,7 @@ __all__ = [
     "apply_consequence",
     "WITHDRAWAL_CUES",
     "mentions_domain_subject",
+    "names_change_verb",
     "primary_intent",
     "says_withdrawal",
     "validate_class",

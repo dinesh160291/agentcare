@@ -669,27 +669,189 @@ class TestConflictingAtReviewRequiresDifference:
             event.payload
             for event in seeded_db.query(TraceEvent).all()
             if event.event_type is TraceEventType.VALIDATION
-            and event.payload.get("what") == "supersede_at_review"
+            and event.payload.get("what") == "supersede_refused"
         ]
         assert refusals and refusals[0]["accepted"] is False
+        assert refusals[0]["detail"]["state"] == S.PENDING_REVIEW.value
 
-    def test_the_same_message_at_in_progress_still_supersedes(
+
+class TestTheSameRefusalAtTheLiveStates:
+    """Round 5 item 2. The rule was always about the *message*, not the state.
+
+    It shipped scoped to ``pending_review`` because that is where it was found,
+    and the scoping was pinned as a falsification: a version that blocked every
+    same-intent supersede everywhere would have passed every test above. One
+    transcript later, the wider case is the one doing damage — "can you give me
+    slots for next week?", asked during an Orthopedics proposal, superseded the
+    booking it was asking about — so the scoping is gone and what varies with
+    the state is only what the refusal *becomes*.
+
+    The falsification moves with it. Two counterexamples below hold the rule to
+    a rule: a different department and a different verb still supersede at
+    ``in_progress``, which is the rephrase path the original scoping protected.
+    """
+
+    def test_a_timing_question_during_a_proposal_refines_rather_than_replaces(
         self, seeded_db, writer
     ):
-        """Distrust green: the guard is scoped to `pending_review`. A version
-        that blocked every same-intent supersede everywhere would pass all of
-        the above and quietly break the rephrase path."""
+        run = make_run(seeded_db, status=S.PENDING_CONFIRMATION)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="can you give me slots for next week?",
+            incoming_steps=[PlanStep.BOOK],
+        )
+
+        assert outcome.consequence is Consequence.REFINE
+        assert outcome.spawns_new_run is False
+        assert run.status is S.PENDING_CONFIRMATION
+
+    def test_the_same_message_at_in_progress_also_refines(self, seeded_db, writer):
         run = make_run(seeded_db, status=S.IN_PROGRESS)
         outcome = apply_consequence(
             seeded_db,
             run,
             _verdict(M.CONFLICTING),
             writer=writer,
-            message="looks good. lets book that time",
+            message="do you have any more appointment for the next week?",
+            incoming_steps=[PlanStep.BOOK],
+        )
+
+        assert outcome.consequence is Consequence.REFINE
+        assert run.status is S.IN_PROGRESS
+
+    def test_a_refinement_writes_nothing(self, seeded_db, writer):
+        """A refused supersede that then edited the request text would be the
+        write the refusal exists to prevent, arriving by another door."""
+        run = make_run(seeded_db, status=S.PENDING_CONFIRMATION)
+        before = (run.request_text, run.plan, run.cancellation_reason)
+
+        apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="can you give me slots for next week?",
+            incoming_steps=[PlanStep.BOOK],
+        )
+
+        assert (run.request_text, run.plan, run.cancellation_reason) == before
+
+    def test_a_different_department_still_supersedes_at_in_progress(
+        self, seeded_db, writer
+    ):
+        """The pinned counterexample. "Instead" means a new request, and a
+        refinement rule that swallowed it would have broken the one path this
+        whole guard is scoped around."""
+        run = make_run(seeded_db, status=S.IN_PROGRESS)
+        cardiology = (
+            seeded_db.query(Department).filter(Department.name == "Cardiology").one()
+        )
+        run.state = {"department_name": cardiology.name, "department_id": cardiology.id}
+        seeded_db.flush()
+
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="book me a dermatology appointment instead",
             incoming_steps=[PlanStep.BOOK],
         )
 
         assert outcome.consequence is Consequence.SUPERSEDE
+        assert run.status is S.CANCELLED
+
+    def test_a_different_verb_still_supersedes_at_in_progress(self, seeded_db, writer):
+        run = make_run(seeded_db, status=S.IN_PROGRESS)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="actually cancel my appointment instead",
+            incoming_steps=[PlanStep.CANCEL],
+        )
+
+        assert outcome.consequence is Consequence.SUPERSEDE
+
+    def test_the_refusal_names_the_state_it_happened_in(self, seeded_db, writer):
+        """One rule, three states — so the trace has to say which one, or a
+        reviewer cannot tell a status reply from a refinement afterwards."""
+        run = make_run(seeded_db, status=S.PENDING_CONFIRMATION)
+        apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONFLICTING),
+            writer=writer,
+            message="can you give me slots for next week?",
+            incoming_steps=[PlanStep.BOOK],
+        )
+        seeded_db.flush()
+
+        refusals = [
+            event.payload
+            for event in seeded_db.query(TraceEvent).all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload.get("what") == "supersede_refused"
+        ]
+        assert refusals
+        assert refusals[0]["detail"]["state"] == S.PENDING_CONFIRMATION.value
+
+
+class TestTheVerbAMessageStates:
+    """``names_change_verb``: a fact about the words, deciding nothing alone.
+
+    It exists because the plan for "please reschedule my appointment to next
+    week" was a lottery — three live replays of two phrasings produced a
+    correct plan, a ``[route, book]`` plan, and no plan at all. The dangerous
+    direction is a false positive: reading a *booking* as a change would send a
+    patient's new request at an appointment they already have. So the verb has
+    to be stated, beside an appointment noun, and withdrawal wins first.
+    """
+
+    @pytest.mark.parametrize(
+        "message, step",
+        [
+            ("please reschedule my appointment to next week", PlanStep.RESCHEDULE),
+            ("lets reschedule my appointment", PlanStep.RESCHEDULE),
+            ("can we move my appointment to Friday", PlanStep.RESCHEDULE),
+            ("I need to postpone my visit", PlanStep.RESCHEDULE),
+            ("i want to cancel my upcoming appointment", PlanStep.CANCEL),
+            ("I want to cancel my appointment", PlanStep.CANCEL),
+        ],
+    )
+    def test_a_stated_verb_is_read(self, message, step):
+        from app.workflow.mapping import names_change_verb
+
+        assert names_change_verb(message) is step
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            # A withdrawal, not an appointment verb — the collision that leaves
+            # an appointment standing while the reply says it was dealt with.
+            "cancel that request",
+            "actually cancel my request",
+            # The bare token that declines a proposal.
+            "cancel",
+            # A booking, and the one phrasing that must keep superseding.
+            "book me a dermatology appointment instead",
+            "I need a cardiology appointment next week",
+            # A question about times, which changes nothing by itself.
+            "can you give me slots for next week?",
+            "show my appointments",
+            # No appointment noun anywhere.
+            "please move my phone number to the new one",
+            "what's the weather like today?",
+        ],
+    )
+    def test_anything_less_is_not_a_stated_verb(self, message):
+        from app.workflow.mapping import names_change_verb
+
+        assert names_change_verb(message) is None
 
 
 class TestDomainNounsVetoTheOffTopicVerdict:

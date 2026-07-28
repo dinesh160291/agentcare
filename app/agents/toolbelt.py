@@ -358,6 +358,22 @@ class Toolbelt:
             tools.append(list_other_slots)
         return tools
 
+    def answer_with_other_slots(self, phrase: str = "") -> dict:
+        """The same search, run by code rather than asked for by the model.
+
+        The orchestrator needs this when it has decided *deterministically*
+        that a message is a refinement — "can you give me slots for next week?"
+        while a proposal stands. The model had already called that message a
+        new request, so it never asked for the times; if code refuses the
+        supersede and then waits for a tool call that is not coming, the
+        patient gets a re-ask for an answer that was one query away.
+
+        Read-only and identical to the bound tool, deliberately: two ways of
+        producing a slot list would be two places for the proposal to be
+        disturbed.
+        """
+        return self._list_other_slots(phrase)
+
     def _list_other_slots(self, phrase: str = "") -> dict:
         """Free times other than the one being held. Read-only, always.
 

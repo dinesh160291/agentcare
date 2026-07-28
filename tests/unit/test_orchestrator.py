@@ -50,6 +50,7 @@ from app.models import (
     WorkflowStatus,
 )
 from app.orchestrator import (
+    NO_PLAN_REPLY,
     SCOPE_REPLY,
     active_run,
     apply_patient_action,
@@ -1453,7 +1454,11 @@ class TestTheScopeGateDoesNotRefuseItsOwnSubject:
 
     Code cannot supply the plan the Coordinator did not produce — that would
     put the deterministic layer in the planning bin — so what changes is the
-    reply: "tell me more", not "I don't do that".
+    reply: "tell me more", not "I don't do that". (Round 5 carved out the one
+    exception: a message that *states* an appointment verb beside an
+    appointment noun, for a patient who has one. See
+    ``TestAStatedVerbSurvivesThePlan``. These phrasings state no verb, so the
+    veto is still what answers them.)
 
     The live message itself has since moved on: "can you tell me my
     appointments" is a *listing question* and is now answered from the rows
@@ -1536,3 +1541,307 @@ class TestTheScopeGateDoesNotRefuseItsOwnSubject:
             session.close()
 
         assert gate["detail"]["domain_subject"] is True
+
+
+class MisplanningLlm(AgentCareLlm):
+    """A Coordinator that plans a *booking* for a reschedule request.
+
+    The live failure, isolated. "Please reschedule my appointment to next week"
+    reached ``submit_plan`` as ``["route", "book"]``, routed to General Medicine
+    with low confidence, and queued for a staff decision about which department
+    should own an appointment that already has one. The same sentence had
+    worked hours before and nothing in between touched planning: replayed live
+    three times, one phrasing produced a correct plan, one produced this, and
+    one produced no plan at all.
+
+    The mock cannot show any of that — it plans reschedules correctly every
+    time, so the correction's own scenario passes with the correction removed.
+    """
+
+    model: str = "misplanning-stub"
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        available = available_tool_names(llm_request)
+        if "submit_safety_verdict" in available:
+            yield function_call_response(
+                "submit_safety_verdict",
+                {"category": "safe", "rationale": "stub: administrative"},
+            )
+            return
+        if "submit_plan" in available and "submit_plan" not in called_tools(llm_request):
+            yield function_call_response("submit_plan", {"steps": ["route", "book"]})
+            return
+        yield text_response("stub: planned a booking")
+
+
+class TestAStatedVerbSurvivesThePlan:
+    """Round 5 item 2(c). A verb the patient typed is not the model's to reread.
+
+    Two provider failures, one rule. The plan came back naming the wrong verb
+    (``MisplanningLlm``) or naming nothing at all (``UnplanningLlm``), and both
+    left a patient with an appointment on the books being asked which
+    department their reschedule belonged to — or told to rephrase. Code now
+    checks the plan against the verb the message states, and states it in the
+    trace either way.
+
+    The correction is narrow on purpose and the last test is what keeps it
+    narrow: a patient with nothing booked is left entirely to the model,
+    because "reschedule my appointment" from someone who has none is a badly
+    worded booking and only the model can tell.
+    """
+
+    RESCHEDULE = "please reschedule my appointment to next week"
+
+    def _plan_of(self, session) -> list[str]:
+        run = session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+        return list(run.plan or []) if run else []
+
+    def test_a_booking_plan_for_a_reschedule_is_corrected(self, patient, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: MisplanningLlm()
+        )
+        turn(patient, self.RESCHEDULE, "s-verb-1")
+
+        session = fresh()
+        try:
+            assert self._plan_of(session) == ["reschedule", "follow_up"]
+        finally:
+            session.close()
+
+    def test_the_corrected_run_never_enters_routing(self, patient, monkeypatch):
+        """The consequence that was actually costing the patient: routing a
+        reschedule asks a human which department owns an appointment that
+        already names one."""
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: MisplanningLlm()
+        )
+        result = turn(patient, self.RESCHEDULE, "s-verb-2")
+
+        session = fresh()
+        try:
+            assert "route" not in self._plan_of(session)
+            assert session.query(Escalation).count() == 0
+        finally:
+            session.close()
+        assert result.status != WorkflowStatus.PENDING_REVIEW.value
+
+    def test_no_plan_at_all_is_also_corrected(self, patient, monkeypatch):
+        """The other live outcome for the same sentence. "Tell me more" is the
+        honest answer to a message nobody could plan for; it is the wrong
+        answer to one that names its verb outright."""
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: UnplanningLlm()
+        )
+        result = turn(patient, self.RESCHEDULE, "s-verb-3")
+
+        session = fresh()
+        try:
+            assert self._plan_of(session) == ["reschedule", "follow_up"]
+        finally:
+            session.close()
+        assert result.reply != NO_PLAN_REPLY
+
+    def test_the_override_is_traced(self, patient, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: MisplanningLlm()
+        )
+        result = turn(patient, self.RESCHEDULE, "s-verb-4")
+
+        session = fresh()
+        try:
+            events = [
+                event.payload
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.VALIDATION
+                and event.payload.get("what") == "plan_change_verb"
+            ]
+        finally:
+            session.close()
+
+        assert events and events[0]["accepted"] is False
+        assert events[0]["detail"]["applied"] == ["reschedule", "follow_up"]
+
+    def test_agreement_is_recorded_too(self, patient):
+        """Under the mock the plan is already right, so this records an
+        agreement — which is the event that says the check ran at all. Without
+        it, "the correction never fired" and "the correction is not wired in"
+        look identical in the trace."""
+        result = turn(patient, self.RESCHEDULE, "s-verb-5")
+
+        session = fresh()
+        try:
+            events = [
+                event.payload
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.VALIDATION
+                and event.payload.get("what") == "plan_change_verb"
+            ]
+        finally:
+            session.close()
+
+        assert events and events[0]["accepted"] is True
+
+    def test_a_patient_with_nothing_booked_is_left_to_the_model(
+        self, other_patient, monkeypatch
+    ):
+        """The falsification. Rohan has no appointment, so there is nothing to
+        reschedule and the model's plan stands — a correction that fired here
+        would be inventing a target."""
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: MisplanningLlm()
+        )
+        turn(other_patient, self.RESCHEDULE, "s-verb-6")
+
+        session = fresh()
+        try:
+            assert self._plan_of(session) == ["route", "book", "documents", "follow_up"]
+        finally:
+            session.close()
+
+
+class SupersedingLlm(AgentCareLlm):
+    """A Coordinator that calls every message during a run a new request.
+
+    Live, "can you give me slots for next week?" — asked while an Orthopedics
+    proposal stood — was classified ``conflicting``, and the booking the
+    patient was in the middle of making was cancelled to start a fresh search
+    for the same thing. The mock reads that message as a side question, so
+    under it the refinement rule is never even consulted and its tests would
+    pass with the rule deleted.
+    """
+
+    model: str = "superseding-stub"
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        available = available_tool_names(llm_request)
+        if "submit_safety_verdict" in available:
+            yield function_call_response(
+                "submit_safety_verdict",
+                {"category": "safe", "rationale": "stub: administrative"},
+            )
+            return
+        if "classify_message" in available and "classify_message" not in called_tools(
+            llm_request
+        ):
+            yield function_call_response(
+                "classify_message",
+                {"message_class": "conflicting", "incoming_steps": ["book"]},
+            )
+            return
+        yield text_response("stub: treating this as a new request")
+
+
+class TestARefinementDoesNotReplaceTheRunItRefines:
+    """Round 5 item 2, (a) and (b), at the orchestrator.
+
+    A question about times, asked while a time is being held, must leave the
+    offer standing and come back with times. It did neither: the run was
+    superseded, the replacement had no department to route by, routing queued
+    it for review, and the patient was told *"a member of staff will assist you
+    with that"* — a referral to a human for a question the slot table answers.
+    """
+
+    QUESTION = "can you give me slots for next week?"
+
+    def _run_row(self, session):
+        return session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+
+    def _hold(self, patient, session_id: str):
+        result = turn(patient, BOOKING, session_id)
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            run = self._run_row(session)
+            return run.id, run.proposed_slot_id
+        finally:
+            session.close()
+
+    def test_the_run_survives_and_the_offer_is_still_held(self, patient, monkeypatch):
+        run_id, held = self._hold(patient, "s-refine-1")
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: SupersedingLlm()
+        )
+        result = turn(patient, self.QUESTION, "s-refine-1")
+
+        session = fresh()
+        try:
+            assert session.query(WorkflowRun).count() == 1
+            run = self._run_row(session)
+            assert (run.id, run.proposed_slot_id) == (run_id, held)
+            assert run.status is WorkflowStatus.PENDING_CONFIRMATION
+        finally:
+            session.close()
+        assert result.run_id == run_id
+
+    def test_the_question_is_answered_with_times(self, patient, monkeypatch):
+        """Refusing the supersede alone would leave the message unanswered,
+        which is half a fix: the model called it a new request, so it never
+        asked for the times. Code runs the search itself."""
+        self._hold(patient, "s-refine-2")
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: SupersedingLlm()
+        )
+        result = turn(patient, self.QUESTION, "s-refine-2")
+
+        assert "free" in result.reply.lower()
+        assert result.author is TraceAuthor.TEMPLATE
+
+    def test_nobody_is_referred_to_staff(self, patient, monkeypatch):
+        self._hold(patient, "s-refine-3")
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: SupersedingLlm()
+        )
+        result = turn(patient, self.QUESTION, "s-refine-3")
+
+        assert "member of staff" not in result.reply.lower()
+        session = fresh()
+        try:
+            assert session.query(Escalation).count() == 0
+        finally:
+            session.close()
+
+    def test_the_request_text_is_untouched(self, patient, monkeypatch):
+        """A refused supersede that edited the request text would contaminate
+        what the next search reads — the write the refusal exists to prevent,
+        arriving by another door."""
+        self._hold(patient, "s-refine-4")
+        session = fresh()
+        try:
+            before = self._run_row(session).request_text
+        finally:
+            session.close()
+
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: SupersedingLlm()
+        )
+        turn(patient, self.QUESTION, "s-refine-4")
+
+        session = fresh()
+        try:
+            assert self._run_row(session).request_text == before
+        finally:
+            session.close()
+
+    def test_a_different_department_still_replaces_it(self, patient, monkeypatch):
+        """The counterexample, through the whole turn rather than the mapping
+        alone. "Instead" names a subject this run is not about, and a rule that
+        swallowed it would have made the system unable to change its mind."""
+        self._hold(patient, "s-refine-5")
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: SupersedingLlm()
+        )
+        turn(patient, "book me a dermatology appointment instead", "s-refine-5")
+
+        session = fresh()
+        try:
+            assert session.query(WorkflowRun).count() == 2
+        finally:
+            session.close()

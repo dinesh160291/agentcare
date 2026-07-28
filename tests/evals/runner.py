@@ -88,6 +88,14 @@ KNOWN_EXPECTATIONS = frozenset(
         # which reads the run the turn ended on — and an abandoned request
         # sitting in the queue is exactly what that blind spot hid.
         "open_escalations",
+        # --- Round 5: refinement must not replace the run it refines ---
+        # Whether this turn ended on the *same* run as the previous one. A
+        # supersede is invisible to every key above when the replacement
+        # reaches the same status with the same proposal: "pending_confirmation
+        # again" is exactly what a run that was destroyed and rebuilt looks
+        # like. `runs_for_patient` counts them but only over a whole scenario;
+        # this names the turn that did it.
+        "same_run",
     }
 )
 
@@ -134,15 +142,22 @@ def _appointment_count(session, patient_id: int) -> int:
     )
 
 
-def run_scenario(scenario: dict) -> ScenarioResult:
+def run_scenario(scenario: dict, *, session_prefix: str = "eval") -> ScenarioResult:
     """Run one scenario's turns in order and collect every failure.
 
     Collects rather than stops at the first: when a scenario breaks it is
     usually more useful to see all four things that changed than the first one
     alphabetically.
+
+    ``session_prefix`` exists for the live sweep. The Coordinator's ADK session
+    is *persistent* and keyed by the conversation id, so replaying the same
+    scenario name twice against the same session store would hand the second
+    run the first one's transcript — turn 1 arriving with history is not turn 1.
+    Under the mock that is harmless and under a live provider it is the
+    difference between a sweep and a re-read of the last sweep.
     """
     result = ScenarioResult(name=scenario["name"])
-    session_id = f"eval-{scenario['name']}"
+    session_id = f"{session_prefix}-{scenario['name']}"
 
     session = SessionLocal()
     try:
@@ -188,13 +203,22 @@ def run_scenario(scenario: dict) -> ScenarioResult:
             )
         else:
             outcome = asyncio.run(run_workflow(user, turn["message"], session_id))
+        prior_run_id = previous_run_id
         previous_run_id = outcome.run_id or previous_run_id
 
         session = SessionLocal()
         try:
             created = _appointment_count(session, patient_id) - baseline
             _check(
-                result, index, expect, outcome, session, before, created, patient_id
+                result,
+                index,
+                expect,
+                outcome,
+                session,
+                before,
+                created,
+                patient_id,
+                prior_run_id,
             )
             assert_well_formed(session)
         finally:
@@ -203,7 +227,9 @@ def run_scenario(scenario: dict) -> ScenarioResult:
     return result
 
 
-def _check(result, index, expect, outcome, session, before, created, patient_id) -> None:
+def _check(
+    result, index, expect, outcome, session, before, created, patient_id, prior_run_id
+) -> None:
     def fail(detail: str) -> None:
         result.failures.append(Failure(index, detail))
 
@@ -258,6 +284,14 @@ def _check(result, index, expect, outcome, session, before, created, patient_id)
             fail(
                 f"proposed_action: expected {expect['proposed_action']!r}, "
                 f"got {actual!r}"
+            )
+
+    if "same_run" in expect and prior_run_id is not None:
+        same = outcome.run_id == prior_run_id
+        if same != expect["same_run"]:
+            fail(
+                f"same_run: expected {expect['same_run']}, got {same} "
+                f"(run {prior_run_id} -> {outcome.run_id})"
             )
 
     if "open_escalations" in expect:

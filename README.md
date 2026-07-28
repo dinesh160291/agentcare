@@ -67,6 +67,52 @@ _(Seed script and demo accounts: pending.)_
 
 _(Pending — golden-set retrieval tests, unit and RBAC tests, mock-forced scenario evals, and frontend↔backend wiring tests.)_
 
+## Known limitations
+
+Honest, current, and drawn from a scripted sweep of every phrasing in five live
+transcripts replayed against a real model (`scripts/live_sweep.py`). The
+conversational layer is **frozen**: the edges below are documented rather than
+fixed, because each remaining one is a judgement about language, and language
+judgements are the part of this system that is allowed to be wrong.
+
+Every limitation is stated with the floor underneath it. That floor is the same
+in each case and it is structural, not a matter of the wording holding: **the
+failure mode is a re-ask, never a wrong commit.** Nothing is booked, moved or
+cancelled without an exact `yes` or the ✅ Confirm button, and that reader is
+code — no model output can reach it.
+
+- **Some phrasings get a clarifying question instead of an offer.** "Please
+  reschedule my appointment to next week" goes straight to a held time. "Lets
+  reschedule my appointment", with no date in it, is answered with "when would
+  you like it?" — and answering *that* can come back as a list of free times
+  rather than a held offer, so the patient has to name a time in a sentence
+  that also names the verb. If a run has to ask twice it ends on the failure
+  notice and opens a staff escalation rather than looping. *Floor: no
+  appointment moves. The cost is another message.*
+- **An unusual reply to a pending confirmation may be re-asked rather than
+  read.** "Not that one, thanks" was read as a decline on one live replay and
+  as a non-answer on another. *Floor: the confirmation reader accepts an exact
+  token or the button and nothing else, so a paraphrase cannot commit in either
+  direction; the re-ask restates the exact time being held.*
+- **The safety screen errs towards escalation, deliberately.** "I have severe
+  knee pain" is passed to a human rather than routed to Orthopedics. A missed
+  emergency is the worst outcome this system has, so the second (model) layer
+  is tuned to over-refer. *Floor: the cost is an administrative request
+  reaching a person who redirects it — never a clinical claim, which no layer
+  is permitted to make.*
+- **A booking that succeeded can still be reported as failed.** When several
+  documents are awaiting verification, the document step can exhaust its
+  per-turn tool budget *after* the appointment has been committed. The
+  appointment is real and correct; the turn ends on the failure notice and
+  raises a staff escalation. *Floor: the commit is transactional and already
+  done — what is wrong is the sentence, and a human is told about it.*
+- **"What documents do I have on file?" is not always recognised as a
+  question.** Appointment and reminder listings are answered deterministically
+  from the database; the documents listing still goes through planning, because
+  pre-empting it would silently stop the verification the step performs — so
+  some phrasings come back as "could you tell me a little more". *Floor:
+  read-only either way; no document state changes.*
+
 ## Configuration
 
 Every setting is environment-based and documented in [`.env.example`](.env.example). `.env` is gitignored and contains no committed values.
