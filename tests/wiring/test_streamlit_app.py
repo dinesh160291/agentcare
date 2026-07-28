@@ -148,6 +148,25 @@ class TestLogin:
         assert at.session_state["token"]
         assert at.session_state["user"]["name"] == "Asha Menon"
 
+    def test_the_refresh_tradeoff_is_stated_on_screen(self, wired_seeded):
+        """The token lives only in session state, so a refresh signs the patient
+        out. That was a *decision* — a token in the URL reaches browser history
+        and logs, and a Streamlit cookie component can only set cookies from
+        JavaScript, so `httpOnly` is impossible and the JWT becomes readable by
+        any script on the page. Both are worse than signing out.
+
+        The decision was to state the tradeoff rather than take either. An
+        unstated tradeoff is the defect; a stated one that nothing pins can
+        disappear in a styling pass and take the honesty with it.
+        """
+        at = _app().run()
+        page = " ".join(block.value for block in at.markdown)
+
+        assert "session ends if you refresh" in page
+        # And the reassurance that makes it survivable: the run is held against
+        # the record, not the tab, so signing back in resumes it.
+        assert "held against your record" in page
+
 
 class TestOnlyRendersWhatItFetched:
     """Change the row behind the UI's back; the screen must follow."""

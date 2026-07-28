@@ -429,3 +429,93 @@ class TestMovingTheOfferToAnotherSlot:
         assert all(
             slot["slot_id"] != run.proposed_slot_id for slot in listed["slots"]
         ), "the time being held is not an alternative to itself"
+
+
+class TestAChoiceMustComeFromTheListThatWasShown:
+    """The appointment-side twin of the unshown-slot rejection.
+
+    An appointment id the model recalls from its context is indistinguishable
+    from one it invented — both arrive as an integer — so once a run has *asked*
+    which appointment, the answer has to be one of the ones it asked about.
+    ``listed_appointment_ids`` is written by ``render_appointment_choice`` at
+    the moment the numbered list is rendered, and by nothing else.
+    """
+
+    def _second_appointment(self, seeded_db) -> Appointment:
+        """A live Dermatology appointment beside Asha's seeded Cardiology one."""
+        slot = slot_in(seeded_db, "Dermatology")
+        doctor = seeded_db.get(Doctor, slot.doctor_id)
+        appointment = Appointment(
+            patient_id=ASHA_PROFILE_ID,
+            doctor_id=doctor.id,
+            slot_id=slot.id,
+            department_id=doctor.department_id,
+            status=AppointmentStatus.CONFIRMED,
+            reason="second appointment for the choice tests",
+            reference_code="AC-009001",
+        )
+        slot.status = SlotStatus.BOOKED
+        seeded_db.add(appointment)
+        seeded_db.flush()
+        return appointment
+
+    def test_an_unlisted_appointment_is_refused(self, seeded_db, asha, run):
+        other = self._second_appointment(seeded_db)
+        run.state = {"listed_appointment_ids": [SEEDED_APPOINTMENT_ID]}
+        seeded_db.flush()
+
+        belt = belt_for(seeded_db, asha, run)
+        result = belt._propose_change(
+            ProposedAction.CANCEL, appointment_id=other.id, slot_id=None
+        )
+
+        assert result["accepted"] is False
+        assert "not one of the choices" in result["problem"]
+        assert run.proposed_action is None
+
+    def test_a_listed_appointment_is_accepted(self, seeded_db, asha, run):
+        other = self._second_appointment(seeded_db)
+        run.state = {"listed_appointment_ids": [SEEDED_APPOINTMENT_ID, other.id]}
+        seeded_db.flush()
+
+        belt = belt_for(seeded_db, asha, run)
+        result = belt._propose_change(
+            ProposedAction.CANCEL, appointment_id=other.id, slot_id=None
+        )
+
+        assert result["accepted"] is True
+        assert run.proposed_appointment_id == other.id
+
+    def test_no_listing_imposes_nothing(self, seeded_db, asha, run):
+        """The single-appointment auto-target path. An empty set is "no list has
+        been shown", not "nothing is allowed" — reading it the other way would
+        break every run that never had to ask."""
+        assert run.state == {}
+        belt = belt_for(seeded_db, asha, run)
+        result = belt._propose_change(
+            ProposedAction.CANCEL, appointment_id=SEEDED_APPOINTMENT_ID, slot_id=None
+        )
+        assert result["accepted"] is True
+
+    def test_both_directions_are_traced(self, seeded_db, asha, run):
+        """A refused invention leaves no other mark, and an accepted choice has
+        to be distinguishable from one that was never checked."""
+        other = self._second_appointment(seeded_db)
+        run.state = {"listed_appointment_ids": [other.id]}
+        seeded_db.flush()
+        belt = belt_for(seeded_db, asha, run)
+
+        belt._propose_change(
+            ProposedAction.CANCEL, appointment_id=SEEDED_APPOINTMENT_ID, slot_id=None
+        )
+        belt._propose_change(
+            ProposedAction.CANCEL, appointment_id=other.id, slot_id=None
+        )
+
+        verdicts = [
+            event.payload["accepted"]
+            for event in seeded_db.query(TraceEvent).all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload["what"] == "appointment_choice"
+        ]
+        assert verdicts == [False, True]

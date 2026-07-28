@@ -29,6 +29,7 @@ from app.models import (
     Department,
     MessageClass,
     PlanStep,
+    ProposedAction,
     TraceEvent,
     TraceEventType,
     WorkflowRun,
@@ -41,6 +42,7 @@ from app.workflow.mapping import (
     apply_consequence,
     mentions_domain_subject,
     primary_intent,
+    says_withdrawal,
     validate_class,
 )
 
@@ -789,3 +791,146 @@ class TestDomainNounsVetoTheOffTopicVerdict:
             and event.payload["what"] == "off_topic_vetoed"
         ]
         assert len(events) == 1
+
+
+class TestWithdrawalNeedsTheWordsForIt:
+    """Item 1(a). The one consequence that destroys the patient's work.
+
+    Live: the agent asked "which appointment, 1 or 2?", the patient answered
+    **"2"**, and gpt-4o-mini classified that as a withdrawal. Validation had
+    nothing to object to — `withdrawal` is a real member of the enum — so the
+    run was cancelled and the patient was told "I've closed that request",
+    which is the opposite of what they had just said.
+
+    The cost asymmetry picks the direction: a wrong withdrawal destroys a
+    request and blames the patient for it; a wrong continuation costs one more
+    message. So a withdrawal is applied only when the message says so.
+    """
+
+    def test_a_bare_number_does_not_withdraw(self, seeded_db, writer):
+        run = make_run(seeded_db, status=S.IN_PROGRESS)
+        outcome = apply_consequence(
+            seeded_db, run, _verdict(M.WITHDRAWAL), writer=writer, message="2"
+        )
+
+        assert outcome.consequence is Consequence.FEED_RUN
+        assert run.status is S.IN_PROGRESS
+        assert run.cancellation_reason is None
+
+    def test_the_class_is_still_recorded_as_withdrawal(self, seeded_db, writer):
+        """The trace has to keep describing the message that arrived. The model
+        really did say withdrawal; only what it may do changed."""
+        run = make_run(seeded_db, status=S.IN_PROGRESS)
+        outcome = apply_consequence(
+            seeded_db, run, _verdict(M.WITHDRAWAL), writer=writer, message="2"
+        )
+        assert outcome.message_class is M.WITHDRAWAL
+
+    def test_a_real_withdrawal_still_withdraws(self, seeded_db, writer):
+        """The direction that must not move. Every phrasing the cue list owns
+        has to keep working, or this guard has traded one broken path for
+        another."""
+        for phrase in (
+            "never mind",
+            "actually never mind, forget it",
+            "forget it",
+            "don't bother",
+            "I no longer need this",
+            "cancel that request",
+            "I've changed my mind",
+        ):
+            run = make_run(seeded_db, status=S.IN_PROGRESS)
+            outcome = apply_consequence(
+                seeded_db, run, _verdict(M.WITHDRAWAL), writer=writer, message=phrase
+            )
+            assert outcome.consequence is Consequence.WITHDRAW, phrase
+            assert run.status is S.CANCELLED, phrase
+
+    def test_the_downgrade_is_traced(self, seeded_db, writer):
+        run = make_run(seeded_db, status=S.IN_PROGRESS)
+        apply_consequence(
+            seeded_db, run, _verdict(M.WITHDRAWAL), writer=writer, message="2"
+        )
+        events = [
+            event
+            for event in seeded_db.query(TraceEvent).all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload["what"] == "withdrawal_cue"
+        ]
+        assert len(events) == 1
+        assert events[0].payload["accepted"] is False
+
+    def test_says_withdrawal_reads_the_words_not_the_intent(self):
+        assert says_withdrawal("actually never mind") is True
+        assert says_withdrawal("2") is False
+        assert says_withdrawal("the second one") is False
+        assert says_withdrawal("") is False
+        assert says_withdrawal(None) is False
+
+
+class TestARunWaitingForAChoiceKeepsTheAnswer:
+    """Item 1, the other half of the same failure.
+
+    Two providers got this wrong in two different ways: gpt-4o-mini called "2"
+    a withdrawal, the mock calls it off-topic. Both are the run refusing to
+    hear an answer to the question it just asked — and "2" carries no
+    administrative noun only because the question already supplied one, which
+    is the reasoning the confirmation state has always used for "hmm, maybe".
+    """
+
+    def _listing_run(self, session):
+        run = make_run(session, status=S.IN_PROGRESS, plan=("cancel",))
+        run.state = {"listed_appointment_ids": [1, 2]}
+        session.flush()
+        return run
+
+    def test_off_topic_becomes_a_continuation(self, seeded_db, writer):
+        run = self._listing_run(seeded_db)
+        outcome = apply_consequence(
+            seeded_db, run, _verdict(M.OFF_TOPIC), writer=writer, message="2"
+        )
+        assert outcome.consequence is Consequence.FEED_RUN
+
+    def test_withdrawal_becomes_a_continuation(self, seeded_db, writer):
+        run = self._listing_run(seeded_db)
+        outcome = apply_consequence(
+            seeded_db, run, _verdict(M.WITHDRAWAL), writer=writer, message="2"
+        )
+        assert outcome.consequence is Consequence.FEED_RUN
+        assert run.status is S.IN_PROGRESS
+
+    def test_a_genuine_withdrawal_still_lands_while_choosing(self, seeded_db, writer):
+        """A patient may abandon a request mid-choice, and saying so must
+        work. The guard is about answers being heard, not about trapping
+        anyone in a listing."""
+        run = self._listing_run(seeded_db)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.WITHDRAWAL),
+            writer=writer,
+            message="actually never mind, forget the whole thing",
+        )
+        assert outcome.consequence is Consequence.WITHDRAW
+        assert run.status is S.CANCELLED
+
+    def test_a_run_with_no_listing_is_unaffected(self, seeded_db, writer):
+        """Scoping control: off-topic during an ordinary run still gets the
+        scope reply, so this has not quietly disabled the guard."""
+        run = make_run(seeded_db, status=S.IN_PROGRESS)
+        outcome = apply_consequence(
+            seeded_db, run, _verdict(M.OFF_TOPIC), writer=writer, message="nvidia stock"
+        )
+        assert outcome.consequence is Consequence.SCOPE_REPLY
+
+    def test_a_listing_already_answered_is_not_still_waiting(self, seeded_db, writer):
+        """Once something is proposed, the choice is made. An off-topic message
+        after that is off-topic again."""
+        run = self._listing_run(seeded_db)
+        run.proposed_action = ProposedAction.CANCEL
+        run.proposed_appointment_id = 1
+        seeded_db.flush()
+        outcome = apply_consequence(
+            seeded_db, run, _verdict(M.OFF_TOPIC), writer=writer, message="nvidia stock"
+        )
+        assert outcome.consequence is Consequence.SCOPE_REPLY

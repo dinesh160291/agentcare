@@ -44,7 +44,12 @@ from app.models import (
 )
 from app.tools.appointments import LIVE_STATUSES
 from app.trace import TraceWriter
-from app.workflow.replies import offered_slot_ids, record_offered, was_offered
+from app.workflow.replies import (
+    listed_appointment_ids,
+    offered_slot_ids,
+    record_offered,
+    was_offered,
+)
 from app.tools import (
     apply_verification,
     diff_required_documents,
@@ -107,6 +112,14 @@ class TurnProposals:
     offered_slots: list[dict] = field(default_factory=list)
     #: This turn answered a question about other times while a proposal stood.
     answered_with_slots: bool = False
+    #: A tool that returns slots actually ran and answered this turn. What the
+    #: reply guard checks an availability claim against: live, a turn whose only
+    #: tool results were two "No department has been decided yet" refusals told
+    #: the patient there were "no available appointment slots in ENT for next
+    #: week", and a search two turns later found 72. A refusal to search is not
+    #: an empty schedule. Set only where slots came back — a refusal leaves it
+    #: alone, which is the whole distinction.
+    searched_slots: bool = False
     #: The window ``resolve_date`` made of the patient's words, when they
     #: scoped their question ("between the 5th and the 10th"). Kept so the
     #: reply can say which period it is answering about.
@@ -143,13 +156,61 @@ class Toolbelt:
 
         The run row is authoritative; session state is the model's scratchpad
         and may never supply a consequential value when a row exists.
+
+        A reschedule or cancellation run never went through routing, so its
+        state holds no department — and the department is not missing, it just
+        lives somewhere else: on the appointment being changed. Without this
+        fallback, "some time next week?" inside a reschedule run reached
+        ``list_other_slots``, got "No department has been decided yet", and the
+        patient was asked to name a department the system already knew — then
+        offered a *cancelled* Dermatology one as the likely answer.
         """
         if self.proposals.department_id is not None:
             return self.proposals.department_id
-        if self.run is not None:
-            value = (self.run.state or {}).get("department_id")
-            return int(value) if value is not None else None
-        return None
+        if self.run is None:
+            return None
+        value = (self.run.state or {}).get("department_id")
+        if value is not None:
+            return int(value)
+        target = self._target_appointment()
+        return target.department_id if target is not None else None
+
+    def _target_appointment(self) -> Appointment | None:
+        """The appointment this run is changing, when that is already settled.
+
+        Settled means one of three things, in order: a proposal names it, a
+        commit recorded it, or the patient has exactly one live appointment and
+        the run is about changing an appointment — the auto-target case, where
+        there was never anything to choose between.
+
+        Never a guess among several. Choosing the referent is language and it
+        belongs to the model, with ``listed_appointment_ids`` standing under
+        it; this is only for reading a department off a decision already made.
+        Ownership is re-checked here because an id on the run is still an id.
+        """
+        run = self.run
+        if run is None:
+            return None
+
+        for candidate_id in (
+            run.proposed_appointment_id,
+            (run.state or {}).get("appointment_id"),
+        ):
+            if candidate_id is None:
+                continue
+            appointment = self.session.get(Appointment, int(candidate_id))
+            if appointment is not None and appointment.patient_id == self.patient_id:
+                return appointment
+
+        planned = set(run.plan or [])
+        if not planned & {PlanStep.RESCHEDULE.value, PlanStep.CANCEL.value}:
+            return None
+        live = list_patient_appointments(
+            self.session, patient_id=self.patient_id, live_only=True
+        )
+        if len(live) != 1:
+            return None
+        return self.session.get(Appointment, live[0]["appointment_id"])
 
     @staticmethod
     def _as_date(value: str) -> date | None:
@@ -358,6 +419,7 @@ class Toolbelt:
         ]
         self.proposals.offered_slots = others
         self.proposals.answered_with_slots = True
+        self.proposals.searched_slots = True
         self.proposals.slot_window = window if window.get("resolved") else None
         # Everything the search returned is answerable, not merely the three
         # the reply lists. "Lets go with 4pm slot" named a time that was in
@@ -569,6 +631,7 @@ class Toolbelt:
                 part_of_day=part_of_day or None,
             )
             self.proposals.offered_slots = list(found.get("slots") or [])
+            self.proposals.searched_slots = True
             return found
 
         def propose_appointment(slot_id: int) -> dict:
@@ -606,13 +669,15 @@ class Toolbelt:
                     "total_matching": 0,
                     "problem": f"Appointment {appointment_id} is not this patient's.",
                 }
-            return find_available_slots(
+            found = find_available_slots(
                 self.session,
                 department_id=appointment.department_id,
                 start=self._as_date(start),
                 end=self._as_date(end),
                 part_of_day=part_of_day or None,
             )
+            self.proposals.searched_slots = True
+            return found
 
         def propose_reschedule(appointment_id: int, slot_id: int) -> dict:
             """Propose moving an existing appointment to a new time. This
@@ -755,6 +820,39 @@ class Toolbelt:
                     "longer be changed."
                 ),
             }
+
+        # If this run has *asked* which appointment, the answer has to be one of
+        # the ones it asked about. The twin of the offered-slot check, and it
+        # exists for the identical reason: an appointment id the model recalls
+        # from its context is indistinguishable from one it invented, because
+        # both arrive as an integer.
+        #
+        # Empty means no listing has been shown — the single-appointment
+        # auto-target path — and imposes nothing.
+        listed = listed_appointment_ids(run)
+        if listed and appointment_id not in listed:
+            self.writer.validation(
+                "appointment_choice",
+                accepted=False,
+                detail={
+                    "appointment_id": appointment_id,
+                    "listed": listed,
+                    "problem": "not one of the appointments offered as a choice",
+                },
+            )
+            return {
+                "accepted": False,
+                "problem": (
+                    f"Appointment {appointment_id} was not one of the choices "
+                    "offered. Use one of the ids that was listed."
+                ),
+            }
+        if listed:
+            self.writer.validation(
+                "appointment_choice",
+                accepted=True,
+                detail={"appointment_id": appointment_id, "listed": listed},
+            )
 
         if action is ProposedAction.RESCHEDULE:
             found = get_slot(self.session, slot_id) if slot_id else {"found": False}

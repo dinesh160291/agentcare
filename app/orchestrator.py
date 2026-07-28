@@ -70,6 +70,7 @@ from app.workflow.mapping import (
     mentions_domain_subject,
     validate_class,
 )
+from app.workflow.queries import QueryKind, answer_query, detect_query
 from app.workflow.plan import (
     advance_plan,
     is_plan_complete,
@@ -78,9 +79,12 @@ from app.workflow.plan import (
     validate_plan,
 )
 from app.workflow.replies import (
+    claims_availability,
     promises_action,
     render_outstanding,
+    listed_appointment_ids,
     render_alternatives,
+    render_appointment_choice,
     render_change_proposal,
     render_proposal,
     render_reask,
@@ -202,6 +206,11 @@ def _task_for(step: PlanStep, run: WorkflowRun, *, message: str, extra: dict) ->
         # history, so "my appointment" means nothing to it without this — and
         # guessing the referent is the one thing story 20 forbids.
         task["appointments"] = _live_appointments(run)
+        # And, once a numbered list has been shown, which ids that list held —
+        # in the order the patient saw. Without it "2" is a number the model
+        # has to map against a listing it wrote itself, which is how a bare
+        # selection reply became unanswerable.
+        task["listed_appointment_ids"] = listed_appointment_ids(run) or None
     task.update(extra)
     return json.dumps({k: v for k, v in task.items() if v is not None}, sort_keys=True)
 
@@ -350,7 +359,15 @@ def _settle_confirmation(
     # above then reads as a stall. Live: "looks good. lets book that time" was
     # answered with "I will proceed to find a suitable time for you. Please
     # hold on", on a turn that was already holding one.
-    lead = "" if stalled else _guarded(coordinator_reply, writer=writer)[0]
+    lead = (
+        ""
+        if stalled
+        else _guarded(
+            coordinator_reply,
+            writer=writer,
+            searched_slots=belt.proposals.searched_slots,
+        )[0]
+    )
     return TurnResult(
         reply=f"{lead}\n{facts}".strip(),
         author=TraceAuthor.LLM if lead else TraceAuthor.TEMPLATE,
@@ -361,27 +378,56 @@ def _settle_confirmation(
     )
 
 
-def _guarded(text: str, *, writer: TraceWriter, fallback: str = "") -> tuple[str, bool]:
-    """Model prose, unless it announces an errand. Returns (text, was_model).
+def _guarded(
+    text: str,
+    *,
+    writer: TraceWriter,
+    fallback: str = "",
+    searched_slots: bool = False,
+) -> tuple[str, bool]:
+    """Model prose, unless it announces an errand or invents availability.
 
-    A reply that says the assistant is off doing something describes a turn
-    that is already over: nothing runs after the reply is written. Live, at
-    ``in_progress``, a side question got "noted as a side question. I will
-    continue... Please hold on for a moment" — twice, with nothing following
-    either time. The patient waits, then repeats themselves, and the stall
-    counter reads their patience as a stall.
+    Returns (text, was_model).
+
+    **The errand.** A reply that says the assistant is off doing something
+    describes a turn that is already over: nothing runs after the reply is
+    written. Live, at ``in_progress``, a side question got "noted as a side
+    question. I will continue... Please hold on for a moment" — twice, with
+    nothing following either time. The patient waits, then repeats themselves,
+    and the stall counter reads their patience as a stall.
+
+    **The invented schedule.** A reply that states what is or is not free has
+    to have looked. Live: "It appears that there are currently no available
+    appointment slots in the ENT department for next week" — on a turn with no
+    ``resolve_date`` and no slot search at all, and contradicted two turns
+    later by a search returning **72** matching slots in that same window. The
+    model had two ``list_other_slots`` results saying *"No department has been
+    decided yet"* and reported a refusal-to-search as an empty schedule.
+
+    ``searched_slots`` is set by the tools that actually return slots, so this
+    is grounding rather than phrasing: a claim with a search behind it passes
+    whatever words it uses, and a claim with nothing behind it fails whatever
+    words it uses. Which is why the wording list can afford to be short.
 
     Applied to every model-authored reply rather than only to the re-ask,
-    because the failure is not a property of the confirmation state — it is a
-    property of a model being asked to say something when the work is done.
+    because neither failure is a property of the confirmation state — both are
+    properties of a model being asked to say something it has no basis for.
     """
-    if text and not promises_action(text):
-        return text, True
-    if text:
+    if not text:
+        return fallback, False
+    if promises_action(text):
         writer.guard_verdict(
             "reply_promises_action", passed=False, detail={"reply": text[:200]}
         )
-    return fallback, False
+        return fallback, False
+    if not searched_slots and claims_availability(text):
+        writer.guard_verdict(
+            "reply_claims_availability",
+            passed=False,
+            detail={"reply": text[:200], "problem": "no slot search ran this turn"},
+        )
+        return fallback, False
+    return text, True
 
 
 def _answer_while_holding(
@@ -779,6 +825,50 @@ async def _turn(
             **base,
         )
 
+    # --- 0b. a listing question is answered from the rows, before planning ---
+    # "What do I have?" has no consequence to weigh, no slot to hold and no
+    # state to move, so routing it through plan-then-delegate makes the answer
+    # depend on whether the Coordinator felt like emitting a plan for that
+    # particular sentence. Live, three phrasings dead-ended in one session
+    # while a fourth worked.
+    #
+    # Before the Coordinator rather than after it, and that ordering is the
+    # whole point: a *fallback* for when planning fails would still be a
+    # lottery, because a wrong plan is as likely as no plan — the mock happily
+    # plans "show my appointments" as a booking and asks which department. This
+    # runs after the safety screen, which is first always, and only where there
+    # is no active run: with one, the same question arrives as a side question
+    # and is answered on that path, with the mapping's record intact.
+    #
+    # Documents are the exception, and the reason is worth stating: the
+    # documents *step* verifies one pending upload per turn, so pre-empting it
+    # would answer the question and quietly stop the work the question used to
+    # trigger. That answer is templated further down instead — the specialist
+    # still runs, and only what the patient is told is code's, which is the
+    # same division the receipt already uses.
+    if run is None:
+        query = detect_query(message)
+        if query is QueryKind.DOCUMENTS:
+            query = None
+        if query is not None:
+            writer.guard_verdict(
+                "listing_query", passed=True, detail={"kind": query.value}
+            )
+            write_audit(
+                session,
+                action="query_answered",
+                entity_type="workflow_run",
+                actor=user,
+                metadata={"kind": query.value},
+            )
+            return TurnResult(
+                reply=answer_query(
+                    session, patient_id=profile.id, kind=query, message=message
+                ),
+                author=TraceAuthor.TEMPLATE,
+                **base,
+            )
+
     # --- 1. a pending confirmation is read in code, before any model call ---
     if run is not None and run.status is WorkflowStatus.PENDING_CONFIRMATION:
         answer = read_confirmation(message)
@@ -1051,8 +1141,26 @@ async def _continue_run(
         if answered is not None:
             return answered
 
+        # And a listing question is answered with the listing. Read-only, so
+        # it disturbs a live run exactly as little as any other side question.
+        query = detect_query(message)
+        if query is not None:
+            return TurnResult(
+                reply=answer_query(
+                    session, patient_id=run.patient_id, kind=query, message=message
+                ),
+                author=TraceAuthor.TEMPLATE,
+                run_id=run.id,
+                status=run.status.value,
+                message_class=outcome.message_class,
+                **base,
+            )
+
         text, from_model = _guarded(
-            coordinator_reply, writer=writer, fallback=NO_PLAN_REPLY
+            coordinator_reply,
+            writer=writer,
+            fallback=NO_PLAN_REPLY,
+            searched_slots=belt.proposals.searched_slots,
         )
         return TurnResult(
             reply=text,
@@ -1146,6 +1254,12 @@ async def _execute_plan(
     #: Set when code replaces what the specialists said. The author on the
     #: outbound event has to name whoever actually wrote the words.
     code_authored = False
+    #: A documents question's templated answer, built while the step runs and
+    #: applied after the loop. Applied at the end rather than mid-loop because
+    #: replacing `said` while later steps are still to speak is how a guard over
+    #: a joined reply drops the good sentence with the bad one.
+    documents_answer = ""
+
     # Each specialist's reply is kept, not overwritten. The booking receipt and
     # the missing-documents list are both things the patient needs; letting the
     # last step win would silently drop whichever mattered most.
@@ -1203,7 +1317,9 @@ async def _execute_plan(
         # ("let me find you a time") must not take the next agent's proposal
         # down with it. Dropping the whole reply left a turn that had proposed
         # a time saying only "could you tell me more about what you need".
-        kept, _ = _guarded(step_reply, writer=writer)
+        kept, _ = _guarded(
+            step_reply, writer=writer, searched_slots=belt.proposals.searched_slots
+        )
         if kept:
             said.append(kept)
 
@@ -1214,6 +1330,24 @@ async def _execute_plan(
         # in the database — contradicted one turn later by the follow-up
         # screen. Nothing to compare is not the same fact as nothing required.
         if step is PlanStep.DOCUMENTS:
+            # A documents *question* gets the templated answer, replacing the
+            # model's inventory prose entirely. The step still ran — the
+            # verification it performs is why this is a replacement here rather
+            # than a pre-empt higher up — and only the saying is code's.
+            #
+            # Live, the model's version dumped a field-by-field inventory and
+            # closed with "since no department has been decided for this
+            # request, there are no additional documents required", to a patient
+            # who had named ENT in the question and had an ENT appointment on
+            # the books. Both halves are now read: the department from the
+            # message or the appointment, the requirements from the diff.
+            if detect_query(message) is QueryKind.DOCUMENTS:
+                documents_answer = answer_query(
+                    session,
+                    patient_id=run.patient_id,
+                    kind=QueryKind.DOCUMENTS,
+                    message=message,
+                )
             outstanding = render_outstanding(session, patient_id=run.patient_id)
             if outstanding:
                 said.append(outstanding)
@@ -1302,12 +1436,48 @@ async def _execute_plan(
             # the model did not produce.
             code_authored = True
 
+    # Nothing proposed, and more than one appointment it could have been: the
+    # specialist is asking which one. That listing is code's, because the
+    # patient's answer to it — "2" — is only meaningful against a list somebody
+    # recorded. Live the model wrote its own numbering, in prose, so when the
+    # patient answered "2" there was nothing anywhere that knew what they meant;
+    # it was classified a withdrawal and cancelled the run.
+    #
+    # `render_appointment_choice` numbers the rows and records the ids in the
+    # same breath, exactly as `render_proposal` does for slots, and returns ""
+    # when there is only one candidate — the auto-target path, where asking
+    # would be a worse answer than acting.
+    if documents_answer:
+        said = [documents_answer]
+        code_authored = True
+
+    change_step = next(
+        (value for value in steps_run if value in ("reschedule", "cancel")), None
+    )
+    if (
+        change_step is not None
+        and run.status is WorkflowStatus.IN_PROGRESS
+        and run.proposed_action is None
+        and not (run.state or {}).get("committed_action")
+    ):
+        choice = render_appointment_choice(
+            session, run, _live_appointments(run), verb=change_step
+        )
+        if choice:
+            said = [choice]
+            code_authored = True
+
     # The Coordinator's acknowledgement is only used when no specialist spoke:
     # "I'll find you an appointment" adds nothing next to "here is the time".
     if said:
         reply, from_model = " ".join(said), not code_authored
     else:
-        reply, from_model = _guarded(fallback_reply, writer=writer, fallback=NO_PLAN_REPLY)
+        reply, from_model = _guarded(
+            fallback_reply,
+            writer=writer,
+            fallback=NO_PLAN_REPLY,
+            searched_slots=belt.proposals.searched_slots,
+        )
     return TurnResult(
         reply=reply,
         author=TraceAuthor.LLM if from_model else TraceAuthor.TEMPLATE,

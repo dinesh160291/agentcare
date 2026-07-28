@@ -1,0 +1,54 @@
+{
+  "name": "choosing-which-appointment",
+  "pins": "A bare \"2\" answering \"which appointment?\" is an answer, not a withdrawal. Live it was classified `withdrawal`, code validated only the class *name* - a real enum member, so nothing objected - and the run was cancelled with the reply \"I've closed that request\". Two things are pinned together. The listing is code's, so `listed_appointment_ids` records what the patient was actually shown and in what order; and the selection is validated against that list, exactly as a re-proposed slot is validated against `offered_slot_ids`. The assertion that matters is the last turn's `appointment_status`: the *second* appointment is cancelled and the first is untouched, which is the only check that can tell a correct selection from a lucky one. Turn 4 must not cancel anything by itself - `proposed_action: cancel` with both appointments still confirmed is the pinned rule holding.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "I need a dermatology appointment next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "proposed_action": "book"
+      }
+    },
+    {
+      "message": "yes",
+      "expect": {
+        "status": "completed",
+        "appointments_created": 1
+      }
+    },
+    {
+      "message": "I want to cancel my appointment",
+      "expect": {
+        "status": "in_progress",
+        "proposed_action": null,
+        "reply_contains": [
+          "more than one upcoming appointment",
+          "1. Cardiology",
+          "2. Dermatology",
+          "Nothing has changed yet"
+        ],
+        "reply_author": "template",
+        "appointment_status": {"1": "confirmed", "2": "confirmed"}
+      }
+    },
+    {
+      "message": "2",
+      "expect": {
+        "status": "pending_confirmation",
+        "proposed_action": "cancel",
+        "appointment_status": {"1": "confirmed", "2": "confirmed"},
+        "reply_contains": ["Dermatology", "cancel it"],
+        "reply_excludes": ["closed that request", "Cardiology"]
+      }
+    },
+    {
+      "message": "yes",
+      "expect": {
+        "status": "completed",
+        "appointment_status": {"1": "confirmed", "2": "cancelled"},
+        "appointments_created": 1
+      }
+    }
+  ]
+}

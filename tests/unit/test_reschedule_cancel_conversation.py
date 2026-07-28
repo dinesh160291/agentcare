@@ -32,6 +32,8 @@ from app.models import (
     Doctor,
     SlotStatus,
     TraceAuthor,
+    TraceEvent,
+    TraceEventType,
     User,
     WorkflowRun,
     WorkflowStatus,
@@ -340,3 +342,115 @@ class TestAChangeProposalStatesBothTimesFromRows:
         result = turn(patient, "I want to cancel my appointment", "s-drift-3")
         assert "AC-000001" in result.reply
         assert "Dr. Nobody" not in result.reply
+
+
+class InventingLlm(MockLlm):
+    """A Coordinator that reports an empty schedule it never looked at.
+
+    The live turn, exactly: two ``list_other_slots`` results reading *"No
+    department has been decided yet"* — a refusal to search — reported to the
+    patient as "there are currently no available appointment slots in the ENT
+    department for next week". Two turns later a search of that same window
+    returned **72** slots.
+
+    The stub answers the coordinator's classify step with prose instead, which
+    is the shape that reaches the patient ungrounded.
+    """
+
+    model: str = "inventing-stub"
+
+    def _change_appointment(self, llm_request, done, task, step):  # noqa: ANN001
+        return text_response(
+            "It appears that there are currently no available appointment "
+            "slots in the Cardiology department for next week."
+        )
+
+
+class TestAnAvailabilityClaimNeedsASearchBehindIt:
+    """Item 2. A reply about the schedule is grounded or it is not said."""
+
+    @pytest.fixture
+    def inventing(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: InventingLlm()
+        )
+
+    def test_an_ungrounded_claim_never_reaches_the_patient(self, patient, inventing):
+        result = turn(patient, "I want to reschedule my appointment", "s-invent-1")
+
+        assert "no available appointment slots" not in result.reply
+        assert "fully booked" not in result.reply
+        # The turn still answers. The guard drops the ungrounded sentence, not
+        # the turn — a silent reply would be its own defect.
+        assert result.reply.strip()
+
+    def test_the_rejection_is_traced(self, patient, inventing):
+        result = turn(patient, "I want to reschedule my appointment", "s-invent-2")
+
+        session = SessionLocal()
+        try:
+            verdicts = [
+                event.payload
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.GUARD_VERDICT
+                and event.payload["guard"] == "reply_claims_availability"
+            ]
+        finally:
+            session.close()
+
+        assert len(verdicts) == 1
+        assert verdicts[0]["passed"] is False
+
+
+class TestARescheduleRunKnowsItsOwnDepartment:
+    """Item 2's other half. A reschedule never went through routing, so the
+    run's state holds no department — but the department is not missing, it is
+    on the appointment being moved.
+
+    Live, "some time next week?" inside a reschedule run reached
+    ``list_other_slots``, got "No department has been decided yet", and the
+    patient was asked to name a department the system already knew — then
+    offered a **cancelled** Dermatology appointment as the likely answer.
+    """
+
+    def test_a_timing_question_returns_real_times(self, patient):
+        turn(patient, "I want to reschedule my appointment", "s-dept-1")
+        result = turn(patient, "some time next week?", "s-dept-1")
+
+        assert "no department" not in result.reply.lower()
+        assert "which department" not in result.reply.lower()
+
+        session = SessionLocal()
+        try:
+            appointment = session.get(Appointment, SEEDED_APPOINTMENT_ID)
+            department = appointment.department.name
+        finally:
+            session.close()
+
+        # Real rows, in the appointment's own department, inside the window.
+        assert "August" in result.reply
+        assert department == "Cardiology"
+
+    def test_the_times_offered_are_that_departments(self, patient):
+        """Not merely non-empty: a search in the wrong department would also
+        return times, and would move the patient's Cardiology visit to a
+        clinic that has nothing to do with it."""
+        result = turn(patient, "I want to reschedule my appointment", "s-dept-2")
+        turn(patient, "some time next week?", "s-dept-2")
+
+        session = SessionLocal()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            offered = (run.state or {}).get("offered_slot_ids") or []
+            departments = {
+                session.get(AppointmentSlot, slot_id).doctor.department_id
+                for slot_id in offered
+            }
+            appointment = session.get(Appointment, SEEDED_APPOINTMENT_ID)
+        finally:
+            session.close()
+
+        assert offered, "nothing was offered; the search never ran"
+        assert departments == {appointment.department_id}

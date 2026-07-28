@@ -1,0 +1,64 @@
+{
+  "name": "listing-questions-are-answered",
+  "pins": "\"What do I have?\" is answered from the rows, before planning. Live, three phrasings dead-ended in one session while a fourth worked - nothing separated them except which sentence the Coordinator felt like planning for, which is not a property a patient can be asked to guess. Answering *before* the Coordinator rather than after it is the whole fix: a fallback for when planning fails would still be a lottery, because a wrong plan is as likely as no plan (the mock plans \"show my appointments\" as a booking and asks which department). Every turn here also asserts `reply_author: template` - the answer is assembled from rows, so a model-authored reply would mean the query path never ran even if the words happened to be right. The last two turns are the controls: an action naming the same nouns must still book, and a genuinely off-topic message must still be refused.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "show my appointments",
+      "expect": {
+        "reply_contains": ["AC-000001", "Cardiology", "Dr. Anita Rao", "9:00 AM"],
+        "reply_excludes": ["could you tell me a little more", "which department", "09:00"],
+        "reply_author": "template",
+        "runs_for_patient": 0
+      }
+    },
+    {
+      "message": "show my upcoming appointments?",
+      "expect": {
+        "reply_contains": ["AC-000001"],
+        "reply_excludes": ["could you tell me a little more"],
+        "reply_author": "template",
+        "runs_for_patient": 0
+      }
+    },
+    {
+      "message": "what appointments I have coming up?",
+      "expect": {
+        "reply_contains": ["AC-000001"],
+        "reply_author": "template",
+        "runs_for_patient": 0
+      }
+    },
+    {
+      "message": "any reminders for me?",
+      "expect": {
+        "reply_contains": ["reminder"],
+        "reply_excludes": ["could you tell me a little more"],
+        "reply_author": "template",
+        "runs_for_patient": 0
+      }
+    },
+    {
+      "message": "what documents I have on file?",
+      "expect": {
+        "reply_contains": ["Documents on file"],
+        "reply_excludes": ["could you tell me a little more", "no department has been decided"],
+        "reply_author": "template"
+      }
+    },
+    {
+      "message": "I need a cardiology appointment next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "proposed_action": "book"
+      }
+    },
+    {
+      "message": "who won the fifa world cup?",
+      "expect": {
+        "reply_author": "guard",
+        "reply_contains": ["I can help with hospital administration"]
+      }
+    }
+  ]
+}

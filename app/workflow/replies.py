@@ -94,6 +94,38 @@ _ACTION_PROMISES = (
     "searching for",
 )
 
+#: Phrases that assert something about the schedule — in either direction. A
+#: reply containing one of these is making a claim only a slot search can
+#: support, and :func:`claims_availability` is checked *only* on turns where no
+#: search ran, so a grounded reply never meets it whatever words it chose.
+#:
+#: The live sentence: "It appears that there are currently no available
+#: appointment slots in the ENT department for next week" — written on a turn
+#: whose only tool results were two refusals reading "No department has been
+#: decided yet", and contradicted two turns later by a search that returned 72
+#: slots in that exact window. A refusal to search is not an empty schedule,
+#: and those are the two things this stops a paraphrase from merging.
+_AVAILABILITY_CLAIMS = (
+    "no available",
+    "no availability",
+    "not available",
+    "no appointment slots",
+    "no slots",
+    "no free",
+    "no times",
+    "no openings",
+    "nothing available",
+    "fully booked",
+    "are available",
+    "is available",
+    "slots available",
+    "times available",
+    "availability for",
+    "have availability",
+    "there are slots",
+    "there is a slot",
+)
+
 
 # --- the offered set ------------------------------------------------------
 
@@ -290,6 +322,63 @@ def render_alternatives(
     )
 
 
+def listed_appointment_ids(run: WorkflowRun) -> list[int]:
+    """Every appointment this run has actually listed for the patient to choose."""
+    return list((run.state or {}).get("listed_appointment_ids") or [])
+
+
+def was_listed(run: WorkflowRun, appointment_id: int) -> bool:
+    """Has this run offered the patient this appointment as a choice?"""
+    return appointment_id in listed_appointment_ids(run)
+
+
+def render_appointment_choice(
+    session: Session, run: WorkflowRun, appointments: Sequence[dict[str, Any]], *, verb: str
+) -> str:
+    """Ask which appointment, numbering them — and record what was numbered.
+
+    The twin of :func:`render_proposal`, for the same reason and with the same
+    rule: **rendering and recording are one step.** A patient who answers "2"
+    is answering the list they were shown, so the list has to be code's or the
+    answer means nothing. Live it was the model's — it wrote its own numbered
+    listing in prose, and nothing anywhere knew what "2" referred to.
+
+    ``listed_appointment_ids`` is the appointment-side ``offered_slot_ids``,
+    born from the rows this function renders and from nowhere else, because an
+    appointment id the model recalls is indistinguishable from one it invented:
+    both arrive as an integer.
+
+    Returns "" for fewer than two candidates — with one appointment there is
+    nothing to choose between, and asking would be a worse answer than acting.
+    """
+    rows = list(appointments or [])
+    if len(rows) < 2:
+        return ""
+
+    lines = []
+    for index, row in enumerate(rows, start=1):
+        when = ""
+        if row.get("start"):
+            day, time = _when(row["start"])
+            when = f" on {day} at {time}"
+        lines.append(
+            f"{index}. {row.get('department_name')} with {row.get('doctor_name')}"
+            f"{when} ({row.get('reference_code')})"
+        )
+
+    state = dict(run.state or {})
+    state["listed_appointment_ids"] = [int(row["appointment_id"]) for row in rows]
+    run.state = state
+
+    action = "cancel" if verb == "cancel" else "move"
+    return (
+        f"You have more than one upcoming appointment, so I want to be sure "
+        f"which one to {action}:\n"
+        + "\n".join(lines)
+        + "\nTell me the number, or name the department. Nothing has changed yet."
+    )
+
+
 def render_change_proposal(session: Session, run: WorkflowRun) -> str:
     """What the patient is asked before a reschedule or a cancellation.
 
@@ -409,6 +498,20 @@ def promises_action(text: str) -> bool:
     """
     lowered = re.sub(r"[’']", "'", (text or "").lower())
     return any(phrase in lowered for phrase in _ACTION_PROMISES)
+
+
+def claims_availability(text: str) -> bool:
+    """Does this text assert what is or is not free?
+
+    The companion to :func:`promises_action`, and the same shape of guard with
+    the same cheap false-positive direction — a rejected reply falls back to a
+    template carrying the facts. The difference is that this one is only ever
+    consulted when **no slot search ran this turn**, so it is not really a
+    judgement about wording: a claim about the schedule with nothing behind it
+    is wrong however it is phrased.
+    """
+    lowered = re.sub(r"[’']", "'", (text or "").lower())
+    return any(phrase in lowered for phrase in _AVAILABILITY_CLAIMS)
 
 
 # --- the receipt ----------------------------------------------------------
@@ -547,16 +650,19 @@ __all__ = [
     "MAX_OPTIONS",
     "REMINDER_LINE",
     "UPLOAD_POINTER",
+    "listed_appointment_ids",
     "offered_slot_ids",
     "promises_action",
     "record_offered",
     "render_alternatives",
+    "render_appointment_choice",
     "render_change_proposal",
     "render_options",
     "render_outstanding",
     "render_proposal",
     "render_reask",
     "render_receipt",
+    "was_listed",
     "was_offered",
     "clock_time",
     "when_words",

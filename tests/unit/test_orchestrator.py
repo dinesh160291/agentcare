@@ -1454,6 +1454,14 @@ class TestTheScopeGateDoesNotRefuseItsOwnSubject:
     Code cannot supply the plan the Coordinator did not produce — that would
     put the deterministic layer in the planning bin — so what changes is the
     reply: "tell me more", not "I don't do that".
+
+    The live message itself has since moved on: "can you tell me my
+    appointments" is a *listing question* and is now answered from the rows
+    before planning is reached at all (see
+    ``TestListingQuestionsAreAnsweredFromTheRows``). What remains for the veto
+    is the wider case — a message that names something this system owns and
+    still produced no plan — so these use a phrasing that names the subject
+    without asking for a list.
     """
 
     @pytest.fixture
@@ -1471,12 +1479,12 @@ class TestTheScopeGateDoesNotRefuseItsOwnSubject:
         )
 
     def test_a_message_naming_appointments_is_not_refused(self, patient, unplanning):
-        result = turn(patient, "can you tell me my appointments", "s-veto-1")
+        result = turn(patient, "my appointment situation is confusing", "s-veto-1")
         assert result.reply != SCOPE_REPLY
         assert result.author is TraceAuthor.TEMPLATE
 
     def test_it_is_never_answered_with_a_scope_refusal_audit(self, patient, unplanning):
-        turn(patient, "can you tell me my appointments", "s-veto-2")
+        turn(patient, "my appointment situation is confusing", "s-veto-2")
 
         session = fresh()
         try:
@@ -1519,7 +1527,7 @@ class TestTheScopeGateDoesNotRefuseItsOwnSubject:
             session.close()
 
     def test_the_gate_records_which_way_it_went(self, patient, unplanning):
-        result = turn(patient, "can you tell me my appointments", "s-veto-4")
+        result = turn(patient, "my appointment situation is confusing", "s-veto-4")
 
         session = fresh()
         try:

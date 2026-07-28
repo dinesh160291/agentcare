@@ -277,6 +277,56 @@ def validate_class(
     )
 
 
+#: What a patient abandoning a request actually says. Code-owned, and the
+#: authority on whether a withdrawal may be *applied* — the model still
+#: proposes the class, as it does for every other class, but this is the one
+#: consequence that destroys the patient's work, so code checks the words
+#: before executing it.
+#:
+#: The live case is as small as it gets. The agent asked "which appointment, 1
+#: or 2?", the patient answered **"2"**, and gpt-4o-mini classified that as a
+#: withdrawal. Code validated the class *name* — a real member of the enum, so
+#: nothing objected — cancelled the run, and replied "I've closed that
+#: request". The patient had said the opposite of that.
+#:
+#: The cost asymmetry decides which way the doubtful case falls: a withdrawal
+#: applied wrongly destroys a request and tells the patient it was their idea;
+#: a withdrawal missed costs one more message. So the rule is *cue required*,
+#: and a message with no cue is fed to the run instead.
+#:
+#: Deliberately a twin of the mock's ``WITHDRAWAL_CUES`` rather than an import.
+#: The mock's list is how the understudy *proposes* a class; this one is what
+#: code will *apply*, and a provider sharing the guard that checks it would be
+#: marking its own work.
+WITHDRAWAL_CUES: tuple[str, ...] = (
+    "never mind",
+    "nevermind",
+    "no mind",
+    "forget it",
+    "forget about it",
+    "forget the whole",
+    "don't bother",
+    "dont bother",
+    "no longer need",
+    "not interested",
+    "leave it",
+    "drop it",
+    "cancel that request",
+    "cancel the request",
+    "cancel my request",
+    "cancel this request",
+    "withdraw",
+    "call the whole thing off",
+    "changed my mind",
+)
+
+
+def says_withdrawal(text: str) -> bool:
+    """Whether the message actually contains a withdrawal cue."""
+    lowered = (text or "").lower()
+    return any(cue in lowered for cue in WITHDRAWAL_CUES)
+
+
 #: Things this system owns. A message naming one of them is asking about this
 #: system's business, whatever else it does or fails to do.
 #:
@@ -380,6 +430,19 @@ def _supersede_needs_difference(
     return True
 
 
+def _awaiting_selection(run: WorkflowRun) -> bool:
+    """Has this run shown a numbered list and not yet had an answer to it?
+
+    ``listed_appointment_ids`` is written by ``render_appointment_choice`` at
+    the moment the list is rendered, and it outlives the answer — so "still
+    waiting" also needs nothing to have been proposed or committed since.
+    """
+    state = run.state or {}
+    if not state.get("listed_appointment_ids"):
+        return False
+    return run.proposed_action is None and not state.get("committed_action")
+
+
 def _retire(
     session: Session, run: WorkflowRun, *, note: str, actor: User | None
 ) -> None:
@@ -443,6 +506,50 @@ def apply_consequence(
     # — recording it as something else would make the trace describe a
     # different message — and only what it may *do* changes: it becomes the
     # read-only class, which touches exactly as little.
+    # The consequence that destroys work needs the patient to have asked for
+    # it. "2", answering "which appointment, 1 or 2?", was classified as a
+    # withdrawal and cancelled the run — the class name was a real enum member,
+    # so validation had nothing to object to, and the reply said "I've closed
+    # that request" to a patient who was in the middle of making one.
+    #
+    # Downgraded to continuation rather than refused outright: the message was
+    # still the patient talking to their own run, and feeding it in is what
+    # answers "2". The class stays `withdrawal` in the trace — it is what the
+    # model said — and only what it may do changes.
+    if consequence is Consequence.WITHDRAW and not says_withdrawal(message):
+        writer.validation(
+            "withdrawal_cue",
+            accepted=False,
+            detail={
+                "problem": "no withdrawal cue in the message",
+                "applied": Consequence.FEED_RUN.value,
+            },
+        )
+        consequence = Consequence.FEED_RUN
+
+    # A run that has just asked the patient a question cannot then rule their
+    # answer out of the conversation. "2", answering "which one, 1 or 2?",
+    # carries no administrative noun only because the question already supplied
+    # one — the same reasoning the confirmation state has always used for "hmm,
+    # maybe". Two providers reached this two different ways: gpt-4o-mini called
+    # it a withdrawal (caught above), the mock calls it off-topic.
+    #
+    # Only off-topic is downgraded here. A withdrawal mid-choice is handled by
+    # the cue check above, which lets a genuine "forget the whole thing" land:
+    # this guard is about answers being heard, not about trapping a patient in
+    # a listing they no longer want.
+    if consequence is Consequence.SCOPE_REPLY and _awaiting_selection(run):
+        writer.validation(
+            "selection_pending",
+            accepted=False,
+            detail={
+                "proposed": consequence.value,
+                "applied": Consequence.FEED_RUN.value,
+                "problem": "the run is waiting for the patient to choose",
+            },
+        )
+        consequence = Consequence.FEED_RUN
+
     if consequence is Consequence.SCOPE_REPLY and mentions_domain_subject(message):
         writer.validation(
             "off_topic_vetoed",
@@ -518,7 +625,9 @@ __all__ = [
     "Consequence",
     "MappingOutcome",
     "apply_consequence",
+    "WITHDRAWAL_CUES",
     "mentions_domain_subject",
     "primary_intent",
+    "says_withdrawal",
     "validate_class",
 ]

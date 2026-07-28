@@ -324,8 +324,53 @@ def mentions_documents(text: str) -> bool:
     return _has(text, DOCUMENT_CUES)
 
 
+#: How a patient names a position in a list they were just shown.
+_ORDINAL_WORDS = {
+    "first": 1, "1st": 1, "one": 1,
+    "second": 2, "2nd": 2, "two": 2,
+    "third": 3, "3rd": 3, "three": 3,
+    "fourth": 4, "4th": 4, "four": 4,
+    "fifth": 5, "5th": 5, "five": 5,
+}
+
+
+def _names_a_position(text: str, count: int) -> int | None:
+    """A 1-based position the patient named, if the message is a selection.
+
+    Only the **last line** is read, because the specialist's ``request_text``
+    is the whole request with each new message appended: "I want to cancel my
+    appointment
+2". The selection is what they just said, not what the
+    accumulated text happens to contain — "I want 2 appointments" earlier in a
+    run must not read as a pick.
+
+    Read here, in the provider, on purpose. Mapping "2" to a row is the
+    *proposal* — the understudy's job, the same judgement a live model makes —
+    and code's job is the check that follows it: the id has to be one this run
+    actually listed. That check lives in ``_propose_change``.
+    """
+    last = (text or "").strip().splitlines()[-1:] or [""]
+    words = re.findall(r"[a-z0-9]+", last[0].lower())
+    if not words:
+        return None
+    # A bare number, or an ordinal word, and nothing else of substance. A whole
+    # sentence that merely contains "two" is not a selection.
+    scaffold = {"the", "one", "option", "number", "no", "please", "lets", "let", "us"}
+    meaningful = [w for w in words if w not in scaffold or w in _ORDINAL_WORDS]
+    for word in meaningful:
+        if word.isdigit():
+            position = int(word)
+            if 1 <= position <= count and len(meaningful) <= 3:
+                return position
+        elif word in _ORDINAL_WORDS and len(meaningful) <= 3:
+            position = _ORDINAL_WORDS[word]
+            if 1 <= position <= count:
+                return position
+    return None
+
+
 def _pick_appointment(
-    candidates: list[dict[str, Any]], request_text: str
+    candidates: list[dict[str, Any]], request_text: str, listed: list | None = None
 ) -> dict[str, Any] | None:
     """Which appointment the patient meant, or ``None`` if it is not clear.
 
@@ -335,14 +380,24 @@ def _pick_appointment(
     "explicit confirmation of exactly which appointment" — which is worth
     nothing if the referent was picked by coincidence.
 
-    One candidate needs no picking. More than one is resolved only by something
-    the patient actually wrote — a department, a doctor, or a date — and only
-    when exactly one candidate matches it.
+    One candidate needs no picking. More than one is resolved by a position in
+    a list the run has actually shown, or by something the patient wrote — a
+    department, a doctor, or a date — and only when exactly one matches.
     """
     if not candidates:
         return None
     if len(candidates) == 1:
         return candidates[0]
+
+    # A position only means something against a list that was shown. Without
+    # `listed` there is no numbering to count against, so "2" is just a number.
+    if listed:
+        position = _names_a_position(request_text, len(listed))
+        if position is not None:
+            chosen_id = listed[position - 1]
+            for row in candidates:
+                if row.get("appointment_id") == chosen_id:
+                    return row
 
     lowered = (request_text or "").lower()
     for key in ("department_name", "doctor_name"):
@@ -879,7 +934,11 @@ class MockLlm(AgentCareLlm):
                 "Would you like to book one?"
             )
 
-        target = _pick_appointment(candidates, str(task.get("request_text") or ""))
+        target = _pick_appointment(
+            candidates,
+            str(task.get("request_text") or ""),
+            task.get("listed_appointment_ids"),
+        )
         if target is None:
             # More than one, and nothing in the request singles one out. Ask.
             return text_response(_which_one(candidates, step))

@@ -31,6 +31,7 @@ from app.models import (
 )
 from app.workflow.replies import (
     UPLOAD_POINTER,
+    claims_availability,
     offered_slot_ids,
     promises_action,
     record_offered,
@@ -417,3 +418,32 @@ class TestTheOutstandingLine:
         seeded_db.flush()
 
         assert render_outstanding(seeded_db, patient_id=2) == ""
+
+
+class TestAvailabilityClaimsAreGrounded:
+    """Item 2's wording half. The guard itself is in ``_guarded``, which only
+    consults this on turns where no slot search ran — so the list can be short
+    without being a lottery."""
+
+    def test_the_live_sentence_is_caught(self):
+        assert claims_availability(
+            "It appears that there are currently no available appointment slots "
+            "in the ENT department for next week."
+        ) is True
+
+    def test_both_directions_count(self):
+        """A confident "there are slots on Tuesday" with nothing behind it is
+        the same defect wearing the opposite sign, and it is the one that sends
+        a patient to a clinic."""
+        assert claims_availability("There are slots available on Tuesday") is True
+        assert claims_availability("ENT is fully booked that week") is True
+
+    def test_ordinary_administrative_prose_is_not_a_claim(self):
+        for text in (
+            "Which department would you like?",
+            "Your appointment is confirmed for Monday 3 August at 9:00 AM.",
+            "I can move it to Monday 3 August at 9:00 AM.",
+            "Could you tell me what date or time would suit you?",
+            "",
+        ):
+            assert claims_availability(text) is False, text
