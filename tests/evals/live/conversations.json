@@ -645,5 +645,61 @@
         }
       }
     ]
+  },
+
+  {
+    "name": "clarify-into-another-department",
+    "pins": "Round 6 item 2. A declined General Medicine proposal, then a clarification naming a different desk. The model calls that a *continuation* with no steps of its own, so the subject check on the supersede path never sees it — before the fix the run kept General Medicine and re-proposed its slots, and every reworded clarification did the same thing, because each one was another continuation. `same_run: false` is the whole assertion: the eye request must not be answered by the run that routed elsewhere.",
+    "patient": "asha.patient@example.invalid",
+    "turns": [
+      {
+        "message": "I need a general medicine appointment",
+        "expect": {"status": "pending_confirmation"}
+      },
+      {
+        "message": "no",
+        "expect": {"status": "in_progress"}
+      },
+      {
+        "message": "let me clarify - appointment for vision issues",
+        "expect": {"same_run": false, "reply_excludes": ["General Medicine"]}
+      }
+    ]
+  },
+
+  {
+    "name": "a-timing-refinement-keeps-its-run",
+    "pins": "The negative control for the rule above, and what keeps it narrow. 'Some time next week' names no department, so it is exactly what it was classified as — a continuation of the request the patient is still making. A rule that superseded here would have turned every refinement into a restart.",
+    "patient": "rohan.patient@example.invalid",
+    "turns": [
+      {
+        "message": "I need a general medicine appointment",
+        "expect": {"status": "pending_confirmation"}
+      },
+      {
+        "message": "no",
+        "expect": {"status": "in_progress"}
+      },
+      {
+        "message": "some time next week please",
+        "expect": {"same_run": true}
+      }
+    ]
+  },
+
+  {
+    "name": "documents-question-phrased-as-submitting",
+    "pins": "Round 6 item 4. 'Do I need to submit any documentations for this visit?' came back as the appointments list. Documents already outranked appointments; the precedence did no work because `\\bdocuments?\\b` stops at 'documents', so 'documentations' matched nothing and the only subject word left standing was 'visit'.",
+    "patient": "asha.patient@example.invalid",
+    "turns": [
+      {
+        "message": "do I need to submit any documentations for this visit?",
+        "expect": {
+          "reply_author": "template",
+          "reply_contains": ["Documents on file"],
+          "reply_excludes": ["Your upcoming appointment"]
+        }
+      }
+    ]
   }
 ]

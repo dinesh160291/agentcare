@@ -94,12 +94,17 @@ code — no model output can reach it.
   as a non-answer on another. *Floor: the confirmation reader accepts an exact
   token or the button and nothing else, so a paraphrase cannot commit in either
   direction; the re-ask restates the exact time being held.*
-- **The safety screen errs towards escalation, deliberately.** "I have severe
-  knee pain" is passed to a human rather than routed to Orthopedics. A missed
-  emergency is the worst outcome this system has, so the second (model) layer
-  is tuned to over-refer. *Floor: the cost is an administrative request
-  reaching a person who redirects it — never a clinical claim, which no layer
-  is permitted to make.*
+- **The safety screen errs towards escalation, and which phrasing trips it is
+  not stable.** The first layer is a code-owned phrase list and behaves the
+  same way every time. The second is a model, and it is both conservative and
+  sensitive to wording: "I have severe knee pain" has been passed to a human
+  rather than routed to Orthopedics, while "severe ear pain" — the same
+  sentence shape — has gone through to routing on another run. A missed
+  emergency is the worst outcome this system has, so the layer is tuned to
+  over-refer and no attempt is made to talk it down. *Floor: the trade is
+  one-directional. An over-refer sends an administrative request to a person
+  who redirects it; nothing routes **past** the screen, and no layer of it is
+  permitted to make a clinical claim in either direction.*
 - **Uploaded documents are verified one per conversational turn.** A patient
   who files three at once has them checked over the next few exchanges rather
   than all at once. This is a deliberate bound, not a backlog: verifying an

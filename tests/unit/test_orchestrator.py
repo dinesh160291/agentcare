@@ -2213,3 +2213,65 @@ class TestRoutingDoesNotReRunOnAQueuedRun:
             )
         finally:
             session.close()
+
+
+class TestClarifyingIntoAnotherDepartment:
+    """The live dead end, end to end: three turns, and the third must escape.
+
+    A General Medicine proposal, declined, then "let me clarify — appointment
+    for vision issues". Before the fix this test's third turn stayed on run 1
+    and re-proposed General Medicine slots — the mock reproduced it exactly, so
+    the failure was structural rather than a live model's bad day. What made it
+    a *dead end* rather than a wrong answer is that clarifying again did the
+    same thing: the model reads a clarification as a continuation, and a
+    continuation was fed into a run whose routing step had already closed.
+    """
+
+    SESSION = "s-clarify-department"
+
+    def _declined_general_medicine(self, patient):
+        first = turn(patient, "I need a general medicine appointment", self.SESSION)
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        declined = turn(patient, "no", self.SESSION)
+        assert declined.status == WorkflowStatus.IN_PROGRESS.value
+        return first.run_id
+
+    def test_naming_another_department_re_routes(self, patient):
+        original = self._declined_general_medicine(patient)
+
+        result = turn(
+            patient, "let me clarify - appointment for vision issues", self.SESSION
+        )
+
+        assert result.run_id != original, "the eye request stayed in the GM run"
+        session = fresh()
+        try:
+            assert session.get(WorkflowRun, original).status is WorkflowStatus.CANCELLED
+            replacement = session.get(WorkflowRun, result.run_id)
+            assert replacement.state["department_name"] == "Ophthalmology"
+        finally:
+            session.close()
+
+    def test_the_reply_is_about_the_department_the_patient_named(self, patient):
+        self._declined_general_medicine(patient)
+        result = turn(
+            patient, "let me clarify - appointment for vision issues", self.SESSION
+        )
+        assert "General Medicine" not in result.reply
+
+    def test_a_timing_refinement_keeps_the_run(self, patient):
+        """The negative control, and the one that keeps the rule narrow. "Some
+        time next week" names no department, so it is what it was classified as
+        — a continuation of the request the patient is still making."""
+        original = self._declined_general_medicine(patient)
+
+        result = turn(patient, "some time next week please", self.SESSION)
+
+        assert result.run_id == original
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, original)
+            assert run.status is not WorkflowStatus.CANCELLED
+            assert run.state["department_name"] == "General Medicine"
+        finally:
+            session.close()

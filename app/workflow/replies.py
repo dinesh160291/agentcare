@@ -293,7 +293,7 @@ def render_proposal(session: Session, run: WorkflowRun, slots: Sequence[dict]) -
     record_offered(run, shortlist)
     return (
         "Here are the earliest times I can offer:\n"
-        f"{options}\n"
+        f"{options}\n\n"
         'Say "yes" to take the one I\'m holding, or tell me which of the '
         "others you'd like."
     )
@@ -318,7 +318,7 @@ def render_alternatives(
         )
     record_offered(run, shortlist)
     return (
-        f"Other times that are free:\n{options}\n" + render_reask(session, run)
+        f"Other times that are free:\n{options}\n\n" + render_reask(session, run)
     )
 
 
@@ -375,7 +375,7 @@ def render_appointment_choice(
         f"You have more than one upcoming appointment, so I want to be sure "
         f"which one to {action}:\n"
         + "\n".join(lines)
-        + "\nTell me the number, or name the department. Nothing has changed yet."
+        + "\n\nTell me the number, or name the department. Nothing has changed yet."
     )
 
 
@@ -531,6 +531,16 @@ def _document_lines(session: Session, run: WorkflowRun) -> list[str]:
     diff = diff_required_documents(
         session, patient_id=run.patient_id, department_id=int(department_id)
     )
+    if not diff["required"]:
+        # General Medicine asks for nothing, so the receipt said nothing, and a
+        # patient read the silence as an omission — then went looking for the
+        # paperwork section that was never coming. This is the *opposite* case
+        # from the documents listing's careful silence: there, no department had
+        # been resolved and "nothing is required" would have been a claim about
+        # a hospital nobody had consulted. Here the department is known and the
+        # rules table is empty, so the sentence is a fact about this visit.
+        return ["No documents are needed for this visit."]
+
     lines = []
     if diff["satisfied"]:
         lines.append(f"Already on file: {', '.join(diff['satisfied'])}.")
@@ -643,7 +653,13 @@ def render_receipt(session: Session, run: WorkflowRun) -> str:
             "no reminder to send — please come along at that time."
         )
 
-    return "\n".join(part for part in parts if part)
+    # Blank-line separated, because these are the facts the patient acts on and
+    # markdown collapses a single newline. ``_document_lines`` goes to some
+    # trouble to keep a mandatory document and an optional one in separate
+    # sentences; joining them with one newline handed them back to the renderer
+    # to weld into a paragraph, which is most of the way back to the "still
+    # needed, which is optional" clause that started all of this.
+    return "\n\n".join(part for part in parts if part)
 
 
 __all__ = [

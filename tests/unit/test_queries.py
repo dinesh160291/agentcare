@@ -215,3 +215,65 @@ class TestRenderingDocuments:
             message="what documents do I need to bring for my ent visit?",
         )
         assert "Documents page" in answer
+
+
+class TestDocumentWordsOutrankAppointmentWords:
+    """One sentence naming both subjects must be read as the more specific one.
+
+    "Do I need to submit any documentations for this visit?" came back as the
+    appointments list. The precedence was already documents-first, and that was
+    not the bug: ``\bdocuments?\b`` matches "document" and "documents" and
+    stops there, so "documentations" matched nothing at all and the only
+    subject word left standing was "visit". A precedence rule between two
+    patterns does no work when one of them never fires.
+    """
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "do I need to submit any documentations for this visit?",
+            "what documentation do I need to bring for my appointment?",
+            "what do I need to bring to my appointment",
+        ],
+    )
+    def test_a_documents_question_that_also_names_a_visit(self, message):
+        assert detect_query(message) is QueryKind.DOCUMENTS
+
+    def test_a_question_carrying_an_action_verb_still_falls_through(self):
+        """The boundary, recorded rather than widened.
+
+        "Is there any paperwork I should upload before my visit?" is a genuine
+        question, and it is *not* detected: "upload" is an action word, and the
+        only carve-out from the action filter is the requirements phrasing that
+        was found live. Widening it to cover this would trade a fall-through —
+        the message goes on to be planned exactly as it is today — for a risk
+        in the direction that costs a booking, and no transcript has asked for
+        that trade.
+        """
+        assert detect_query("is there any paperwork I should upload before my visit?") is None
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "show my appointments",
+            "what appointments I have coming up?",
+            "list my bookings",
+        ],
+    )
+    def test_a_plain_appointments_question_is_unaffected(self, message):
+        """The scoping control. Widening the document vocabulary must not turn
+        every listing question into a documents question."""
+        assert detect_query(message) is QueryKind.APPOINTMENTS
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "upload my ecg report",
+            "I want to submit my x-ray",
+            "please book me an appointment and I'll bring the report",
+        ],
+    )
+    def test_an_instruction_is_still_not_a_question(self, message):
+        """The dangerous direction, unchanged: "upload" and "submit" now name
+        the subject, and naming a subject is not asking about it."""
+        assert detect_query(message) is None

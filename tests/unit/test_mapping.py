@@ -1096,3 +1096,165 @@ class TestARunWaitingForAChoiceKeepsTheAnswer:
             seeded_db, run, _verdict(M.OFF_TOPIC), writer=writer, message="nvidia stock"
         )
         assert outcome.consequence is Consequence.SCOPE_REPLY
+
+
+class TestAContinuationThatNamesAnotherDepartment:
+    """The other door into the subject check, and the one the patient found.
+
+    Round 5 taught the supersede path to re-resolve the subject, which was
+    correct and reachable only by messages the model called *conflicting*. Live,
+    a General Medicine proposal was declined and the patient wrote "let me
+    clarify — appointment for vision issues"; the model called it a
+    **continuation** with no steps of its own. Nothing re-resolved, the routing
+    step stayed complete, and the run offered General Medicine slots for an eye
+    request — and every reworded clarification did the same thing again, because
+    each one was another continuation.
+
+    Reproduced under the mock before it was fixed, which is why the class and
+    the empty ``incoming_steps`` are stated as facts here rather than guessed:
+    a version of this rule conditioned on the incoming intent matching the
+    run's would have been inert, because there was no incoming intent to match.
+    """
+
+    def _routed(self, session, name="General Medicine", status=S.IN_PROGRESS):
+        run = make_run(session, status=status)
+        department = (
+            session.query(Department).filter(Department.name == name).one()
+        )
+        run.state = {"department_id": department.id, "department_name": department.name}
+        session.flush()
+        return run
+
+    def test_naming_a_different_department_supersedes(self, seeded_db, writer):
+        run = self._routed(seeded_db)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONTINUATION),
+            writer=writer,
+            message="let me clarify - appointment for vision issues",
+            incoming_steps=[],
+        )
+
+        assert outcome.consequence is Consequence.SUPERSEDE
+        assert outcome.spawns_new_run is True
+        assert run.status is S.CANCELLED
+
+    def test_a_timing_refinement_stays_in_the_run(self, seeded_db, writer):
+        """The pinned negative direction. "Some time next week" names no
+        department, so the run it arrived in is still the run it belongs to."""
+        run = self._routed(seeded_db)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONTINUATION),
+            writer=writer,
+            message="some time next week would suit me better",
+            incoming_steps=[],
+        )
+
+        assert outcome.consequence is Consequence.FEED_RUN
+        assert run.status is S.IN_PROGRESS
+        assert "next week" in run.request_text
+
+    def test_naming_the_same_department_again_stays(self, seeded_db, writer):
+        """Repeating the department is confidence, not a change of subject."""
+        run = self._routed(seeded_db)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONTINUATION),
+            writer=writer,
+            message="yes, the general medicine one",
+            incoming_steps=[],
+        )
+        assert outcome.consequence is Consequence.FEED_RUN
+        assert run.status is S.IN_PROGRESS
+
+    def test_an_ambiguous_message_does_not_supersede(self, seeded_db, writer):
+        """``ambiguous`` is the safety valve. Two desks settle nothing, and a
+        supersede on a maybe destroys a request on noise."""
+        run = self._routed(seeded_db)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONTINUATION),
+            writer=writer,
+            message="my kid has ear pain too",
+            incoming_steps=[],
+        )
+        assert outcome.consequence is Consequence.FEED_RUN
+        assert run.status is S.IN_PROGRESS
+
+    def test_a_run_that_has_not_routed_yet_is_never_superseded(
+        self, seeded_db, writer
+    ):
+        """The dangerous direction. A run with no department has nothing to
+        differ from, so the patient's first clarification must not destroy it."""
+        run = make_run(seeded_db, status=S.IN_PROGRESS)
+        assert not (run.state or {}).get("department_id")
+
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.CONTINUATION),
+            writer=writer,
+            message="it's about my vision",
+            incoming_steps=[],
+        )
+        assert outcome.consequence is Consequence.FEED_RUN
+        assert run.status is S.IN_PROGRESS
+
+    def test_a_cooperating_message_keeps_its_own_consequence(self, seeded_db, writer):
+        """The most expensive mistake this module can make, pinned against.
+
+        "Also, here's my old ECG" names Cardiology during a General Medicine
+        booking and is *helping*. It classifies as complementary, and only
+        continuation is upgraded — so it appends a step and the booking lives.
+        """
+        run = self._routed(seeded_db)
+        outcome = apply_consequence(
+            seeded_db,
+            run,
+            _verdict(M.COMPLEMENTARY),
+            writer=writer,
+            message="also, here is my old ecg report",
+            incoming_steps=[PlanStep.DOCUMENTS],
+        )
+        assert outcome.consequence is Consequence.APPEND_STEP
+        assert run.status is S.IN_PROGRESS
+
+    def test_both_directions_are_traced(self, seeded_db, writer):
+        """A subject that changed and a subject that did not both leave a mark;
+        an upgrade that only ever recorded itself when it fired would be
+        indistinguishable from one that never ran."""
+        changed = self._routed(seeded_db)
+        apply_consequence(
+            seeded_db,
+            changed,
+            _verdict(M.CONTINUATION),
+            writer=writer,
+            message="actually it is about my vision",
+            incoming_steps=[],
+        )
+        same = self._routed(seeded_db)
+        apply_consequence(
+            seeded_db,
+            same,
+            _verdict(M.CONTINUATION),
+            writer=writer,
+            message="the general medicine appointment",
+            incoming_steps=[],
+        )
+
+        seeded_db.flush()
+
+        subjects = [
+            event.payload
+            for event in seeded_db.query(TraceEvent).order_by(TraceEvent.seq).all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload.get("what") == "new_subject"
+        ]
+        assert [s["accepted"] for s in subjects] == [True, False]
+        assert subjects[0]["detail"]["named_department"] == "Ophthalmology"
+        assert subjects[1]["detail"]["named_department"] == "General Medicine"

@@ -68,9 +68,19 @@ _ASKING = (
 #: specificity: "what documents do I need for my appointment" is about
 #: documents, and reading it as an appointment listing would answer the wrong
 #: half of a sentence that named both.
+#:
+#: Documents outranking appointments was already true, and it was not enough.
+#: Live, "do I need to submit any documentations for this visit?" came back as
+#: the appointments list — not because the precedence was wrong but because the
+#: document half never matched at all: ``\bdocuments?\b`` stops at "document"
+#: and "documents", and "documentations" is neither. The only term left
+#: standing was "visit". So the stems are open-ended here, and the words a
+#: patient uses for *handing something over* — upload, submit, bring — count as
+#: naming the subject, which is what makes the precedence do any work.
 _SUBJECTS: tuple[tuple[QueryKind, tuple[str, ...]], ...] = (
-    (QueryKind.DOCUMENTS, (r"\bdocuments?\b", r"\breports?\b", r"\bpaperwork\b",
-                           r"\brecords?\b", r"\bfiles?\b")),
+    (QueryKind.DOCUMENTS, (r"\bdocument\w*\b", r"\breports?\b", r"\bpaperwork\b",
+                           r"\brecords?\b", r"\bfiles?\b", r"\bupload\w*\b",
+                           r"\bsubmit\w*\b", r"\bbring\b")),
     (QueryKind.REMINDERS, (r"\breminders?\b",)),
     (QueryKind.APPOINTMENTS, (r"\bappointments?\b", r"\bbookings?\b", r"\bvisits?\b")),
 )
@@ -242,7 +252,11 @@ def _documents(session: Session, patient_id: int, message: str) -> str:
                 "everything they ask for is already on file."
             )
 
-    return "\n".join(parts)
+    # Blank lines, not single newlines: the first part is a bullet list, and a
+    # sentence one newline below a list item is read as part of that item —
+    # "Required before your ENT visit" rendered as a continuation of the last
+    # document on file.
+    return "\n\n".join(parts)
 
 
 def answer_query(

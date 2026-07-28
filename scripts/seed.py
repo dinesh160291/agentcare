@@ -66,75 +66,120 @@ DEMO_PASSWORD = "Demo123!pass"  # synthetic, documented in the README
 # Departments: (id, name, description, synonyms, [(document type, mandatory)])
 # Descriptions are administrative only — which department handles which kind of
 # request. Nothing here describes, implies, or names a medical condition.
+#
+# The synonym list is routing vocabulary — the words a patient uses for the
+# desk they need, not a symptom dictionary. It is deliberately long, and it is
+# **data**: a 25-phrase probe of ordinary phrasings resolved 15, and the other
+# ten ("back pain", "headache", "fever", "diarrhea", "hair loss", "fractured",
+# "red eyes", "pregnant", "my son") each took the clarify-or-review path. None
+# of those was a misroute — unresolved fails safe — but a queue that fills with
+# questions the table could have answered is a queue nobody reads.
+#
+# Three rules hold this list together:
+#
+# * **Plurals are rows, not code.** Matching is on word boundaries, so "ears"
+#   is not "ear" and "knees" is not "knee". Teaching the matcher to pluralise
+#   would be a change to the deterministic bin for something thirty rows do
+#   exactly and visibly.
+# * **A term belongs to one department.** ``uq_department_synonym_term`` is a
+#   global unique constraint, so the same string cannot be filed under two
+#   desks. Ambiguity is produced the way "my kid has ear pain" produces it —
+#   two *different* terms owned by two departments, both present in one
+#   sentence. Hence "blood pressure" under Cardiology and the bare word
+#   "pressure" under General Medicine: either desk is a defensible answer, so
+#   the pair resolves ``ambiguous`` and the patient is asked, which is the
+#   behaviour that was wanted and the constraint would otherwise have refused.
+# * **A word that is ordinary English stays out.** Bare "back" was dropped for
+#   "back pain"/"backache"/"lower back": "push back my appointment" is one of
+#   the reschedule phrasings this project already reads, and a synonym that
+#   turns it into an Orthopedics request would hand the refinement rule a new
+#   subject that the patient never named.
 DEPARTMENTS: list[tuple[int, str, str, list[str], list[tuple[str, bool]]]] = [
     (
         1,
         "Cardiology",
         "Handles heart and circulatory appointments and follow-ups.",
-        ["heart", "cardiac", "cardiology", "ecg", "ekg", "echo"],
+        ["heart", "cardiac", "cardiology", "ecg", "ekg", "echo",
+         "blood pressure", "bp", "palpitations"],
         [("ECG report", True), ("Blood test report", True)],
     ),
     (
         2,
         "Orthopedics",
         "Handles bone, joint, and musculoskeletal appointments.",
-        ["bone", "joint", "orthopedic", "orthopaedic", "fracture", "knee", "shoulder"],
+        ["bone", "joint", "orthopedic", "orthopaedic", "fracture", "knee", "shoulder",
+         "bones", "joints", "knees", "shoulders",
+         "back pain", "backache", "lower back", "spine",
+         "fractured", "broken", "sprain", "sprained",
+         "ankle", "hip", "wrist", "elbow"],
         [("X-ray report", True)],
     ),
     (
         3,
         "Dermatology",
         "Handles skin, hair, and nail appointments.",
-        ["skin", "derma", "dermatology", "rash", "acne"],
+        ["skin", "derma", "dermatology", "rash", "acne",
+         "hair", "hair loss", "itching", "allergy", "eczema"],
         [("Previous treatment summary", False)],
     ),
     (
         4,
         "General Medicine",
         "Handles general adult consultations and routine check-ups.",
-        ["general", "physician", "gp", "general medicine", "check-up", "checkup"],
+        ["general", "physician", "gp", "general medicine", "check-up", "checkup",
+         "fever", "cough", "cold", "flu", "body ache",
+         "physical", "annual", "weakness", "pressure"],
         [],
     ),
     (
         5,
         "Pediatrics",
         "Handles appointments for children and adolescents.",
-        ["child", "children", "kid", "paediatric", "pediatric", "infant", "baby"],
+        ["child", "children", "kid", "paediatric", "pediatric", "infant", "baby",
+         "kids", "babies", "son", "daughter", "toddler",
+         "vaccination", "immunization"],
         [("Immunization record", True)],
     ),
     (
         6,
         "Neurology",
         "Handles nervous-system appointments and follow-ups.",
-        ["neuro", "neurology", "nerve", "migraine", "seizure"],
+        ["neuro", "neurology", "nerve", "migraine", "seizure",
+         "headache", "headaches", "migraines", "dizziness", "numbness"],
         [("Prior MRI or CT report", True)],
     ),
     (
         7,
         "ENT",
         "Handles ear, nose, and throat appointments.",
-        ["ent", "ear", "nose", "throat", "hearing", "sinus", "tonsil"],
+        ["ent", "ear", "nose", "throat", "hearing", "sinus", "tonsil",
+         "ears", "earache", "snoring", "hoarse"],
         [("Previous audiometry report", False)],
     ),
     (
         8,
         "Ophthalmology",
         "Handles eye and vision appointments.",
-        ["eye", "vision", "ophthalmology", "optical", "cataract"],
+        ["eye", "vision", "ophthalmology", "optical", "cataract",
+         "eyes", "eyesight", "sight", "blurry", "eyelid",
+         "glasses", "lens", "lenses"],
         [("Previous eye test report", True)],
     ),
     (
         9,
         "Gynecology & Obstetrics",
         "Handles women's health, pregnancy, and maternity appointments.",
-        ["gynecology", "gynaecology", "obstetrics", "pregnancy", "maternity", "prenatal"],
+        ["gynecology", "gynaecology", "obstetrics", "pregnancy", "maternity", "prenatal",
+         "pregnant", "period", "periods", "cramps", "menstrual"],
         [("Previous ultrasound report", True)],
     ),
     (
         10,
         "Gastroenterology",
         "Handles digestive-system appointments and follow-ups.",
-        ["gastro", "gastroenterology", "digestive", "stomach", "liver", "endoscopy"],
+        ["gastro", "gastroenterology", "digestive", "stomach", "liver", "endoscopy",
+         "gastric", "diarrhea", "acidity", "indigestion", "heartburn",
+         "vomiting", "nausea", "tummy", "belly", "constipation"],
         [("Previous endoscopy report", False)],
     ),
 ]

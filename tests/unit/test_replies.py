@@ -447,3 +447,90 @@ class TestAvailabilityClaimsAreGrounded:
             "",
         ):
             assert claims_availability(text) is False, text
+
+
+class TestADepartmentThatAsksForNothing:
+    """Silence is not an answer, and it was read as an omission.
+
+    A General Medicine booking requires no documents, so the receipt's document
+    section was simply absent — and the patient went looking for the paperwork
+    line that was never coming. The note this is *not* is the documents
+    listing's careful silence: there, no department has been resolved and
+    "nothing is required" would be a claim about a hospital nobody consulted.
+    Here the department is known and its rules table is empty, which is a fact
+    about this visit and sayable.
+    """
+
+    @pytest.fixture
+    def general_medicine(self, booked):
+        from app.models import Department
+
+        session, run, appointment = booked
+        gm = session.query(Department).filter(Department.name == "General Medicine").one()
+        assert gm.required_documents == [], "the fixture assumes GM requires nothing"
+        run.state = dict(run.state) | {"department_id": gm.id}
+        session.commit()
+        return session, run, appointment
+
+    def test_the_receipt_says_so_explicitly(self, general_medicine):
+        session, run, _ = general_medicine
+        assert "No documents are needed for this visit." in render_receipt(session, run)
+
+    def test_a_department_that_does_ask_is_untouched(self, booked):
+        """The populated case is the one that already worked. Ophthalmology
+        wants an eye test report, and it must still say which and why."""
+        from app.models import Department
+
+        session, run, _ = booked
+        eyes = session.query(Department).filter(Department.name == "Ophthalmology").one()
+        run.state = dict(run.state) | {"department_id": eyes.id}
+        session.commit()
+
+        text = render_receipt(session, run)
+        assert "Previous eye test report" in text
+        assert "No documents are needed" not in text
+
+
+class TestTheRenderersSurviveMarkdown:
+    """Every one of these is a list with a sentence after it.
+
+    The chat renders markdown, and markdown reads a line one newline below a
+    list item as belonging to that item. So "Say yes to take the one I'm
+    holding" arrived welded to the third slot — an instruction about the whole
+    offer, printed as though it were part of one option. The templates were
+    right and the renderer undid them, which is a failure mode no assertion
+    about *content* can see.
+    """
+
+    def test_the_option_list_is_separated_from_the_instruction(self, seeded_db):
+        from app.workflow.replies import render_proposal
+
+        run = WorkflowRun(
+            patient_id=1,
+            status=WorkflowStatus.IN_PROGRESS,
+            request_text="book me something",
+            plan=["route", "book"],
+            completed_steps=[],
+            state={},
+        )
+        seeded_db.add(run)
+        seeded_db.flush()
+
+        text = render_proposal(
+            seeded_db,
+            run,
+            [
+                _slot(1, "2026-08-03T09:00:00"),
+                _slot(2, "2026-08-03T10:00:00"),
+                _slot(3, "2026-08-03T11:00:00"),
+            ],
+        )
+        assert "\n\nSay \"yes\"" in text, repr(text)
+
+    def test_the_receipt_puts_a_blank_line_between_its_facts(self, booked):
+        """``_document_lines`` splits a mandatory document from an optional one
+        on purpose; a single newline handed them back to be welded."""
+        session, run, _ = booked
+        text = render_receipt(session, run)
+        assert "\n\n" in text
+        assert "\n" not in text.replace("\n\n", "")

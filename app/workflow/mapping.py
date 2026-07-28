@@ -498,6 +498,74 @@ def _shows_no_difference(
     return True
 
 
+def _names_another_department(
+    session: Session,
+    run: WorkflowRun,
+    *,
+    message: str,
+    writer: TraceWriter,
+) -> bool:
+    """Does this message name a desk that is not the one the run already routed to?
+
+    The other half of :func:`_shows_no_difference`, and it exists because the
+    subject check that function performs was only ever reachable through the
+    *supersede* path. Live: a General Medicine proposal was declined, and the
+    patient wrote "let me clarify — appointment for vision issues". The model
+    called that a **continuation** with no steps of its own, which is a fair
+    reading of the words — so nothing re-resolved anything, the completed
+    routing step stayed completed, and the run answered an eye request with
+    General Medicine slots. Clarifying again could not escape it: every
+    rewording was another continuation fed into the same routed run, and only
+    the word "instead" — which reaches the conflicting path — would have got
+    the patient out.
+
+    A refinement adds detail to a subject. A message naming a *different*
+    department has changed it, whatever class fits the grammar, so this is the
+    same shape as the rule that makes a different appointment verb conflicting
+    however the model classified it.
+
+    Three conditions, and each one is a direction this must not fire in:
+
+    * **the run must already have a department.** A run still being routed has
+      nothing to differ from, and superseding it would destroy the request on
+      the patient's first clarification.
+    * **the resolver must be certain.** ``ambiguous`` is the safety valve: "my
+      kid has ear pain" during a run names two desks and settles nothing, and
+      a supersede on a maybe is a supersede on noise.
+    * **the message alone is read, never the run's accumulated text.** By the
+      time this runs the continuation has not been appended yet — and it must
+      not be, because the combined text says "general medicine" *and* "vision"
+      and resolves to nothing but ambiguity.
+
+    Only ``continuation`` is upgraded. A *complementary* message — "also,
+    here's my old ECG" during a General Medicine booking — names Cardiology and
+    is cooperating, and reading that as a new request is the most expensive
+    mistake this module can make. It keeps its own consequence.
+    """
+    current = (run.state or {}).get("department_id")
+    if not current:
+        return False
+
+    named = resolve_department(session, message or "")
+    if named.get("status") != "resolved":
+        return False
+
+    different = int(named["department"]["id"]) != int(current)
+    writer.validation(
+        "new_subject",
+        accepted=different,
+        detail={
+            "run_department_id": int(current),
+            "named_department": named["department"]["name"],
+            "matched_terms": named["matched_terms"],
+            "applied": (
+                Consequence.SUPERSEDE.value if different else Consequence.FEED_RUN.value
+            ),
+        },
+    )
+    return different
+
+
 def _awaiting_selection(run: WorkflowRun) -> bool:
     """Has this run shown a numbered list and not yet had an answer to it?
 
@@ -642,6 +710,14 @@ def apply_consequence(
             if run.status is WorkflowStatus.PENDING_REVIEW
             else Consequence.REFINE
         )
+
+    # And the mirror image: a *continuation* that names a different desk is not
+    # one. Placed after the refusal above so the two rules cannot chase each
+    # other — this one only ever reads a consequence the other never produces.
+    if consequence is Consequence.FEED_RUN and _names_another_department(
+        session, run, message=message, writer=writer
+    ):
+        consequence = Consequence.SUPERSEDE
 
     if consequence is Consequence.WITHDRAW:
         transition(
