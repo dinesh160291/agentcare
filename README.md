@@ -100,12 +100,14 @@ code — no model output can reach it.
   is tuned to over-refer. *Floor: the cost is an administrative request
   reaching a person who redirects it — never a clinical claim, which no layer
   is permitted to make.*
-- **A booking that succeeded can still be reported as failed.** When several
-  documents are awaiting verification, the document step can exhaust its
-  per-turn tool budget *after* the appointment has been committed. The
-  appointment is real and correct; the turn ends on the failure notice and
-  raises a staff escalation. *Floor: the commit is transactional and already
-  done — what is wrong is the sentence, and a human is told about it.*
+- **Uploaded documents are verified one per conversational turn.** A patient
+  who files three at once has them checked over the next few exchanges rather
+  than all at once. This is a deliberate bound, not a backlog: verifying an
+  unbounded number in one turn is what used to exhaust the agent's tool budget
+  and take the rest of the booking down with it. *Floor: nothing waits on
+  verification — the appointment, the reminder and the required-documents list
+  are all unaffected by it, and a mismatch is flagged for staff whenever it is
+  found.*
 - **"What documents do I have on file?" is not always recognised as a
   question.** Appointment and reminder listings are answered deterministically
   from the database; the documents listing still goes through planning, because

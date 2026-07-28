@@ -92,7 +92,7 @@ from app.workflow.replies import (
     render_reask,
     render_receipt,
 )
-from app.workflow.state_machine import create_run, transition
+from app.workflow.state_machine import create_run, is_legal, transition
 
 # Code-authored replies. They are templates on purpose: a guard's output and a
 # failure notice are the system's most deterministic moments, and they must
@@ -1598,6 +1598,20 @@ def _settle_step(
         if proposals.department_id is None:
             return False, False
         if proposals.routing_confidence == "low":
+            if run.status is WorkflowStatus.PENDING_REVIEW:
+                # Already queued, and routing has just re-run on a run that was
+                # waiting. `pending_review -> pending_review` is not an edge, so
+                # driving it raised through the turn envelope and the patient
+                # got an HTTP 500 — seen live when a message during a review
+                # classified as a continuation and the plan carried on. The
+                # queue item exists, the run is where it belongs, and the only
+                # thing to do is stop.
+                writer.guard_verdict(
+                    "routing_rerun_while_queued",
+                    passed=False,
+                    detail={"department_id": proposals.department_id},
+                )
+                return True, False
             # Low-confidence routing is a human's decision, not a confident
             # guess dressed up as one.
             #
@@ -1675,16 +1689,43 @@ def _fail_run(
 
     Deduped per run and kind like every other escalation, so a run that fails
     twice is one item with two occurrences rather than two items.
+
+    **The run is failed only from a state the table lets it fail from.** A
+    budget can blow on a turn that does not own the run's state at all — the
+    safety screen or the Coordinator, while the run sits at
+    ``pending_confirmation`` holding a slot the patient has not answered yet, or
+    at ``pending_review`` in front of staff. ``pending_confirmation -> failed``
+    is not an edge, and driving it raised straight through the turn envelope:
+    the patient got an HTTP 500 where a failure notice was intended, and the
+    live sweep caught it twice on one run.
+
+    Not moving the run is also the right answer rather than merely the legal
+    one. The proposal is still valid and still confirmable; discarding a held
+    time because one turn misbehaved would cost the patient the booking they
+    had already made a decision about. What the turn owes is the notice and the
+    queue item, and both are written either way.
     """
-    transition(
-        session,
-        run,
-        to=WorkflowStatus.FAILED,
-        trigger=reason,
-        writer=writer,
-        actor=user,
-        detail={"budget": reason},
-    )
+    if is_legal(run.status, WorkflowStatus.FAILED):
+        transition(
+            session,
+            run,
+            to=WorkflowStatus.FAILED,
+            trigger=reason,
+            writer=writer,
+            actor=user,
+            detail={"budget": reason},
+        )
+    else:
+        # The state the run is in has no edge to `failed`, and that is the
+        # table saying the run is not this turn's to end. Recorded rather than
+        # silently skipped: "the run failed" and "a turn failed while the run
+        # stood" are different facts and the queue item below is the same
+        # either way.
+        writer.guard_verdict(
+            "run_failable",
+            passed=False,
+            detail={"status": run.status.value, "reason": reason},
+        )
     create_escalation(
         session,
         workflow_run_id=run.id,

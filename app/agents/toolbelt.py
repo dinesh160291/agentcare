@@ -973,13 +973,10 @@ class Toolbelt:
             return self._record_missing_documents()
 
         def list_unverified_documents_tool() -> dict:
-            """List documents that have been uploaded but not yet checked
-            against the type the patient declared them as."""
-            return {
-                "documents": list_unverified_documents(
-                    self.session, patient_id=self.patient_id
-                )
-            }
+            """The next document to check, if there is one. At most one — any
+            others are picked up on a later turn, so verify this one and move
+            on. Do not call this again in the same task."""
+            return self._next_unverified()
 
         def read_document_text(document_id: int) -> dict:
             """Read the text of an uploaded PDF so you can see what it is.
@@ -1007,6 +1004,38 @@ class Toolbelt:
             diff_required_documents_tool,
             record_missing_documents,
         ]
+
+    def _next_unverified(self) -> dict:
+        """One pending document per turn — the bound, in code at last.
+
+        **It already existed, in the understudy only.** ``MockLlm._verify_next``
+        has always taken ``pending[0]`` and said why: forty unchecked uploads
+        would otherwise spend the whole iteration budget here and never reach
+        the diff the booking actually needs. The prompt told a live model the
+        opposite — *"For each one"* — so ``gpt-4o-mini`` did exactly that, and
+        three seeded documents cost nine tool calls against a cap of eight. The
+        ninth was ``diff_required_documents``: the run went ``failed``, a
+        ``system_failure`` escalation opened for a booking that had already
+        succeeded, and ``record_missing_documents`` never ran, so the patient
+        was never told what to bring. The receipt is assembled from rows, so it
+        went out looking perfect on top of all of it.
+
+        A bound that lives in the provider is not a bound. This is the same
+        lesson as every other guard here — the mock is more careful than the
+        live model in precisely the places the live defects live — so the cap
+        moves to the seam both providers go through, and the mock's own
+        one-per-turn logic keeps working unchanged because it reads
+        ``pending[0]`` of a list that is now one long.
+
+        ``still_pending`` is reported rather than hidden: "there is one to do"
+        and "there is one left and that is all" are different facts, and the
+        agent's reply is allowed to know which.
+        """
+        pending = list_unverified_documents(self.session, patient_id=self.patient_id)
+        return {
+            "documents": pending[:1],
+            "still_pending": max(len(pending) - 1, 0),
+        }
 
     def _read_document_text(self, document_id: int) -> dict:
         """Extract text, but only from a document this patient owns.

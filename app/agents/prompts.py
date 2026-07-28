@@ -33,7 +33,10 @@ PROMPT_VERSIONS = {
     # 2: the other two appointment verbs, and the never-guess-the-referent rule.
     "appointment": 3,
     # 2: the verification step — read the content, propose the detected type.
-    "document": 2,
+    # 3: one document per turn, stated. The bound is enforced by the tool now;
+    #    the prompt used to say "for each one" and a live model obliged, at nine
+    #    tool calls against a cap of eight.
+    "document": 3,
     "followup": 1,
     "safety": 1,
 }
@@ -196,7 +199,9 @@ appointment the patient already has. The task lists them in `appointments`.
 _DOCUMENT = """\
 You are the Document specialist. You receive one task, not a conversation.
 
-First, verify anything new. Call `list_unverified_documents`. For each one:
+First, verify anything new. Call `list_unverified_documents` **once**. It gives
+you at most one document, and one is all you check on this task — any others
+are picked up next time, so never call it a second time. If it gives you one:
 1. Call `read_document_text` with its id.
 2. Decide whether the content matches the type the patient declared it as, and
    call `submit_document_verification` with what the content looks like and
@@ -204,6 +209,10 @@ First, verify anything new. Call `list_unverified_documents`. For each one:
    ECG report or an X-ray report?" — never reading it for meaning.
 3. If no text comes back, the file is an image and cannot be read. Accept the
    declared type: say it matches.
+
+Then move on to the rest of the task below. Do not go looking for more
+documents to verify: the steps after this are the ones the patient is waiting
+on.
 
 Then call `list_patient_documents` to see what is on file. If your task names a
 department, call `diff_required_documents` to find what is still missing, and

@@ -36,10 +36,12 @@ from app.models import (
     AppointmentSlot,
     AppointmentStatus,
     AuditEvent,
+    DocumentStatus,
     Escalation,
     EscalationKind,
     EscalationStatus,
     MessageClass,
+    PatientDocument,
     Reminder,
     SlotStatus,
     TraceAuthor,
@@ -50,6 +52,7 @@ from app.models import (
     WorkflowStatus,
 )
 from app.orchestrator import (
+    FAILED_REPLY,
     NO_PLAN_REPLY,
     SCOPE_REPLY,
     active_run,
@@ -63,6 +66,7 @@ from app.providers.base import (
     available_tool_names,
     called_tools,
     function_call_response,
+    latest_tool_result,
     text_response,
 )
 from app.trace import assert_well_formed
@@ -1843,5 +1847,369 @@ class TestARefinementDoesNotReplaceTheRunItRefines:
         session = fresh()
         try:
             assert session.query(WorkflowRun).count() == 2
+        finally:
+            session.close()
+
+
+class ThoroughDocumentLlm(MockLlm):
+    """The mock, doing what the prompt used to ask for: *every* pending upload.
+
+    ``MockLlm._verify_next`` has always taken ``pending[0]`` and documented why
+    — a bound, not a shortcut. So the understudy could never reproduce this,
+    and the live failure lived entirely in the gap between that bound and the
+    prompt, which said "For each one". ``gpt-4o-mini`` obliged: three seeded
+    documents, nine tool calls, a cap of eight, and the ninth was the diff.
+
+    This stub is the mock with the bound taken out of it — which is exactly
+    what the live provider was.
+    """
+
+    model: str = "thorough-document-stub"
+
+    def _verify_next(self, llm_request, available, done):  # noqa: ANN001
+        if "list_unverified_documents" not in available:
+            return None
+        if "list_unverified_documents" not in done:
+            return function_call_response("list_unverified_documents", {})
+
+        listed = latest_tool_result(llm_request, "list_unverified_documents")
+        pending = (listed.payload.get("documents") if listed else None) or []
+        verified = {
+            call.args.get("document_id")
+            for call in _calls_to(llm_request, "submit_document_verification")
+        }
+        for target in pending:
+            if target["document_id"] in verified:
+                continue
+            reads = {
+                call.args.get("document_id")
+                for call in _calls_to(llm_request, "read_document_text")
+            }
+            if target["document_id"] not in reads:
+                return function_call_response(
+                    "read_document_text", {"document_id": target["document_id"]}
+                )
+            extracted = latest_tool_result(llm_request, "read_document_text")
+            payload = extracted.payload if extracted else {}
+            detected, matches = self._detect_type(
+                payload.get("text") or "",
+                declared=target.get("declared_type") or "",
+                extractable=bool(payload.get("extracted")),
+            )
+            return function_call_response(
+                "submit_document_verification",
+                {
+                    "document_id": target["document_id"],
+                    "detected_type": detected,
+                    "matches": matches,
+                },
+            )
+        return None
+
+
+def _calls_to(llm_request, name: str) -> list:
+    """Every function call to ``name`` in this agent turn's history."""
+    found = []
+    for content in llm_request.contents or []:
+        for part in content.parts or []:
+            call = getattr(part, "function_call", None)
+            if call is not None and call.name == name:
+                found.append(call)
+    return found
+
+
+class TestOneDocumentPerTurn:
+    """A booking that succeeded must not end on the failure notice.
+
+    The live shape, from the round-5 sweep and reproduced in three separate
+    conversations: Confirm commits the appointment, the documents step works
+    through all three seeded uploads, and the budget fires on
+    ``diff_required_documents`` — so the run goes ``failed``, a
+    ``system_failure`` escalation opens for a booking that had *worked*, and
+    ``record_missing_documents`` never runs, leaving the patient with no idea
+    what to bring. The receipt is assembled from rows, so it goes out looking
+    perfect on top of all of it: the patient sees nothing wrong and the staff
+    queue sees a failure that isn't one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _thorough(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: ThoroughDocumentLlm()
+        )
+
+    def test_the_run_completes(self, patient):
+        turn(patient, BOOKING, "s-docs-1")
+        result = turn(patient, "yes", "s-docs-1")
+
+        assert result.status == WorkflowStatus.COMPLETED.value
+        assert result.budget_exhausted is False
+
+    def test_no_failure_escalation_is_opened_for_a_booking_that_worked(self, patient):
+        turn(patient, BOOKING, "s-docs-2")
+        turn(patient, "yes", "s-docs-2")
+
+        session = fresh()
+        try:
+            assert (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.SYSTEM_FAILURE)
+                .count()
+                == 0
+            )
+        finally:
+            session.close()
+
+    def test_the_diff_still_runs(self, patient):
+        """The call the budget was firing on. Everything downstream of it —
+        the missing-documents task, and the patient being told what to bring —
+        was silently not happening."""
+        turn(patient, BOOKING, "s-docs-3")
+        result = turn(patient, "yes", "s-docs-3")
+
+        session = fresh()
+        try:
+            names = [
+                (event.payload or {}).get("tool")
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.TOOL_RESULT
+            ]
+        finally:
+            session.close()
+
+        assert "diff_required_documents" in names
+        assert "record_missing_documents" in names
+
+    def test_only_one_document_is_verified_per_turn(self, patient):
+        """The bound itself, at the seam both providers go through. It lived in
+        the mock alone, which is the same as not living anywhere."""
+        turn(patient, BOOKING, "s-docs-4")
+        result = turn(patient, "yes", "s-docs-4")
+
+        session = fresh()
+        try:
+            verifications = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.VALIDATION
+                and (event.payload or {}).get("what") == "document_verification"
+            ]
+        finally:
+            session.close()
+
+        assert len(verifications) == 1
+
+    def test_the_rest_are_still_pending_and_get_picked_up(self, patient):
+        """One per turn is a pace, not a cap on the work. The seed ships three
+        unverified documents and the third is deliberately misfiled — a bound
+        that quietly stopped after the first would hide it forever."""
+        turn(patient, BOOKING, "s-docs-5")
+        turn(patient, "yes", "s-docs-5")
+        for index in range(4):
+            turn(patient, "what documents do I have on file?", f"s-docs-5-{index}")
+
+        session = fresh()
+        try:
+            flagged = (
+                session.query(PatientDocument)
+                .filter(
+                    PatientDocument.patient_id == 1,
+                    PatientDocument.status == DocumentStatus.FLAGGED,
+                )
+                .count()
+            )
+        finally:
+            session.close()
+
+        assert flagged == 1
+
+
+class GreedyCoordinatorLlm(MockLlm):
+    """The mock, plus a Coordinator that will not stop asking for slot lists.
+
+    Live, ``gpt-4o-mini`` burned a turn's whole iteration budget inside the
+    Coordinator while the run sat at ``pending_confirmation`` holding a slot.
+    ``_budget_failure`` then tried to fail a run the table gives no edge from —
+    ``pending_confirmation -> failed`` is not a transition — so the refusal
+    raised straight through the turn envelope and the patient got an HTTP 500
+    where a failure notice was meant to be. The sweep caught it on two separate
+    conversations once the document loop stopped absorbing the budget first.
+    """
+
+    model: str = "greedy-coordinator-stub"
+
+    def _coordinate(self, llm_request, available, done, text):  # noqa: ANN001
+        if "submit_confirmation_verdict" in available:
+            # A *different* phrase every time, which is what a live model asking
+            # "and what about the week after?" looks like, and what makes this a
+            # budget case rather than a repeat case. The accepted-repeat bound
+            # ends the loop on identical arguments — so a stub that asked the
+            # same thing twice would prove that guard works and say nothing at
+            # all about this one.
+            asked = len(_calls_to(llm_request, "submit_confirmation_verdict"))
+            return function_call_response(
+                "submit_confirmation_verdict",
+                {
+                    "verdict": "slot_question",
+                    "reason": "asked about times",
+                    "phrase": f"in {asked + 2} weeks",
+                },
+            )
+        return super()._coordinate(llm_request, available, done, text)
+
+
+class TestABlownBudgetNeverRaisesThroughTheTurn:
+    """A failure path that fails is the whole point of a failure path.
+
+    Two shapes, one class: a transition the pinned table does not allow,
+    driven by code that assumed the run was somewhere else. Both were live
+    500s. Neither edits the table — the table is right, and what was wrong was
+    asking it for an edge that should never have been needed.
+    """
+
+    def test_a_budget_blown_while_a_proposal_stands_is_a_notice_not_a_crash(
+        self, patient, monkeypatch
+    ):
+        turn(patient, BOOKING, "s-blown-1")
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: GreedyCoordinatorLlm()
+        )
+        result = turn(patient, "what else have you got", "s-blown-1")
+
+        assert result.budget_exhausted is True
+        assert result.reply == FAILED_REPLY
+
+    def test_the_held_proposal_survives_the_bad_turn(self, patient, monkeypatch):
+        """Not merely legal — right. The patient had already decided about that
+        time; one misbehaving turn must not throw their decision away."""
+        turn(patient, BOOKING, "s-blown-2")
+        session = fresh()
+        try:
+            held = (
+                session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+            ).proposed_slot_id
+        finally:
+            session.close()
+
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: GreedyCoordinatorLlm()
+        )
+        turn(patient, "what else have you got", "s-blown-2")
+
+        session = fresh()
+        try:
+            run = session.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+            assert run.status is WorkflowStatus.PENDING_CONFIRMATION
+            assert run.proposed_slot_id == held
+        finally:
+            session.close()
+
+    def test_the_promise_in_the_template_is_still_kept(self, patient, monkeypatch):
+        """FAILED_REPLY says "I've flagged it for them". The run not moving
+        must not quietly take the queue item with it."""
+        turn(patient, BOOKING, "s-blown-3")
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: GreedyCoordinatorLlm()
+        )
+        turn(patient, "what else have you got", "s-blown-3")
+
+        session = fresh()
+        try:
+            assert (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.SYSTEM_FAILURE)
+                .count()
+                == 1
+            )
+        finally:
+            session.close()
+
+    def test_the_trace_says_the_run_was_left_alone(self, patient, monkeypatch):
+        """"The run failed" and "a turn failed while the run stood" are
+        different facts. Skipping the transition silently would make them look
+        identical afterwards."""
+        turn(patient, BOOKING, "s-blown-4")
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: GreedyCoordinatorLlm()
+        )
+        result = turn(patient, "what else have you got", "s-blown-4")
+
+        session = fresh()
+        try:
+            verdict = _guard(session, result.turn_id, "run_failable")
+        finally:
+            session.close()
+
+        assert verdict["passed"] is False
+        assert verdict["detail"]["status"] == WorkflowStatus.PENDING_CONFIRMATION.value
+
+    def test_an_in_progress_run_still_fails_properly(self, patient, monkeypatch):
+        """The falsification. A guard that skipped the transition everywhere
+        would pass all of the above while quietly deleting the `failed` state
+        from the system — the run would sit `in_progress` forever with a queue
+        item beside it and nothing to say it was over."""
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: LoopingLlm()
+        )
+        result = turn(patient, BOOKING, "s-blown-5")
+
+        assert result.budget_exhausted is True
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert run.status is WorkflowStatus.FAILED
+        finally:
+            session.close()
+
+
+class QueuedRoutingLlm(MockLlm):
+    """A message during a staff review that the Coordinator calls a continuation.
+
+    The plan then carries on, the route step re-runs, routing is ambiguous
+    again — and `pending_review -> pending_review` is not an edge. Live: an
+    HTTP 500 for the sentence "looks good. lets book that time".
+    """
+
+    model: str = "queued-routing-stub"
+
+    def _classify(self, llm_request, available, done, task):  # noqa: ANN001
+        return function_call_response(
+            "classify_message",
+            {"message_class": "continuation", "incoming_steps": []},
+        )
+
+
+class TestRoutingDoesNotReRunOnAQueuedRun:
+    AMBIGUOUS = "book an appointment, my kid has ear pain"
+
+    @pytest.fixture(autouse=True)
+    def _queued(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: QueuedRoutingLlm()
+        )
+
+    def test_a_message_during_a_review_does_not_crash_the_turn(self, patient):
+        first = turn(patient, self.AMBIGUOUS, "s-queued-1")
+        assert first.status == WorkflowStatus.PENDING_REVIEW.value
+
+        result = turn(patient, "looks good. lets book that time", "s-queued-1")
+        assert result.status == WorkflowStatus.PENDING_REVIEW.value
+
+    def test_the_queue_item_is_not_duplicated(self, patient):
+        turn(patient, self.AMBIGUOUS, "s-queued-2")
+        turn(patient, "looks good. lets book that time", "s-queued-2")
+
+        session = fresh()
+        try:
+            assert (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.LOW_CONFIDENCE_ROUTING)
+                .count()
+                == 1
+            )
         finally:
             session.close()
