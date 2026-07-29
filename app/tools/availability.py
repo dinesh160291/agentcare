@@ -50,17 +50,26 @@ def _serialise_slot(slot: AppointmentSlot, doctor: Doctor, department: Departmen
 
 
 def _patient_busy(
-    session: Session, patient_id: int
-) -> list[tuple[datetime, datetime, str]]:
+    session: Session, patient_id: int, exclude_appointment_id: int | None = None
+) -> list[tuple[datetime, datetime, str, int]]:
     """When this patient is already committed, and with whom.
 
     The department name rides along because withholding a time silently reads
     as ignoring the question: "how about 11am?" answered with 9, 10 and 2
     tells the patient nothing about where their 11 went.
+
+    ``exclude_appointment_id`` leaves out the appointment being moved. Without
+    it an appointment collides with itself the moment a reschedule considers a
+    slot overlapping its own — a same-time change of doctor is refused as a
+    clash with the very row it is changing, and that appointment's own hour
+    disappears from its own search.
     """
-    rows = (
+    query = (
         session.query(
-            AppointmentSlot.start_time, AppointmentSlot.end_time, Department.name
+            AppointmentSlot.start_time,
+            AppointmentSlot.end_time,
+            Department.name,
+            Appointment.id,
         )
         .join(Appointment, Appointment.slot_id == AppointmentSlot.id)
         .join(Department, Department.id == Appointment.department_id)
@@ -68,9 +77,49 @@ def _patient_busy(
             Appointment.patient_id == patient_id,
             Appointment.status.in_((AppointmentStatus.PENDING, AppointmentStatus.CONFIRMED)),
         )
-        .all()
     )
-    return [(start, end, name) for start, end, name in rows]
+    if exclude_appointment_id is not None:
+        query = query.filter(Appointment.id != exclude_appointment_id)
+    return [(start, end, name, id_) for start, end, name, id_ in query.all()]
+
+
+def patient_clash(
+    session: Session,
+    *,
+    patient_id: int,
+    start: datetime,
+    end: datetime,
+    exclude_appointment_id: int | None = None,
+) -> dict[str, Any] | None:
+    """The patient's own appointment overlapping ``start``–``end``, if any.
+
+    One rule, three layers. The booking path has refused a second appointment
+    at an occupied time since Phase 2; the reschedule path never got the same
+    guard, and on 2026-07-29 a patient moved their Dermatology appointment onto
+    the exact time of an Ophthalmology one they had booked minutes earlier.
+    Both rows committed, both confirmed, one instant.
+
+    So the question lives here once and is asked from everywhere that could
+    create the state: the commit (where refusing makes it impossible), the
+    proposal (where refusing means the patient is never asked to agree to an
+    impossible time), and the search (where filtering means it is never
+    offered). A guard written for one verb is a guard the other verb drifts
+    away from, and this is what that drift cost.
+
+    Overlap, not equality: it is the same predicate the search already applies
+    when withholding a patient's own busy times, and two layers answering the
+    same question differently is how they disagree.
+    """
+    for busy_start, busy_end, department_name, appointment_id in _patient_busy(
+        session, patient_id, exclude_appointment_id
+    ):
+        if start < busy_end and busy_start < end:
+            return {
+                "appointment_id": appointment_id,
+                "department_name": department_name,
+                "start": busy_start.isoformat(),
+            }
+    return None
 
 
 def find_available_slots(
@@ -83,6 +132,7 @@ def find_available_slots(
     part_of_day: str | None = None,
     limit: int = DEFAULT_LIMIT,
     free_for_patient: int | None = None,
+    exclude_appointment_id: int | None = None,
 ) -> dict[str, Any]:
     """Available slots matching the filters, soonest first.
 
@@ -106,6 +156,10 @@ def find_available_slots(
     subtracted. A patient who asks "how about 11am?" and gets 9, 10 and 2 back
     with no explanation has been answered as though they said nothing; the
     caller needs the times and the clashing department to say otherwise.
+
+    ``exclude_appointment_id`` is for a reschedule: the appointment being moved
+    is not a reason to withhold a time from its own search, and counting it
+    hides the hour it currently occupies from the patient trying to change it.
     """
     query = (
         session.query(AppointmentSlot, Doctor, Department)
@@ -143,13 +197,13 @@ def find_available_slots(
     # *why* a time the patient asked for is not on the list it got back.
     withheld: list[dict[str, Any]] = []
     if free_for_patient is not None:
-        busy = _patient_busy(session, free_for_patient)
+        busy = _patient_busy(session, free_for_patient, exclude_appointment_id)
         keep = []
         for row in rows:
             clash = next(
                 (
                     name
-                    for start_at, finish, name in busy
+                    for start_at, finish, name, _ in busy
                     if row[0].start_time < finish and start_at < row[0].end_time
                 ),
                 None,

@@ -36,6 +36,7 @@ from app.models import (
     AppointmentSlot,  # noqa: F401  (slot rows are read directly by the round-6 tests)
     AppointmentStatus,
     AuditEvent,
+    Department,
     DocumentStatus,
     Doctor,
     Escalation,
@@ -3710,6 +3711,214 @@ class TestAnOverruledClassificationLosesItsProse:
         try:
             run = session.get(WorkflowRun, first.run_id)
             assert run.status is WorkflowStatus.CANCELLED
+        finally:
+            session.close()
+
+
+class ClashProposingLlm(MockLlm):
+    """``gpt-4o-mini``, proposing a time the search had already withheld.
+
+    The mock cannot reproduce this defect on its own, and that is the point of
+    the stub. The mock proposes out of ``slots``, and the clashing time is not
+    in there — the search removed it correctly. The live model read
+    ``withheld_for_patient``, the field that exists so *code* can explain a
+    missing time, and treated it as part of the menu.
+
+    It proposes the clash exactly once. A stub that kept proposing it would be
+    testing the rejected-repeat budget instead, which is a different open item.
+    """
+
+    model: str = "clash-proposing-stub"
+    clashing_slot_id: int = 0
+    moving_appointment_id: int = 0
+
+    def _change_appointment(self, llm_request, done, task, step):  # noqa: ANN001
+        if (
+            step == "reschedule"
+            and "find_slots_for_reschedule" in done
+            and task.get("committed") != step
+            and latest_tool_result(llm_request, "propose_reschedule") is None
+        ):
+            return function_call_response(
+                "propose_reschedule",
+                {
+                    "appointment_id": self.moving_appointment_id,
+                    "slot_id": self.clashing_slot_id,
+                },
+            )
+        return super()._change_appointment(llm_request, done, task, step)
+
+
+class TestARescheduleCannotLandOnTheirOwnAppointment:
+    """Round 9, item 1, end to end — runs #6 and #7 of the live session.
+
+    The patient booked Ophthalmology for Thursday 6 August at 9:00 AM, then
+    asked to move their Dermatology appointment "to August 6th". The search
+    withheld the 9:00 and said why; the model proposed it anyway; the proposal
+    was recorded, the patient was shown a card offering it, they confirmed, and
+    ``reschedule_appointment`` committed. Appointments 3 and 5, both confirmed,
+    both at 2026-08-06 09:00 — a state the booking path had refused since
+    Phase 2 and the reschedule path had never been taught to.
+
+    The department of the clashing slot matches the appointment being moved on
+    purpose: a cross-department slot is refused one guard earlier, and a test
+    that trips *that* refusal says nothing at all about this one.
+    """
+
+    @pytest.fixture
+    def two_appointments(self, seeded_db, patient):
+        """Asha's seeded Cardiology appointment, plus one elsewhere — and the
+        Cardiology slot that collides with the second."""
+        seeded = seeded_db.get(Appointment, SEEDED_APPOINTMENT_ID)
+        elsewhere = (
+            seeded_db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .join(Department, Department.id == Doctor.department_id)
+            .filter(
+                Department.name == "Ophthalmology",
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                AppointmentSlot.start_time > clock.now(),
+                AppointmentSlot.start_time != seeded.slot.start_time,
+            )
+            .order_by(AppointmentSlot.start_time)
+            .first()
+        )
+        clashing = (
+            seeded_db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .filter(
+                Doctor.department_id == seeded.department_id,
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                AppointmentSlot.start_time == elsewhere.start_time,
+            )
+            .first()
+        )
+        assert clashing is not None, "no Cardiology slot at the Ophthalmology time"
+
+        elsewhere.status = SlotStatus.BOOKED
+        seeded_db.add(
+            Appointment(
+                patient_id=1,
+                doctor_id=elsewhere.doctor_id,
+                slot_id=elsewhere.id,
+                department_id=elsewhere.doctor.department_id,
+                status=AppointmentStatus.CONFIRMED,
+                reference_code="AC-000099",
+                reason="vision test",
+            )
+        )
+        seeded_db.commit()
+        return clashing.id, elsewhere.start_time
+
+    @pytest.fixture(autouse=True)
+    def _propose_the_clash(self, monkeypatch, two_appointments):
+        clashing_slot_id, _ = two_appointments
+        monkeypatch.setattr(
+            "app.agents.base.get_provider",
+            lambda name=None: ClashProposingLlm(
+                clashing_slot_id=clashing_slot_id,
+                moving_appointment_id=SEEDED_APPOINTMENT_ID,
+            ),
+        )
+
+    def _ask(self, patient, when, session_id: str):
+        """The live shape, both turns of it.
+
+        Naming the destination date is naming the *other* appointment's date,
+        so turn 1 is refused as ambiguous — a date cue matching one appointment
+        and a department cue matching the other — and the numbered list is
+        drawn. That is what run #7 did, and the patient answered "2". Turn 2
+        carries no window, which is why the live search came back with all 138
+        slots and the model reached past them into the withheld list.
+
+        Without this second turn the run never proposes anything at all, and
+        every assertion below passes against a refusal one guard too early.
+        """
+        first = turn(
+            patient,
+            f"move my cardiology appointment to {when:%B} {when.day}",
+            session_id,
+        )
+        assert "which one" in first.reply.lower() or "more than one" in first.reply
+        choice = next(
+            line.strip()[0]
+            for line in first.reply.splitlines()
+            if line.strip()[:1].isdigit() and "Cardiology" in line
+        )
+        return turn(patient, choice, session_id)
+
+    def test_the_clashing_slot_is_never_held(self, patient, two_appointments):
+        clashing_slot_id, when = two_appointments
+
+        result = self._ask(patient, when, "s-clash-e2e-1")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert run.proposed_slot_id != clashing_slot_id
+        finally:
+            session.close()
+
+    def test_the_patient_is_never_shown_the_clashing_time(
+        self, patient, two_appointments
+    ):
+        """The reply is the part the patient acts on. A card offering a time
+        the commit is guaranteed to refuse is a promise the system cannot
+        keep, and they press Confirm on it.
+
+        The whole rendered instant, not just the clock time: the seed lays the
+        same hours down every day, so "11:00 AM" alone appears in perfectly
+        good offers for other days and would fail this for nothing.
+        """
+        _, when = two_appointments
+
+        result = self._ask(patient, when, "s-clash-e2e-2")
+
+        assert f"{when:%A} {when.day} {when:%B} at {clock_time(when)}" not in result.reply
+
+    def test_no_two_live_appointments_share_a_start_time(self, patient, two_appointments):
+        """The state itself, after the whole turn — the query that found the
+        live defect, asked of the system rather than of one function."""
+        _, when = two_appointments
+        self._ask(patient, when, "s-clash-e2e-3")
+        asyncio.run(apply_patient_action(patient, "confirm", "s-clash-e2e-3"))
+
+        session = fresh()
+        try:
+            starts = [
+                start
+                for (start,) in session.query(AppointmentSlot.start_time)
+                .join(Appointment, Appointment.slot_id == AppointmentSlot.id)
+                .filter(
+                    Appointment.patient_id == 1,
+                    Appointment.status.in_(
+                        (AppointmentStatus.PENDING, AppointmentStatus.CONFIRMED)
+                    ),
+                )
+                .all()
+            ]
+            assert len(starts) == len(set(starts))
+        finally:
+            session.close()
+
+    def test_the_refusal_is_in_the_trace(self, patient, two_appointments):
+        """A refused proposal changes nothing, so the trace row is the only
+        evidence the guard ran at all."""
+        _, when = two_appointments
+        result = self._ask(patient, when, "s-clash-e2e-4")
+
+        session = fresh()
+        try:
+            rejected = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.VALIDATION
+                and event.payload.get("what") == "appointment_change_proposal"
+                and event.payload.get("accepted") is False
+            ]
+            assert rejected, "the clash refusal left no trace row"
         finally:
             session.close()
 

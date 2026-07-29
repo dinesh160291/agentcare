@@ -244,6 +244,265 @@ class TestTheNewSlotMustBeUsable:
         assert run.proposed_action is None
 
 
+class TestTheSlotMustBeFreeInThePatientsOwnDiary:
+    """Round 9, item 1 — the proposal half of the clash guard.
+
+    The commit refuses a double booking outright; this stops the patient ever
+    being *asked* to agree to one. Live, the run held a Dermatology appointment
+    and the model proposed the 9:00 AM that the patient's brand-new
+    Ophthalmology appointment already occupied — a Confirm guaranteed to bounce,
+    offered as though it were a choice.
+
+    ``message`` names the department on purpose. With two live appointments and
+    no cue in the words, ``_settle_target`` refuses one step earlier — so a
+    test written without it passes green while saying nothing whatever about
+    the guard below it.
+    """
+
+    @pytest.fixture
+    def clash(self, seeded_db, asha):
+        """Asha's seeded Cardiology appointment, plus a Dermatology one
+        occupying the exact time of a free Cardiology slot."""
+        target = slot_in(seeded_db, "Cardiology")
+        occupied = (
+            seeded_db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .join(Department, Department.id == Doctor.department_id)
+            .filter(
+                Department.name == "Dermatology",
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                AppointmentSlot.start_time == target.start_time,
+            )
+            .first()
+        )
+        assert occupied is not None, "no Dermatology slot at that Cardiology time"
+
+        occupied.status = SlotStatus.BOOKED
+        second = Appointment(
+            patient_id=ASHA_PROFILE_ID,
+            doctor_id=occupied.doctor_id,
+            slot_id=occupied.id,
+            department_id=occupied.doctor.department_id,
+            status=AppointmentStatus.CONFIRMED,
+            reference_code="AC-000099",
+            reason="skin rash",
+        )
+        seeded_db.add(second)
+        seeded_db.flush()
+        return target
+
+    def test_a_slot_the_patient_is_already_busy_at_is_refused(
+        self, seeded_db, asha, run, clash
+    ):
+        belt = belt_for(seeded_db, asha, run)
+        belt.message = "move my cardiology appointment"
+        result = belt._propose_change(
+            ProposedAction.RESCHEDULE,
+            appointment_id=SEEDED_APPOINTMENT_ID,
+            slot_id=clash.id,
+        )
+
+        assert result["accepted"] is False
+        assert "already have a" in result["problem"]
+
+    def test_the_refused_proposal_is_not_written_to_the_run(
+        self, seeded_db, asha, run, clash
+    ):
+        belt = belt_for(seeded_db, asha, run)
+        belt.message = "move my cardiology appointment"
+        belt._propose_change(
+            ProposedAction.RESCHEDULE,
+            appointment_id=SEEDED_APPOINTMENT_ID,
+            slot_id=clash.id,
+        )
+
+        assert run.proposed_action is None
+        assert run.proposed_slot_id is None
+        assert run.status is WorkflowStatus.IN_PROGRESS
+
+    def test_both_directions_are_traced(self, seeded_db, asha, run, clash):
+        """A refused clash leaves no other mark — the run is untouched, so
+        without the row there is nothing to say the guard ran at all."""
+        belt = belt_for(seeded_db, asha, run)
+        belt.message = "move my cardiology appointment"
+        belt._propose_change(
+            ProposedAction.RESCHEDULE,
+            appointment_id=SEEDED_APPOINTMENT_ID,
+            slot_id=clash.id,
+        )
+        seeded_db.flush()
+
+        rejections = [
+            event
+            for event in seeded_db.query(TraceEvent)
+            .filter(TraceEvent.event_type == TraceEventType.VALIDATION)
+            .all()
+            if event.payload.get("what") == "appointment_change_proposal"
+            and event.payload.get("accepted") is False
+        ]
+        assert any(
+            "clash" in (event.payload.get("detail") or {}).get("problem", "")
+            for event in rejections
+        )
+
+    def test_a_free_time_is_still_accepted(self, seeded_db, asha, run, clash):
+        """The negative control. The same run, the same second appointment,
+        a Cardiology slot at an hour the patient is not already spoken for."""
+        free = (
+            seeded_db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .join(Department, Department.id == Doctor.department_id)
+            .filter(
+                Department.name == "Cardiology",
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                AppointmentSlot.start_time > clash.start_time,
+            )
+            .order_by(AppointmentSlot.start_time)
+            .first()
+        )
+        belt = belt_for(seeded_db, asha, run)
+        belt.message = "move my cardiology appointment"
+        result = belt._propose_change(
+            ProposedAction.RESCHEDULE,
+            appointment_id=SEEDED_APPOINTMENT_ID,
+            slot_id=free.id,
+        )
+
+        assert result["accepted"] is True
+
+    def test_the_appointment_being_moved_is_not_its_own_clash(
+        self, seeded_db, asha, run
+    ):
+        """Self-exclusion at the proposal layer.
+
+        Asha's own Cardiology appointment sits at some hour; the other
+        cardiologist is free at that same hour. Moving to it is a change of
+        doctor, and without excluding the row being moved the guard reads it as
+        a clash with itself and refuses every such move.
+        """
+        current = seeded_db.get(Appointment, SEEDED_APPOINTMENT_ID)
+        twin = (
+            seeded_db.query(AppointmentSlot)
+            .filter(
+                AppointmentSlot.start_time == current.slot.start_time,
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                AppointmentSlot.doctor_id != current.doctor_id,
+            )
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .filter(Doctor.department_id == current.department_id)
+            .first()
+        )
+        assert twin is not None, "no second cardiologist free at that time"
+
+        belt = belt_for(seeded_db, asha, run)
+        result = belt._propose_change(
+            ProposedAction.RESCHEDULE,
+            appointment_id=SEEDED_APPOINTMENT_ID,
+            slot_id=twin.id,
+        )
+
+        assert result["accepted"] is True
+
+
+class TestWhatTheSearchHandsTheModel:
+    """Round 9, item 1 — the search filtered correctly and the payload undid it.
+
+    ``find_available_slots`` has withheld a patient's own busy times since
+    round 7, and returned them in ``withheld_for_patient`` since round 8 so the
+    reply could say *why* a named time is missing. That field is read here and
+    nowhere downstream — but the tool handed it to the model, which is a list
+    of slot ids labelled "not available to this patient", given to the one
+    component whose job is to choose a slot id. Live, the model chose one.
+    """
+
+    @pytest.fixture
+    def busy(self, seeded_db, asha):
+        """Asha booked into the exact time of a free Cardiology slot."""
+        target = slot_in(seeded_db, "Cardiology")
+        occupied = (
+            seeded_db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .join(Department, Department.id == Doctor.department_id)
+            .filter(
+                Department.name == "Dermatology",
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                AppointmentSlot.start_time == target.start_time,
+            )
+            .first()
+        )
+        occupied.status = SlotStatus.BOOKED
+        seeded_db.add(
+            Appointment(
+                patient_id=ASHA_PROFILE_ID,
+                doctor_id=occupied.doctor_id,
+                slot_id=occupied.id,
+                department_id=occupied.doctor.department_id,
+                status=AppointmentStatus.CONFIRMED,
+                reference_code="AC-000099",
+                reason="skin rash",
+            )
+        )
+        seeded_db.flush()
+        return target
+
+    def _tool(self, belt, name: str):
+        return next(t for t in belt.appointment_tools() if t.__name__ == name)
+
+    def test_the_reschedule_search_withholds_nothing_by_name(
+        self, seeded_db, asha, run, busy
+    ):
+        belt = belt_for(seeded_db, asha, run)
+        found = self._tool(belt, "find_slots_for_reschedule")(SEEDED_APPOINTMENT_ID)
+
+        assert "withheld_for_patient" not in found
+        assert busy.id not in {slot["slot_id"] for slot in found["slots"]}
+
+    def test_the_booking_search_withholds_nothing_by_name(
+        self, seeded_db, asha, run, busy
+    ):
+        run.state = {"department_id": 1}
+        belt = belt_for(seeded_db, asha, run)
+        found = self._tool(belt, "find_available_slots")("", "", "")
+
+        assert "withheld_for_patient" not in found
+        assert busy.id not in {slot["slot_id"] for slot in found["slots"]}
+
+    def test_the_appointment_being_moved_does_not_hide_its_own_hour(
+        self, seeded_db, asha, run
+    ):
+        """Self-exclusion in the search.
+
+        Asha's Cardiology appointment occupies an hour; the other cardiologist
+        is free in it. Counting the appointment against its own search removes
+        that slot, so the answer to "can I see the other doctor at the same
+        time" is a list that does not contain the only slot that answers it.
+        """
+        current = seeded_db.get(Appointment, SEEDED_APPOINTMENT_ID)
+        twin = (
+            seeded_db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .filter(
+                Doctor.department_id == current.department_id,
+                AppointmentSlot.start_time == current.slot.start_time,
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+            )
+            .first()
+        )
+        assert twin is not None, "no second cardiologist free at that time"
+
+        belt = belt_for(seeded_db, asha, run)
+        # Scoped to the day: the default limit is 20 and the seed lays down
+        # fourteen days of slots, so an unscoped search would drop this slot
+        # for being far down the list and the assertion would pass or fail on
+        # the limit rather than on the rule.
+        day = current.slot.start_time.date().isoformat()
+        found = self._tool(belt, "find_slots_for_reschedule")(
+            SEEDED_APPOINTMENT_ID, day, day
+        )
+
+        assert twin.id in {slot["slot_id"] for slot in found["slots"]}
+
+
 class TestTheAcceptedPath:
     def test_a_valid_cancellation_proposal_pauses_the_run(self, seeded_db, asha, run):
         belt = belt_for(seeded_db, asha, run)

@@ -445,6 +445,196 @@ class TestReschedulingRefusals:
         assert result["reason"] == "slot_in_the_past"
 
 
+class TestReschedulingCannotDoubleBook:
+    """Round 9, item 1 — the clash guard booking has always had, ported.
+
+    Live, runs #6 and #7: the patient booked Ophthalmology for Thursday 6
+    August at 9:00 AM, then asked to move their Dermatology appointment "to
+    August 6th". The search withheld the 9:00 slot correctly and even named the
+    clash; the model proposed it anyway — out of the withheld list, which the
+    tool result handed it — and ``reschedule_appointment`` committed it without
+    a word. Appointments 3 and 5 both confirmed at one instant, which the
+    *booking* path has refused since Phase 2.
+
+    This is the layer that makes it impossible rather than unlikely. Every
+    guard above it can be bypassed by a stale proposal, a retry, or a direct
+    call, which is why the refusal has to live here as well as there.
+    """
+
+    @staticmethod
+    def _department_slot(db, department_id: int, *, start=None, not_at=None, exclude=()):
+        """A free slot in a department, optionally at (or away from) a time.
+
+        ``not_at`` excludes a whole start time rather than a slot id, and it is
+        load-bearing: every department has two doctors, so excluding one slot
+        leaves its twin at the same instant — and a "different time" chosen
+        that way is the same time, which makes the *setup* booking bounce off
+        the very guard under test.
+        """
+        from app.models import Doctor
+
+        query = (
+            db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .filter(
+                Doctor.department_id == department_id,
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                AppointmentSlot.start_time > clock.now() + timedelta(hours=24),
+            )
+        )
+        if start is not None:
+            query = query.filter(AppointmentSlot.start_time == start)
+        if not_at is not None:
+            query = query.filter(AppointmentSlot.start_time != not_at)
+        if exclude:
+            query = query.filter(AppointmentSlot.id.notin_(exclude))
+        return query.order_by(AppointmentSlot.start_time, AppointmentSlot.id).first()
+
+    def _the_live_shape(self, db, patient_b):
+        """Two appointments in two departments, and a slot that collides.
+
+        Returns (mover_appointment_id, clashing_slot_id, mover_slot_id) — the
+        Dermatology appointment, the Dermatology slot sitting at the exact
+        time of the Ophthalmology one, and where the mover started.
+        """
+        keeper_slot = self._department_slot(db, 8)
+        keeper_start = keeper_slot.start_time
+        book_appointment(db, patient_b, slot_id=keeper_slot.id, reason="vision test")
+
+        clashing = self._department_slot(db, 3, start=keeper_start)
+        assert clashing is not None, "the seed has no Dermatology slot at that time"
+
+        mover_slot = self._department_slot(db, 3, not_at=keeper_start)
+        mover = book_appointment(db, patient_b, slot_id=mover_slot.id, reason="skin rash")
+        assert mover["ok"] is True, "the setup booking must succeed on its own"
+
+        return mover["appointment"]["appointment_id"], clashing.id, mover_slot.id
+
+    def test_moving_onto_another_appointments_time_is_refused(self, db, patient_b):
+        appointment_id, clashing_slot_id, _ = self._the_live_shape(db, patient_b)
+
+        result = reschedule_appointment(
+            db, patient_b, appointment_id, new_slot_id=clashing_slot_id
+        )
+
+        assert result["ok"] is False
+        assert result["reason"] == "patient_double_booked"
+
+    def test_no_two_live_appointments_share_a_start_time(self, db, patient_b):
+        """The claim the patient actually cares about, asserted about the data.
+
+        The reason code above is this repo's word for it; this is the state
+        itself, and it is the query that found the live defect.
+        """
+        appointment_id, clashing_slot_id, _ = self._the_live_shape(db, patient_b)
+        reschedule_appointment(db, patient_b, appointment_id, new_slot_id=clashing_slot_id)
+
+        starts = [
+            start
+            for (start,) in db.query(AppointmentSlot.start_time)
+            .join(Appointment, Appointment.slot_id == AppointmentSlot.id)
+            .filter(
+                Appointment.patient_id == 2,
+                Appointment.status.in_(
+                    (AppointmentStatus.PENDING, AppointmentStatus.CONFIRMED)
+                ),
+            )
+            .all()
+        ]
+        assert len(starts) == 2, "both appointments must still exist to be compared"
+        assert len(starts) == len(set(starts))
+
+    def test_the_clashing_slot_is_left_available(self, db, patient_b):
+        """Refused before the claim, not after it.
+
+        A refusal that has already flipped the slot to booked takes a time out
+        of everyone's diary to punish a move that never happened.
+        """
+        appointment_id, clashing_slot_id, _ = self._the_live_shape(db, patient_b)
+        reschedule_appointment(db, patient_b, appointment_id, new_slot_id=clashing_slot_id)
+
+        assert db.get(AppointmentSlot, clashing_slot_id).status == SlotStatus.AVAILABLE
+
+    def test_the_original_appointment_is_untouched(self, db, patient_b):
+        appointment_id, clashing_slot_id, mover_slot_id = self._the_live_shape(db, patient_b)
+        reschedule_appointment(db, patient_b, appointment_id, new_slot_id=clashing_slot_id)
+
+        assert db.get(Appointment, appointment_id).slot_id == mover_slot_id
+        assert db.get(AppointmentSlot, mover_slot_id).status == SlotStatus.BOOKED
+
+    def test_an_appointment_does_not_clash_with_itself(self, db, patient_b):
+        """Self-exclusion, pinned by the only case that can falsify it.
+
+        Moving a 9:00 to a 10:00 cannot fail for want of this rule — the two
+        slots do not overlap, so a check with no exclusion at all still lets it
+        through. Changing *doctor* at the same time is the case that does:
+        without excluding the appointment being moved, its own slot overlaps
+        the destination and every such move is refused as a clash with itself.
+        """
+        original = self._department_slot(db, 3)
+        booked = book_appointment(db, patient_b, slot_id=original.id, reason="skin rash")
+        appointment_id = booked["appointment"]["appointment_id"]
+
+        same_time_other_doctor = self._department_slot(
+            db, 3, start=original.start_time, exclude=(original.id,)
+        )
+        assert same_time_other_doctor is not None, "the seed has one dermatologist"
+
+        result = reschedule_appointment(
+            db, patient_b, appointment_id, new_slot_id=same_time_other_doctor.id
+        )
+
+        assert result["ok"] is True
+        assert db.get(Appointment, appointment_id).slot_id == same_time_other_doctor.id
+
+    def test_an_ordinary_move_to_another_hour_still_succeeds(self, db, patient_b):
+        """The regression the guard could plausibly cause.
+
+        Not a pin on self-exclusion — see above — but on the overlap predicate
+        itself: a helper that asked "does this patient have anything that day"
+        would refuse this, and so would one that compared dates rather than
+        instants.
+        """
+        original = self._department_slot(db, 3)
+        booked = book_appointment(db, patient_b, slot_id=original.id, reason="skin rash")
+        later_same_day = self._department_slot(
+            db,
+            3,
+            start=original.start_time + timedelta(hours=1),
+            exclude=(original.id,),
+        )
+        assert later_same_day is not None, "the seed has no next-hour slot that day"
+
+        result = reschedule_appointment(
+            db,
+            patient_b,
+            booked["appointment"]["appointment_id"],
+            new_slot_id=later_same_day.id,
+        )
+
+        assert result["ok"] is True
+
+    def test_a_cancelled_appointment_does_not_block_the_time(self, db, patient_b):
+        """A released commitment is not a commitment.
+
+        The same rule the search follows: live statuses only. Counting a
+        cancelled visit would shrink the patient's own schedule permanently.
+        """
+        appointment_id, clashing_slot_id, _ = self._the_live_shape(db, patient_b)
+        keeper = (
+            db.query(Appointment)
+            .filter(Appointment.patient_id == 2, Appointment.id != appointment_id)
+            .order_by(Appointment.id.desc())
+            .first()
+        )
+        cancel_appointment(db, patient_b, keeper.id)
+
+        result = reschedule_appointment(
+            db, patient_b, appointment_id, new_slot_id=clashing_slot_id
+        )
+        assert result["ok"] is True
+
+
 class TestCancellation:
     def test_cancelling_marks_the_appointment_cancelled(self, db, patient_b):
         slot_id = free_slot(db)

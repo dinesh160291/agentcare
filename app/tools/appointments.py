@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 from app import clock
 from app.audit import write_audit
 from app.auth.ownership import get_owned_or_404, patient_profile_for
+from app.tools.availability import patient_clash
 from app.tools.confirmations import _clock_time
 from app.models import (
     Appointment,
@@ -252,15 +253,11 @@ def book_appointment(
         return _refuse(session, run, reason="doctor_unavailable",
                        message="That appointment time is no longer available.")
 
-    clash = (
-        session.query(Appointment)
-        .join(AppointmentSlot, AppointmentSlot.id == Appointment.slot_id)
-        .filter(
-            Appointment.patient_id == profile.id,
-            Appointment.status.in_(LIVE_STATUSES),
-            AppointmentSlot.start_time == slot.start_time,
-        )
-        .first()
+    clash = patient_clash(
+        session,
+        patient_id=profile.id,
+        start=slot.start_time,
+        end=slot.end_time,
     )
     if clash is not None:
         return _refuse(
@@ -342,6 +339,29 @@ def reschedule_appointment(
     if not doctor.active or not department.active:
         return _refuse(session, run, reason="doctor_unavailable",
                        message="That appointment time is no longer available.")
+
+    # The same question booking asks, excluding the appointment being moved —
+    # which is not a reason to refuse its own move. Booking has refused an
+    # occupied time since Phase 2 and this path never got the guard, so a
+    # patient moved a Dermatology appointment onto the exact time of an
+    # Ophthalmology one and both rows committed. Checked *before* the claim:
+    # a refusal that has already flipped the slot to booked takes a time out
+    # of the department's diary for a move that never happened.
+    clash = patient_clash(
+        session,
+        patient_id=appointment.patient_id,
+        start=new_slot.start_time,
+        end=new_slot.end_time,
+        exclude_appointment_id=appointment.id,
+    )
+    if clash is not None:
+        return _refuse(
+            session, run,
+            reason="patient_double_booked",
+            alternatives=_alternatives(session, department_id=doctor.department_id,
+                                       around=new_slot.start_time),
+            message="You already have an appointment at that time.",
+        )
 
     # Claim first: if this fails, nothing has been given up.
     if not _claim_slot(session, new_slot_id):

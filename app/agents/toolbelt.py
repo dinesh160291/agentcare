@@ -24,7 +24,7 @@ trace rows, and the change they describe commit or roll back together.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
 from sqlalchemy.orm import Session
@@ -65,6 +65,7 @@ from app.tools import (
     list_patient_documents,
     list_patient_reminders,
     list_unverified_documents,
+    patient_clash,
     render_confirmation,
     resolve_date,
     resolve_department,
@@ -322,6 +323,24 @@ class Toolbelt:
         accepted = verdict.appointment_id == appointment_id
         self.writer.validation("appointment_target", accepted=accepted, detail=detail)
         return verdict.appointment_id or appointment_id, None
+
+    @staticmethod
+    def _offerable(found: dict) -> dict:
+        """A search payload with the times the patient may not be offered removed.
+
+        ``withheld_for_patient`` was added so *code* could say why a time the
+        patient named is missing. It is consumed inside this class and read by
+        nothing downstream — but it was being returned to the model, which is a
+        list of slot ids labelled "this patient cannot have these", handed to
+        the one component whose job is to pick a slot id.
+
+        Live, that is exactly what happened: the search withheld the 9:00 AM
+        the patient's other appointment occupied, named the clash, and the
+        model proposed 403 out of the withheld list. The filtering was working
+        perfectly; the payload undid it. Whatever is refused below must not be
+        offered up here.
+        """
+        return {key: value for key, value in found.items() if key != "withheld_for_patient"}
 
     @staticmethod
     def _as_date(value: str) -> date | None:
@@ -852,7 +871,7 @@ class Toolbelt:
             )
             self.proposals.offered_slots = list(found.get("slots") or [])
             self.proposals.searched_slots = True
-            return found
+            return self._offerable(found)
 
         def propose_appointment(slot_id: int) -> dict:
             """Propose a specific time to the patient. This books nothing: it
@@ -896,9 +915,14 @@ class Toolbelt:
                 end=self._as_date(end),
                 part_of_day=part_of_day or None,
                 free_for_patient=self.patient_id,
+                # The appointment being moved is not a reason to withhold a
+                # time from its own search: counting it hid the hour it
+                # currently occupies, so a patient asking for the other doctor
+                # at the same time was told nothing was free then.
+                exclude_appointment_id=appointment_id,
             )
             self.proposals.searched_slots = True
-            return found
+            return self._offerable(found)
 
         def propose_reschedule(appointment_id: int, slot_id: int) -> dict:
             """Propose moving an existing appointment to a new time. This
@@ -1112,6 +1136,37 @@ class Toolbelt:
                         "That time is in a different department. Rescheduling "
                         "keeps the same department; book a new appointment "
                         "instead."
+                    ),
+                }
+
+            # Is the patient themselves free then? The search already withholds
+            # these, and that was not enough: it returns the withheld slots so
+            # the reply can explain them, and the model proposed one *out of
+            # that list*. Excluding the appointment being moved, which is not a
+            # reason to refuse its own move.
+            clash = patient_clash(
+                self.session,
+                patient_id=self.patient_id,
+                start=datetime.fromisoformat(found["start"]),
+                end=datetime.fromisoformat(found["end"]),
+                exclude_appointment_id=appointment_id,
+            )
+            if clash is not None:
+                self.writer.validation(
+                    "appointment_change_proposal",
+                    accepted=False,
+                    detail={
+                        "appointment_id": appointment_id,
+                        "slot_id": slot_id,
+                        "problem": "clash with the patient's own appointment",
+                        "clashes_with": clash["appointment_id"],
+                    },
+                )
+                return {
+                    "accepted": False,
+                    "problem": (
+                        f"You already have a {clash['department_name']} "
+                        "appointment at that time. Offer another."
                     ),
                 }
 

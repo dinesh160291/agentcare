@@ -22,7 +22,7 @@ from app.tools.appointments import (
     list_patient_appointments,
     reschedule_appointment,
 )
-from app.tools.availability import find_available_slots, get_slot
+from app.tools.availability import find_available_slots, get_slot, patient_clash
 from app.tools.confirmations import render_confirmation
 from app.tools.dates import resolve_date
 from app.tools.departments import (
@@ -79,6 +79,7 @@ __all__ = [
     "list_patient_documents",
     "list_unverified_documents",
     "list_patient_reminders",
+    "patient_clash",
     "render_confirmation",
     "reschedule_appointment",
     "resolve_date",
