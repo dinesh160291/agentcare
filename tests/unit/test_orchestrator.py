@@ -4603,6 +4603,39 @@ class TestAModelProposedWindowIsDisposedByCode:
 
         assert refused and refused[0]["accepted"] is False
 
+    def test_a_turn_that_showed_times_is_not_a_non_answer(self, patient, monkeypatch):
+        """The third instance of one shape, and the live sweep found this one too.
+
+        The stall counter bounds a *re-ask loop*, and its own comment says a
+        turn that rendered times is not a re-ask. The code said something
+        narrower — a turn where **code** rendered times — because
+        ``answered_timing`` is set only by the code-driven search, which is
+        skipped when the model has already answered. Those two readings agreed
+        until round 9 handed the model its own way to render times, and then a
+        patient who asked about timing, was shown times, and was told nothing
+        was wrong still had a non-answer charged against them.
+
+        Pre-round-9 this conversation passed live and it fails now, which is
+        what makes it a regression rather than another chronic red.
+        """
+        self._holding(patient, "s-propwin-4")
+        monkeypatch.setattr(
+            "app.agents.base.get_provider",
+            lambda name=None: WindowProposingLlm(
+                window_start=clock.today().isoformat(),
+                window_end=(clock.today() + timedelta(days=6)).isoformat(),
+            ),
+        )
+
+        result = turn(patient, "what else is free around then?", "s-propwin-4")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert run.non_answer_count == 0
+        finally:
+            session.close()
+
     def test_nothing_is_booked_by_a_window(self, patient, monkeypatch):
         """The bound that makes reading a window freely safe: it searches, and
         that is all it can do."""

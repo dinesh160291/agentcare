@@ -1919,10 +1919,20 @@ async def _continue_run(
     # rendered times is not a re-ask. The message that *was* counted here — the
     # Thursday-or-Friday question above — was a patient being told nothing and
     # then charged for it.
+    #
+    # Read from ``answered_with_slots``, not from ``answered_timing``. The
+    # second means "*code* ran the search", and the two were the same thing
+    # only for as long as code was the only thing that could render times at
+    # this state. Round 9 gave the model ``propose_search_window``, which sets
+    # ``answered_with_slots`` and therefore *skips* the code-driven branch
+    # above — leaving ``answered_timing`` false on a turn that had just shown
+    # the patient a list. They asked about timing, were answered, and were
+    # charged a non-answer for it. The sentence this comment already made is
+    # the correct rule; the condition simply did not implement it.
     if (
         awaiting_confirmation
         and run.status is WorkflowStatus.PENDING_CONFIRMATION
-        and not answered_timing
+        and not belt.proposals.answered_with_slots
     ):
         run.non_answer_count += 1
         session.flush()
