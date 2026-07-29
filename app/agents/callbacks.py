@@ -43,7 +43,12 @@ from __future__ import annotations
 import json
 
 from app.agents.memory import window_contents
-from app.providers.base import request_snapshot, response_snapshot, text_response
+from app.providers.base import (
+    current_turn_start,
+    request_snapshot,
+    response_snapshot,
+    text_response,
+)
 from app.trace import TraceWriter
 
 
@@ -65,6 +70,16 @@ class TurnCallbacks:
         self.writer = writer
         self.max_tool_iterations = max_tool_iterations
         self.history_window_turns = history_window_turns
+        #: Set for a turn with no live run, where the Coordinator's job is to
+        #: *plan* rather than to classify. A planner has nothing to learn from
+        #: the transcript — whether this message needs routing and a booking is
+        #: a fact about this message and the patient's record — and live it had
+        #: something to lose: reasoning over a session in which "conflicting"
+        #: had once been the right answer, it submitted that word as a plan step
+        #: five times running and the request never started. Classification is
+        #: the opposite case and is deliberately untouched: how a message
+        #: relates to what came before is unanswerable without what came before.
+        self.plan_context_only = False
         self.tool_iterations = 0
         self.budget_exhausted = False
         #: This agent has said everything it was asked for. Unlike
@@ -128,7 +143,16 @@ class TurnCallbacks:
 
         # Window *before* the snapshot, so the trace records what was actually
         # sent rather than what the framework would have sent unaided.
-        if self.history_window_turns > 0 and llm_request.contents:
+        if self.plan_context_only and llm_request.contents:
+            # The current turn and nothing older. Cutting at
+            # ``current_turn_start`` rather than counting turns reuses the one
+            # definition of "this turn" the providers already read, and it
+            # keeps what the turn has earned: the patient's message, and the
+            # context tool's result once it has been called.
+            llm_request.contents = llm_request.contents[
+                current_turn_start(llm_request) :
+            ]
+        elif self.history_window_turns > 0 and llm_request.contents:
             llm_request.contents = window_contents(
                 llm_request.contents, turns=self.history_window_turns
             )

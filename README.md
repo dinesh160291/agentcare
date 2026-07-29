@@ -56,7 +56,7 @@ The trade is deliberately one-directional: a missed emergency is the worst outco
 
 ### Context contract
 
-The Coordinator receives a windowed transcript. **Specialists receive no history at all** — only a typed task and the state they need. Where language *is* the job (routing), the request text rides inside the typed task. Delegation is dispatched by the orchestrator from the validated plan rather than by handing a sub-agent the whole session.
+The Coordinator receives a windowed transcript while a run is live, and only the current turn plus the patient's own record on a fresh turn — classifying a message needs what came before, planning one does not. **Specialists receive no history at all** — only a typed task and the state they need. Where language *is* the job (routing), the request text rides inside the typed task. Delegation is dispatched by the orchestrator from the validated plan rather than by handing a sub-agent the whole session.
 
 ### Orchestration
 

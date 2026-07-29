@@ -416,6 +416,43 @@ def mentions_domain_subject(text: str) -> bool:
     return bool(_DOMAIN_PATTERN.search(text or ""))
 
 
+#: What a follow-up question is about, beyond the subjects every other part of
+#: the system shares. Kept separate from ``_DOMAIN_SUBJECTS`` rather than folded
+#: into it: that tuple feeds the scope-gate veto, whose behaviour on "nvidia
+#: stock" and "who won the fifa final" is pinned byte for byte, and widening it
+#: with words as ordinary as "pending" and "upcoming" would move a guard nobody
+#: asked to move.
+_FOLLOW_UP_SUBJECTS: tuple[str, ...] = (
+    r"\btasks?\b",
+    r"\bfollow[- ]?ups?\b",
+    r"\bupcoming\b",
+    r"\bpending\b",
+    r"\boutstanding\b",
+)
+
+_FOLLOW_UP_PATTERN = re.compile("|".join(_FOLLOW_UP_SUBJECTS), re.IGNORECASE)
+
+
+def names_followup_subject(text: str) -> bool:
+    """Whether a message is about the patient's own outstanding business.
+
+    The narrow companion to :func:`mentions_domain_subject`, and it exists
+    because ``follow_up`` is the one plan step that names no subject. Every
+    other step is about something — a department, an appointment, a document —
+    so a plan containing it says what the message was about. A plan of
+    ``["follow_up"]`` alone says nothing, and the gate had nothing to check it
+    against: live, "what is the capital city of India?" was planned that way,
+    accepted, and answered with a list of the patient's reminders.
+
+    "task" is here rather than in ``_DOMAIN_SUBJECTS`` because it belongs to
+    exactly this question. It is also not optional: "do I have any pending
+    tasks?" is in neither the domain vocabulary nor the listing detector, so a
+    gate assembled from those two alone would refuse the one follow-up question
+    the live session actually got right.
+    """
+    return bool(_FOLLOW_UP_PATTERN.search(text or ""))
+
+
 #: The verbs that act on an appointment the patient already has, each with the
 #: plan step it names. Deliberately short, and deliberately *not* including
 #: "change": every live phrasing used "reschedule", and a bare "change" beside
@@ -892,6 +929,7 @@ __all__ = [
     "apply_consequence",
     "WITHDRAWAL_CUES",
     "mentions_domain_subject",
+    "names_followup_subject",
     "names_appointment_verbs",
     "names_change_verb",
     "names_timing",

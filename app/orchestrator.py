@@ -51,6 +51,8 @@ from app.models import (
     ProposedAction,
     TERMINAL_WORKFLOW_STATUSES,
     TraceAuthor,
+    TraceEvent,
+    TraceEventType,
     User,
     UserRole,
     WorkflowRun,
@@ -73,6 +75,7 @@ from app.workflow.mapping import (
     mentions_domain_subject,
     names_appointment_verbs,
     names_change_verb,
+    names_followup_subject,
     names_timing,
     primary_intent,
     says_only_withdrawal,
@@ -124,6 +127,17 @@ DECLINED_REPLY = (
 NO_PLAN_REPLY = (
     "I want to make sure I get this right — could you tell me a little more about "
     "what you need help with?"
+)
+#: Said when the model planned something for a message that named nothing this
+#: system administers. Distinct from ``SCOPE_REPLY``, which answers a message
+#: the model itself declined to plan: there the invitation is the whole point,
+#: because the patient may simply not have said enough yet. Here they said
+#: plenty and none of it was ours, so the honest reply closes rather than asks.
+#: No escalation sentence, because nothing is being sent anywhere — there is
+#: nothing for a human to review about the capital of India.
+UNSUPPORTED_TOPIC_REPLY = (
+    "I handle hospital administration only: appointments, documents, reminders, "
+    "and follow-ups — I can't help with that one."
 )
 #: Said when a message would have replaced a run that is waiting for staff, and
 #: showed no difference to justify it. It states the run's *position*, never
@@ -871,6 +885,209 @@ def _corrected_change_plan(
     return corrected
 
 
+def _plan_floor(
+    session: Session,
+    *,
+    message: str,
+    belt: Toolbelt,
+    writer: TraceWriter,
+    user: User,
+) -> list[PlanStep] | None:
+    """A canonical plan for a booking the patient stated and nobody planned.
+
+    The second of the two places code may supply a plan, and the twin of
+    :func:`_corrected_change_plan` — which already covers the change verbs, for
+    a patient who has something to change. What had no equivalent is ``book``,
+    because it closes over nothing that exists yet, and that is the verb the
+    live failure was about: "I wanted to book an appointment for knee pain"
+    reached ``submit_plan`` as ``["conflicting"]`` four times, as
+    ``["cancel", "book"]`` once, and then as prose. Every guard did its job and
+    the patient met a clarifying question they had already answered in the
+    sentence. Rephrasing produced the identical fixation.
+
+    Three conditions, and each of them narrows it deliberately:
+
+    * **Nothing was accepted, and something was attempted.** A model that
+      planned is never second-guessed here — this fills a hole, it does not
+      arbitrate. And where nothing was even proposed, the clarify is still the
+      honest answer.
+    * **The words name exactly one verb, and it is ``book``.** Reusing
+      :func:`names_appointment_verbs`, so the vocabulary is the one the dropped
+      verb line and the plan correction already read. Two verbs, or a change
+      verb, and this stands aside: one request confirms one thing, and the
+      change verbs have an owner already.
+    * **The plan goes through ``validate_plan`` like any other.** The floor
+      cannot express anything a Coordinator could not, and every downstream
+      guard runs unchanged — routing still resolves the department from the
+      Department table, which is why the fallback never has to guess one.
+    """
+    if belt.proposals.plan is not None or not belt.proposals.rejections:
+        return None
+    if names_appointment_verbs(message) != {PlanStep.BOOK}:
+        return None
+
+    plan = validate_plan([PlanStep.BOOK.value])
+    writer.guard_verdict(
+        "plan_floor",
+        passed=True,
+        detail={
+            "verb": PlanStep.BOOK.value,
+            "plan": [step.value for step in plan],
+            "rejected_attempts": len(belt.proposals.rejections),
+        },
+    )
+    write_audit(
+        session,
+        action="plan_floor_applied",
+        entity_type="workflow_run",
+        actor=user,
+        metadata={"verb": PlanStep.BOOK.value},
+    )
+    return plan
+
+
+#: How many fresh-turn clarifies in a row before a human is asked to look.
+#: Two, so the third message is answered by a person rather than by the same
+#: question a third time.
+MAX_CONSECUTIVE_CLARIFIES = 2
+
+CLARIFY_ESCALATED_REPLY = (
+    "I'm sorry — I haven't been able to pin down what you need, so I've asked a "
+    "member of staff to pick this up. They'll be in touch."
+)
+
+
+def _consecutive_clarifies(session: Session, *, session_id: str, turn_id: str) -> int:
+    """How many fresh-turn clarifies run unbroken up to this turn.
+
+    The clarify is bounded like every other automated writer here: a reply that
+    invites a rephrase, given to a rephrase, is a loop, and live it ran until
+    the patient gave up. What makes it a *loop* rather than a bad answer is that
+    nothing about the turn changes between iterations.
+
+    Counted from the trace because a fresh turn writes nothing else — no run,
+    no proposal, nowhere on a row to keep a counter. Consecutive means
+    consecutive: any turn in between that did something else resets it, so a
+    patient who books successfully and is puzzling over something new later
+    starts from zero rather than inheriting an old tally.
+    """
+    rows = (
+        session.query(TraceEvent.turn_id, TraceEvent.event_type, TraceEvent.payload)
+        .filter(TraceEvent.session_id == session_id)
+        .order_by(TraceEvent.id)
+        .all()
+    )
+    order: dict[str, None] = {}
+    clarified: set[str] = set()
+    for row_turn, event_type, payload in rows:
+        if row_turn is None:
+            continue
+        order.setdefault(row_turn, None)
+        if (
+            event_type is TraceEventType.GUARD_VERDICT
+            and (payload or {}).get("guard") == "clarify_repeat"
+        ):
+            clarified.add(row_turn)
+
+    count = 0
+    for previous in reversed([t for t in order if t != turn_id]):
+        if previous not in clarified:
+            break
+        count += 1
+    return count
+
+
+def _earns_follow_up(message: str) -> bool:
+    """Whether a message has said enough to deserve a follow-up-only plan.
+
+    Three ways, and they are all existing readers rather than a new opinion:
+    the domain subjects every guard here shares, the follow-up nouns that name
+    a patient's own outstanding business, and the listing detector that already
+    answers "what have I got" questions before planning is reached.
+
+    The false-positive direction costs a run that reads the patient's own
+    reminders back to them — mildly silly. The false-negative direction refuses
+    a real question about their own tasks, which is the expensive one, so the
+    test is deliberately generous and every one of its three limbs is a reader
+    that already existed.
+    """
+    return (
+        mentions_domain_subject(message)
+        or names_followup_subject(message)
+        or detect_query(message) is not None
+    )
+
+
+def _escalate_unplannable(
+    session: Session,
+    *,
+    writer: TraceWriter,
+    user: User,
+    message: str,
+    base: dict,
+) -> TurnResult:
+    """Hand a request nobody could plan to a human.
+
+    A run is created to key the escalation to, for the reason
+    :func:`_budget_failure` gives: every escalation points at a run through a
+    non-nullable column, and one row is a better trade than one nullable key
+    for one path. It is born ``in_progress`` and escalated a line later,
+    because the transition is what the trace needs.
+
+    The kind is ``unsupported_request`` rather than ``system_failure``: nothing
+    broke. The request is real, it names something this system administers, and
+    the planner could not turn it into steps — which is exactly the case a
+    human is better at than another clarifying question.
+    """
+    profile = _patient_profile(session, user)
+    run = create_run(
+        session,
+        patient_id=profile.id,
+        status=WorkflowStatus.IN_PROGRESS,
+        trigger="clarify_loop_escalated",
+        writer=writer,
+        request_text=message,
+        plan=[],
+        session_id=base.get("session_id"),
+        actor=user,
+    )
+    transition(
+        session,
+        run,
+        to=WorkflowStatus.ESCALATED,
+        trigger="clarify_loop_escalated",
+        writer=writer,
+        actor=user,
+        detail={"consecutive_clarifies": MAX_CONSECUTIVE_CLARIFIES + 1},
+    )
+    create_escalation(
+        session,
+        workflow_run_id=run.id,
+        kind=EscalationKind.UNSUPPORTED_REQUEST,
+        reason=(
+            "The patient rephrased a request naming an administrative subject "
+            "three times and no plan could be produced."
+        ),
+        message=message,
+        actor=user,
+    )
+    write_audit(
+        session,
+        action="clarify_loop_escalated",
+        entity_type="workflow_run",
+        entity_id=run.id,
+        actor=user,
+        metadata={"consecutive_clarifies": MAX_CONSECUTIVE_CLARIFIES + 1},
+    )
+    return TurnResult(
+        reply=CLARIFY_ESCALATED_REPLY,
+        author=TraceAuthor.TEMPLATE,
+        run_id=run.id,
+        status=run.status.value,
+        **base,
+    )
+
+
 def _budget_failure(
     session: Session,
     *,
@@ -1381,15 +1598,28 @@ async def _turn(
     existing = await conversation.get_session(
         app_name=memory.APP_NAME, user_id=str(user.id), session_id=conversation_id
     )
-    coordinator_reply = await run_agent(
-        coordinator.build_agent(belt, callbacks, provider=provider),
-        task_text=message,
-        callbacks=callbacks,
-        session_service=conversation,
-        session_id=conversation_id,
-        user_id=str(user.id),
-        create=existing is None,
-    )
+    # With no live run the Coordinator is a planner, and a planner is answering
+    # a question about *this* message: what does it need, given who is asking.
+    # The transcript cannot help with that and demonstrably hurt — see
+    # ``plan_context_only``. With a run, the same agent is a classifier whose
+    # entire question is how this message relates to what came before, so the
+    # window stays exactly as it was.
+    callbacks.plan_context_only = run is None
+    try:
+        coordinator_reply = await run_agent(
+            coordinator.build_agent(belt, callbacks, provider=provider),
+            task_text=message,
+            callbacks=callbacks,
+            session_service=conversation,
+            session_id=conversation_id,
+            user_id=str(user.id),
+            create=existing is None,
+        )
+    finally:
+        # Specialists run later in this same turn against their own throwaway
+        # sessions; leaving the flag set would be harmless there and wrong to
+        # rely on, and the turn envelope is the only place that knows.
+        callbacks.plan_context_only = False
 
     if callbacks.budget_exhausted:
         return _budget_failure(
@@ -1423,6 +1653,33 @@ async def _turn(
         patient_id=profile.id,
         writer=writer,
     )
+    if plan is None:
+        plan = _plan_floor(
+            session, message=message, belt=belt, writer=writer, user=user
+        )
+    if plan == [PlanStep.FOLLOW_UP] and not _earns_follow_up(message):
+        # A plan of follow-up alone asserts nothing about the message, because
+        # the follow-up agent can run on any patient at any time. Every other
+        # step names something the request had to be about; this one does not,
+        # so the gate — which asks for a domain subject only when there is *no*
+        # plan — had nothing to disagree with, and three off-topic questions
+        # became three completed runs that listed the patient's reminders back
+        # at them.
+        writer.guard_verdict(
+            "follow_up_earned",
+            passed=False,
+            detail={"problem": "follow-up plan for a message that names no subject"},
+        )
+        write_audit(
+            session,
+            action="scope_gate_refused",
+            entity_type="workflow_run",
+            actor=user,
+            metadata={"reason": "follow-up plan not earned by the message"},
+        )
+        return TurnResult(
+            reply=UNSUPPORTED_TOPIC_REPLY, author=TraceAuthor.GUARD, **base
+        )
     names_a_subject = mentions_domain_subject(message)
     writer.guard_verdict(
         "scope_gate",
@@ -1453,6 +1710,22 @@ async def _turn(
             entity_type="workflow_run",
             actor=user,
             metadata={"reason": "message names a subject this system administers"},
+        )
+        # Asking again is only an answer the first couple of times. Live, the
+        # same clarify met the same rephrasing until the patient stopped
+        # trying — the reply was polite, the run was correct, and nothing was
+        # happening. A third time, a person looks at it instead.
+        prior = _consecutive_clarifies(
+            session,
+            session_id=base.get("session_id") or "",
+            turn_id=writer.turn_id,
+        )
+        if prior >= MAX_CONSECUTIVE_CLARIFIES:
+            return _escalate_unplannable(
+                session, writer=writer, user=user, message=message, base=base
+            )
+        writer.guard_verdict(
+            "clarify_repeat", passed=True, detail={"consecutive": prior + 1}
         )
         return TurnResult(reply=NO_PLAN_REPLY, author=TraceAuthor.TEMPLATE, **base)
 

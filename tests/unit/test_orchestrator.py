@@ -58,19 +58,23 @@ from app.orchestrator import (
     FAILED_REPLY,
     NO_PLAN_REPLY,
     SCOPE_REPLY,
+    UNSUPPORTED_TOPIC_REPLY,
     active_run,
     apply_patient_action,
     run_workflow,
 )
+from app.workflow.plan import PlanStep
 from app.workflow.replies import clock_time
 from app.providers.mock import MockLlm
 from app.providers.base import (
     AgentCareLlm,
     available_tool_names,
     called_tools,
+    current_turn_start,
     function_call_response,
     latest_tool_result,
     text_response,
+    tool_results,
 )
 from app.trace import assert_well_formed
 
@@ -131,6 +135,14 @@ def _guard(session, turn_id: str, name: str) -> dict:
             if (event.payload or {}).get("guard") == name:
                 return event.payload
     raise AssertionError(f"no {name!r} guard verdict in turn {turn_id}")
+
+
+def _guard_or_none(session, turn_id: str, name: str) -> dict | None:
+    """The same, for a guard whose *absence* is the claim."""
+    try:
+        return _guard(session, turn_id, name)
+    except AssertionError:
+        return None
 
 
 class TestBookingHappyPath:
@@ -1548,6 +1560,508 @@ class TestTheScopeGateDoesNotRefuseItsOwnSubject:
             session.close()
 
         assert gate["detail"]["domain_subject"] is True
+
+
+class FixatedCoordinatorLlm(MockLlm):
+    """A Coordinator stuck on a word from the wrong vocabulary.
+
+    Live: "I wanted to book an appointment for knee pain" reached
+    ``submit_plan`` as ``["conflicting"]`` four times — a *classifier* class,
+    not a plan step, refused each time by the closed enum — then once as
+    ``["cancel", "book"]``, refused by the one-verb rule, and finally as prose
+    the scope gate discarded. The patient rephrased and got the identical
+    fixation. Nothing was wrong with any guard; the run simply never started.
+
+    Three attempts then prose, because that is the shape of the live turn.
+    Submitting until the iteration budget fires would test the budget path
+    instead, which already has its own tests and produces a different reply.
+    """
+
+    model: str = "fixated-coordinator-stub"
+
+    def _plan(self, llm_request, done, text):  # noqa: ANN001
+        submitted = latest_tool_result(llm_request, "submit_plan")
+        if submitted is not None and submitted.payload.get("accepted"):
+            return self._from_plan(submitted.payload)
+        attempts = sum(
+            1 for result in tool_results(llm_request) if result.name == "submit_plan"
+        )
+        if attempts < 3:
+            return function_call_response("submit_plan", {"steps": ["conflicting"]})
+        return text_response(
+            "Your knee pain request conflicts with your existing appointment."
+        )
+
+
+class HistoryFixatedCoordinatorLlm(FixatedCoordinatorLlm):
+    """The same fixation, but *caused* by the transcript — which is the claim.
+
+    ``FixatedCoordinatorLlm`` pins the floor: it misplans no matter what it can
+    see, so it says nothing about why the live model misplanned. This one
+    fixates only while it can see a turn older than the current one, and plans
+    perfectly well when it cannot. That is the difference between a stub that
+    reproduces the symptom and one that reproduces the *cause*, and only the
+    second can falsify a bound on context.
+    """
+
+    model: str = "history-fixated-coordinator-stub"
+
+    def _plan(self, llm_request, done, text):  # noqa: ANN001
+        contents = llm_request.contents or []
+        if current_turn_start(llm_request) > 0 and len(contents) > 1:
+            return super()._plan(llm_request, done, text)
+        return MockLlm._plan(self, llm_request, done, text)
+
+
+class TestAFreshTurnPlansOnItsOwnMessage:
+    """Round 9, item 2a — the planner reasons over one message, not a session.
+
+    The live Coordinator's context began at a *previous run's* first message,
+    so it was still reasoning about a conversation in which "conflicting" had
+    been a valid answer. A fresh turn has nothing to learn from that: whether
+    this message needs routing and a booking is a fact about this message and
+    the patient's own record, both of which it is handed.
+
+    Mid-run turns are untouched. There the Coordinator is a classifier, its
+    whole question is how the new message relates to what came before, and
+    ``TestTheMidRunWindowSurvives`` is what holds that.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fixated(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider",
+            lambda name=None: HistoryFixatedCoordinatorLlm(),
+        )
+
+    def _with_history(self, patient, session_id: str):
+        """Two turns of unrelated conversation, so a transcript exists."""
+        turn(patient, "what's the weather like?", session_id)
+        turn(patient, "who won the fifa final", session_id)
+
+    def test_a_planner_that_needs_history_to_fail_now_succeeds(self, patient):
+        self._with_history(patient, "s-bounded-1")
+
+        result = turn(
+            patient, "I wanted to book an appointment for knee pain", "s-bounded-1"
+        )
+
+        assert result.run_id is not None
+        assert result.reply != NO_PLAN_REPLY
+
+    def test_the_run_is_routed_by_routing(self, patient):
+        """Orthopedics has to come from the Department table, through the
+        routing step — not from anything the floor guessed."""
+        self._with_history(patient, "s-bounded-2")
+
+        result = turn(
+            patient, "I wanted to book an appointment for knee pain", "s-bounded-2"
+        )
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            department = session.get(Department, run.state.get("department_id"))
+            assert department.name == "Orthopedics"
+        finally:
+            session.close()
+
+    def test_the_coordinators_request_carries_only_this_turn(self, patient):
+        """The bound itself, read off the trace rather than inferred from the
+        reply — the recorded request is what was actually sent."""
+        self._with_history(patient, "s-bounded-3")
+
+        result = turn(
+            patient, "I wanted to book an appointment for knee pain", "s-bounded-3"
+        )
+
+        session = fresh()
+        try:
+            requests = [
+                event.payload
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .order_by(TraceEvent.seq)
+                .all()
+                if event.event_type is TraceEventType.LLM_REQUEST
+                and event.agent_name == "coordinator"
+            ]
+        finally:
+            session.close()
+
+        assert requests, "the coordinator made no recorded request"
+        first = json.dumps(requests[0])
+        assert "weather" not in first
+        assert "fifa" not in first
+
+
+class TestTheFloorUnderAFailedPlan:
+    """Round 9, item 2b — when nothing is accepted, the words still said it.
+
+    Bounding the context (2a) removes the *cause* observed live. It cannot
+    promise the model will plan: a fresh session can misplan on its own, and
+    then the patient meets the clarify, rephrases, and meets it again. So where
+    the message plainly states a verb and a subject this system administers,
+    code supplies that verb's canonical plan rather than asking a question
+    whose answer is already in the sentence.
+
+    Narrow on purpose, and it is the second carve-out of the same shape as
+    round 5's ``_corrected_change_plan`` — which already covers the change
+    verbs for a patient who has something to change. What it adds is *book*,
+    which closes over nothing that exists yet and so had no equivalent. Every
+    downstream guard runs unchanged: the plan goes through ``validate_plan``
+    like any other, and routing still decides the department from the table.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fixated(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: FixatedCoordinatorLlm()
+        )
+
+    def test_a_stated_booking_survives_a_coordinator_that_never_plans(self, patient):
+        result = turn(
+            patient, "I wanted to book an appointment for knee pain", "s-floor-1"
+        )
+
+        assert result.run_id is not None
+        assert result.reply != NO_PLAN_REPLY
+
+    def test_the_department_still_comes_from_routing(self, patient):
+        result = turn(
+            patient, "I wanted to book an appointment for knee pain", "s-floor-2"
+        )
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            department = session.get(Department, run.state.get("department_id"))
+            assert department.name == "Orthopedics"
+            assert run.plan[0] == PlanStep.ROUTE.value
+        finally:
+            session.close()
+
+    def test_the_floor_is_recorded_as_a_guard_verdict(self, patient):
+        """Code supplying a plan is exactly the kind of thing that must not be
+        invisible: the trace has to say the plan was not the model's."""
+        result = turn(
+            patient, "I wanted to book an appointment for knee pain", "s-floor-3"
+        )
+
+        session = fresh()
+        try:
+            floor = _guard(session, result.turn_id, "plan_floor")
+        finally:
+            session.close()
+
+        assert floor["detail"]["verb"] == "book"
+
+    def test_a_vague_message_still_gets_the_clarify(self, patient):
+        """The negative control, and the thing that keeps the floor narrow.
+
+        The message names the subject — so the veto applies and the answer is
+        "tell me more" — but it states no verb, so there is nothing for code to
+        supply and asking is the honest answer.
+        """
+        result = turn(patient, "my appointment situation is confusing", "s-floor-4")
+
+        assert result.reply == NO_PLAN_REPLY
+        assert result.run_id is None
+
+    def test_an_off_topic_message_is_not_dragged_in(self, patient):
+        """Naming no subject at all is still a refusal, not a booking."""
+        result = turn(patient, "who won the fifa final", "s-floor-6")
+
+        assert result.reply == SCOPE_REPLY
+        assert result.run_id is None
+
+
+class TestTheClarifyLoopIsBounded:
+    """Round 9, item 2b's other half — a question asked forever is not an answer.
+
+    The clarify is a good reply once. Given to a rephrase of the message that
+    produced it, it is a loop, and the live session shows what that costs: the
+    patient rephrased, met the identical sentence, and stopped. Nothing about
+    the turn changes between iterations, which is what makes it a loop rather
+    than an unlucky answer — so it is bounded like every other automated writer
+    here, and the bound hands over to a person rather than trying again.
+
+    Deliberately *not* applied to the off-topic refusal: there is nothing for a
+    human to review about the FIFA final, and a queue of that is a queue nobody
+    reads. This fires only where the patient keeps naming something this system
+    genuinely administers and the planner keeps failing to plan it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fixated(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: FixatedCoordinatorLlm()
+        )
+
+    VAGUE = "my appointment situation is confusing"
+
+    def test_the_third_vague_message_reaches_a_human(self, patient):
+        assert turn(patient, self.VAGUE, "s-clarify-1").reply == NO_PLAN_REPLY
+        assert turn(patient, self.VAGUE, "s-clarify-1").reply == NO_PLAN_REPLY
+
+        third = turn(patient, self.VAGUE, "s-clarify-1")
+
+        assert third.reply != NO_PLAN_REPLY
+        assert third.status == WorkflowStatus.ESCALATED.value
+
+    def test_the_escalation_is_a_queue_item_a_human_can_act_on(self, patient):
+        for _ in range(3):
+            turn(patient, self.VAGUE, "s-clarify-2")
+
+        session = fresh()
+        try:
+            escalations = session.query(Escalation).all()
+            assert len(escalations) == 1
+            assert escalations[0].kind is EscalationKind.UNSUPPORTED_REQUEST
+            assert escalations[0].status is EscalationStatus.OPEN
+        finally:
+            session.close()
+
+    def test_a_turn_that_did_something_resets_the_count(self, patient):
+        """Consecutive means consecutive. A patient who gets stuck twice, is
+        answered by something else, and is puzzled again later must not be
+        escalated by a tally left over from before.
+
+        The turn in between is an off-topic one because it leaves no run: a
+        booking would, and the next message would then be a *mid-run* turn
+        answering a held proposal, which never reaches this branch at all and
+        would prove nothing about the counter.
+        """
+        turn(patient, self.VAGUE, "s-clarify-3")
+        turn(patient, self.VAGUE, "s-clarify-3")
+        turn(patient, "who won the fifa final", "s-clarify-3")
+
+        result = turn(patient, self.VAGUE, "s-clarify-3")
+
+        assert result.reply == NO_PLAN_REPLY
+
+    def test_an_off_topic_message_is_never_escalated(self, patient):
+        """The direction that would make the queue useless."""
+        for index in range(3):
+            result = turn(patient, "who won the fifa final", "s-clarify-4")
+            assert result.reply == SCOPE_REPLY
+
+        session = fresh()
+        try:
+            assert session.query(Escalation).count() == 0
+        finally:
+            session.close()
+
+    def test_an_accepted_plan_is_never_second_guessed(self, patient, monkeypatch):
+        """The floor may only fill a hole. A Coordinator that plans properly
+        must reach the same outcome it always did, so the guard has to be
+        unreachable whenever a plan was accepted."""
+        monkeypatch.setattr("app.agents.base.get_provider", lambda name=None: MockLlm())
+
+        result = turn(patient, "I need a dermatology appointment next week", "s-floor-5")
+
+        session = fresh()
+        try:
+            assert _guard_or_none(session, result.turn_id, "plan_floor") is None
+        finally:
+            session.close()
+
+
+class FollowUpPlanningLlm(MockLlm):
+    """A Coordinator that answers anything at all with ``["follow_up"]``.
+
+    Live, runs #10 to #12: "what is the capital city of India?", "who is the
+    ceo of nvidia?" and "tell me about google stock" each produced a plan of
+    ``["follow_up"]``. It is a real step, so the plan guard accepted it; the
+    scope gate only asked for a domain subject when the plan was *empty*, so it
+    passed; and the follow-up agent dutifully listed the patient's reminders.
+    Three completed runs of noise.
+
+    Containment held — the agent's only tools are reminders and tasks, so the
+    question was never answered — which is exactly why this was invisible. The
+    reply was wrong, not leaky.
+    """
+
+    model: str = "followup-planning-stub"
+
+    def _plan(self, llm_request, done, text):  # noqa: ANN001
+        submitted = latest_tool_result(llm_request, "submit_plan")
+        if submitted is not None:
+            return self._from_plan(submitted.payload)
+        return function_call_response("submit_plan", {"steps": ["follow_up"]})
+
+
+class TestAFollowUpPlanMustBeEarned:
+    """Round 9, item 3 — ``follow_up`` was a free pass through the scope gate.
+
+    Every other step names something the message has to be about. ``follow_up``
+    names the one specialist that can run on any patient at any time, so a plan
+    containing only it asserts nothing about the request — and the gate, which
+    checks for a domain subject only when there is no plan at all, had nothing
+    to disagree with.
+
+    So the message has to earn it: name something this system administers, or
+    be a listing question. Otherwise the plan is refused, no run is created,
+    and nothing goes to staff — there is nothing for a human to review about
+    the CEO of nvidia.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _followup_planner(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: FollowUpPlanningLlm()
+        )
+
+    OFF_TOPIC = (
+        "what is the capital city of India?",
+        "who is the ceo of nvidia?",
+        "tell me about google stock",
+    )
+
+    def test_an_off_topic_message_spawns_no_run(self, patient):
+        for index, message in enumerate(self.OFF_TOPIC):
+            result = turn(patient, message, f"s-earn-{index}")
+            assert result.run_id is None, message
+
+        session = fresh()
+        try:
+            assert session.query(WorkflowRun).count() == 0
+            assert session.query(Escalation).count() == 0
+        finally:
+            session.close()
+
+    def test_the_reply_says_so_plainly(self, patient):
+        result = turn(patient, self.OFF_TOPIC[0], "s-earn-reply")
+
+        assert result.reply == UNSUPPORTED_TOPIC_REPLY
+        assert result.author is TraceAuthor.GUARD
+
+    def test_the_refusal_is_recorded(self, patient):
+        result = turn(patient, self.OFF_TOPIC[0], "s-earn-trace")
+
+        session = fresh()
+        try:
+            gate = _guard(session, result.turn_id, "follow_up_earned")
+        finally:
+            session.close()
+
+        assert gate["passed"] is False
+
+    def test_a_question_about_the_patients_own_tasks_is_answered(self, patient):
+        """Run #14's exact wording, and the reason the gate cannot simply reuse
+        ``mentions_domain_subject``: "task" is in neither that vocabulary nor
+        the listing detector's, so a gate built from those alone would refuse
+        the one follow-up question the session got right."""
+        result = turn(patient, "do I have any pending tasks?", "s-earn-tasks")
+
+        assert result.reply != UNSUPPORTED_TOPIC_REPLY
+        assert result.run_id is not None
+
+    def test_a_reminders_question_never_reaches_this_gate_at_all(self, patient):
+        """Named for what it actually pins, which sabotage is how I found out.
+
+        With ``_earns_follow_up`` forced to refuse everything, this still
+        passed: a listing question is answered from the rows *before* the
+        Coordinator runs, so the gate never sees it. That makes this a
+        regression guard on the query router's precedence rather than on the
+        gate — worth keeping, worth not mistaking for the other thing.
+        """
+        result = turn(patient, "what reminders do I have?", "s-earn-reminders")
+
+        assert result.reply != UNSUPPORTED_TOPIC_REPLY
+        session = fresh()
+        try:
+            assert _guard_or_none(session, result.turn_id, "follow_up_earned") is None
+        finally:
+            session.close()
+
+    def test_a_follow_up_step_inside_a_larger_plan_is_untouched(
+        self, patient, monkeypatch
+    ):
+        """The gate is about a plan that is *only* follow-up. Every booking
+        plan ends with one, and closing over that would stop the system
+        working entirely."""
+        monkeypatch.setattr("app.agents.base.get_provider", lambda name=None: MockLlm())
+
+        result = turn(patient, BOOKING, "s-earn-booking")
+
+        assert result.run_id is not None
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert PlanStep.FOLLOW_UP.value in run.plan
+        finally:
+            session.close()
+
+
+class HistoryReadingClassifierLlm(MockLlm):
+    """A classifier that can only do its job with the transcript in front of it.
+
+    The other half of item 2a, and the half that could have been broken
+    silently. Bounding the *planner* to one message is safe because planning is
+    a question about that message; bounding the classifier would not be,
+    because "how does this relate to the request already running" is
+    unanswerable without the thing it relates to.
+
+    This stub makes that consequence visible instead of assumed: shown nothing
+    older than the current message, it answers ``off_topic`` — which is what a
+    trimmed mid-run turn would look like from inside a model, and what the
+    round-4 zombie run was made of.
+    """
+
+    model: str = "history-reading-classifier-stub"
+
+    def _classify(self, llm_request, available, done, text):  # noqa: ANN001
+        if current_turn_start(llm_request) == 0:
+            return function_call_response(
+                "classify_message",
+                {"message_class": "off_topic", "incoming_steps": []},
+            )
+        return super()._classify(llm_request, available, done, text)
+
+
+class TestTheMidRunWindowSurvives:
+    """Item 2a must not follow the planner's bound into the classifier."""
+
+    @pytest.fixture(autouse=True)
+    def _history_reading(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider",
+            lambda name=None: HistoryReadingClassifierLlm(),
+        )
+
+    def test_a_classification_that_needs_the_transcript_still_gets_it(self, patient):
+        first = turn(patient, BOOKING, "s-midrun-window")
+        assert first.run_id is not None
+
+        result = turn(patient, "what else is free that week?", "s-midrun-window")
+
+        assert result.message_class != MessageClass.OFF_TOPIC.value
+        assert result.run_id == first.run_id
+
+    def test_the_mid_run_request_still_carries_the_earlier_turn(self, patient):
+        """Read off the recorded request, so it says what was sent rather than
+        what the reply implies."""
+        first = turn(patient, BOOKING, "s-midrun-window-2")
+        result = turn(patient, "what else is free that week?", "s-midrun-window-2")
+
+        session = fresh()
+        try:
+            requests = [
+                event.payload
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .order_by(TraceEvent.seq)
+                .all()
+                if event.event_type is TraceEventType.LLM_REQUEST
+                and event.agent_name == "coordinator"
+            ]
+        finally:
+            session.close()
+
+        assert requests
+        assert "cardiology" in json.dumps(requests[0]).lower()
+        assert first.run_id is not None
 
 
 class MisplanningLlm(AgentCareLlm):
