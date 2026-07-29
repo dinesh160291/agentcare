@@ -18,7 +18,14 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app import clock
-from app.models import AppointmentSlot, Department, Doctor, SlotStatus
+from app.models import (
+    Appointment,
+    AppointmentSlot,
+    AppointmentStatus,
+    Department,
+    Doctor,
+    SlotStatus,
+)
 
 DEFAULT_LIMIT = 20
 
@@ -42,6 +49,20 @@ def _serialise_slot(slot: AppointmentSlot, doctor: Doctor, department: Departmen
     }
 
 
+def _patient_busy(session: Session, patient_id: int) -> list[tuple[datetime, datetime]]:
+    """When this patient is already committed — their live appointments' times."""
+    rows = (
+        session.query(AppointmentSlot.start_time, AppointmentSlot.end_time)
+        .join(Appointment, Appointment.slot_id == AppointmentSlot.id)
+        .filter(
+            Appointment.patient_id == patient_id,
+            Appointment.status.in_((AppointmentStatus.PENDING, AppointmentStatus.CONFIRMED)),
+        )
+        .all()
+    )
+    return [(start, end) for start, end in rows]
+
+
 def find_available_slots(
     session: Session,
     *,
@@ -51,6 +72,7 @@ def find_available_slots(
     end: date | None = None,
     part_of_day: str | None = None,
     limit: int = DEFAULT_LIMIT,
+    free_for_patient: int | None = None,
 ) -> dict[str, Any]:
     """Available slots matching the filters, soonest first.
 
@@ -60,6 +82,15 @@ def find_available_slots(
 
     An unrecognised ``part_of_day`` is ignored rather than guessed at: silently
     narrowing to a period the patient did not ask for hides the choice.
+
+    ``free_for_patient`` drops the slots that overlap that patient's own live
+    appointments. A slot free in the *department's* diary can still be a time
+    the patient is already spoken for, and the booking transaction refuses that
+    as ``patient_double_booked`` — correctly, but far too late to be useful.
+    Live, a Dermatology proposal held Monday 9:00 AM against a patient who
+    already had a Dermatology appointment at Monday 9:00 AM, so the Confirm was
+    guaranteed to bounce before it was ever offered. The commit-time check
+    stays exactly where it is; this only stops the engine setting it up to fail.
     """
     query = (
         session.query(AppointmentSlot, Doctor, Department)
@@ -92,6 +123,17 @@ def find_available_slots(
     if window is not None:
         first_hour, last_hour = window
         rows = [row for row in rows if first_hour <= row[0].start_time.hour < last_hour]
+
+    if free_for_patient is not None:
+        busy = _patient_busy(session, free_for_patient)
+        rows = [
+            row
+            for row in rows
+            if not any(
+                row[0].start_time < finish and start_at < row[0].end_time
+                for start_at, finish in busy
+            )
+        ]
 
     total = len(rows)
     limited = rows[: max(0, limit)] if limit is not None else rows

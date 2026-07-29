@@ -519,3 +519,196 @@ class TestAChoiceMustComeFromTheListThatWasShown:
             and event.payload["what"] == "appointment_choice"
         ]
         assert verdicts == [False, True]
+
+
+class TestTheTargetComesFromThePatientsWords:
+    """The one unguarded model argument, and the write behind it.
+
+    Live, with a Monday Dermatology appointment and a Thursday Orthopedics one,
+    "reschedule the appointment on Monday" arrived here as the *Thursday* id.
+    Ownership passed, liveness passed, the slot was free and in the right
+    department, the proposal was recorded, the patient confirmed — and the
+    wrong appointment moved. Every check in this module asks whether an id is
+    *usable*; none of them asked whether it was the one that was named.
+    """
+
+    @pytest.fixture
+    def two(self, seeded_db, asha):
+        """Asha's seeded Cardiology appointment, plus a Dermatology one."""
+        seeded = seeded_db.get(Appointment, SEEDED_APPOINTMENT_ID)
+        slot = slot_in(seeded_db, "Dermatology")
+        second = Appointment(
+            patient_id=ASHA_PROFILE_ID,
+            department_id=slot.doctor.department_id,
+            doctor_id=slot.doctor_id,
+            slot_id=slot.id,
+            status=AppointmentStatus.CONFIRMED,
+            reference_code="AC-009002",
+            reason="skin",
+        )
+        slot.status = SlotStatus.BOOKED
+        seeded_db.add(second)
+        seeded_db.flush()
+        return seeded, second
+
+    def belt(self, seeded_db, asha, run, message):
+        return Toolbelt(
+            seeded_db,
+            user=asha,
+            patient_id=ASHA_PROFILE_ID,
+            writer=TraceWriter(seeded_db, session_id="s-guards"),
+            run=run,
+            message=message,
+        )
+
+    def test_a_named_department_overrides_the_models_pick(self, seeded_db, asha, run, two):
+        """The whole defect in one assertion: the model asks for the wrong one
+        and the patient's own words win."""
+        seeded, second = two
+        belt = self.belt(seeded_db, asha, run, "cancel my dermatology appointment")
+
+        result = belt._propose_change(
+            ProposedAction.CANCEL, appointment_id=seeded.id, slot_id=None
+        )
+
+        assert result["accepted"] is True
+        assert run.proposed_appointment_id == second.id
+
+    def test_the_override_is_written_to_the_trace(self, seeded_db, asha, run, two):
+        """A silent override is a second unchecked decision. What was proposed,
+        what was resolved, and which cues did it all have to be readable."""
+        seeded, second = two
+        belt = self.belt(seeded_db, asha, run, "cancel my dermatology appointment")
+        belt._propose_change(ProposedAction.CANCEL, appointment_id=seeded.id, slot_id=None)
+        seeded_db.flush()
+
+        events = [
+            event.payload
+            for event in seeded_db.query(TraceEvent).all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload.get("what") == "appointment_target"
+        ]
+        assert events, "an override that leaves no event cannot be reviewed"
+        assert events[0]["accepted"] is False
+        assert events[0]["detail"]["proposed"] == seeded.id
+        assert events[0]["detail"]["resolved"] == second.id
+
+    def test_agreement_is_written_too(self, seeded_db, asha, run, two):
+        """Both directions. A check that only records its overrides cannot be
+        told apart from one that never ran."""
+        seeded, second = two
+        belt = self.belt(seeded_db, asha, run, "cancel my dermatology appointment")
+        belt._propose_change(ProposedAction.CANCEL, appointment_id=second.id, slot_id=None)
+        seeded_db.flush()
+
+        events = [
+            event.payload
+            for event in seeded_db.query(TraceEvent).all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload.get("what") == "appointment_target"
+        ]
+        assert [event["accepted"] for event in events] == [True]
+
+    def test_no_cue_with_two_appointments_refuses(self, seeded_db, asha, run, two):
+        """Nobody knows which, so nothing is recorded — and the orchestrator's
+        own numbered list is what asks. Guessing here is what the live failure
+        was made of."""
+        seeded, _ = two
+        belt = self.belt(seeded_db, asha, run, "please cancel my appointment")
+
+        result = belt._propose_change(
+            ProposedAction.CANCEL, appointment_id=seeded.id, slot_id=None
+        )
+
+        assert result["accepted"] is False
+        assert run.proposed_appointment_id is None
+
+    def test_one_appointment_needs_no_cue(self, seeded_db, asha, run):
+        """The auto-target case, unchanged. There was never a choice to get
+        wrong, so nothing is imposed."""
+        belt = self.belt(seeded_db, asha, run, "please cancel my appointment")
+
+        result = belt._propose_change(
+            ProposedAction.CANCEL, appointment_id=SEEDED_APPOINTMENT_ID, slot_id=None
+        )
+
+        assert result["accepted"] is True
+
+    def test_a_missing_id_is_still_refused_with_one_appointment(self, seeded_db, asha, run):
+        """And it is not quietly rewritten into the one row that happens to be
+        there. A slip must stay a slip."""
+        belt = self.belt(seeded_db, asha, run, "please cancel my appointment")
+
+        result = belt._propose_change(
+            ProposedAction.CANCEL, appointment_id=99999, slot_id=None
+        )
+
+        assert result["accepted"] is False
+
+    def test_an_answer_to_a_numbered_list_is_left_to_the_listed_guard(
+        self, seeded_db, asha, run, two
+    ):
+        """"2" names no weekday and no department, so this would read it as no
+        cue and refuse the very list it was answering. Where a choice has been
+        shown, `listed_appointment_ids` is the authority."""
+        seeded, second = two
+        run.state = {"listed_appointment_ids": [seeded.id, second.id]}
+        seeded_db.flush()
+        belt = self.belt(seeded_db, asha, run, "2")
+
+        result = belt._propose_change(
+            ProposedAction.CANCEL, appointment_id=second.id, slot_id=None
+        )
+
+        assert result["accepted"] is True
+        assert run.proposed_appointment_id == second.id
+
+
+class TestAHeldSlotIsAlwaysAnswerable:
+    """Whatever the reply around it looks like, the held time is in the set.
+
+    ``offered_slot_ids`` means "times this patient has been shown", and both
+    readers of it — the re-proposal guard and ``read_selection`` — take it at
+    that word. The proposal card names the held slot on *every* turn that holds
+    one, including the turns where ``render_proposal`` draws nothing because no
+    search ran and there is no shortlist to draw. Recording it only where a
+    shortlist is rendered would leave the patient holding a time they could
+    then not name, which is the hole item 2 exists to close rather than move.
+
+    Reached through the toolbelt because that is the only way to hold a slot
+    without a search in front of it — which is exactly what a live model does
+    when it recalls an id from its context window.
+    """
+
+    def test_a_proposal_with_no_search_behind_it_is_still_recorded(
+        self, seeded_db, asha, run
+    ):
+        slot = slot_in(seeded_db, "Cardiology")
+        belt = belt_for(seeded_db, asha, run)
+
+        result = belt._propose_appointment(slot.id)
+
+        assert result["accepted"] is True
+        assert run.state["offered_slot_ids"] == [slot.id]
+
+    def test_moving_the_offer_leaves_both_in_the_set(self, seeded_db, asha, run):
+        """The union is a union. "Actually the first one you showed me" arrives
+        three exchanges later and a set that shrank would refuse it."""
+        first = slot_in(seeded_db, "Cardiology")
+        belt = belt_for(seeded_db, asha, run)
+        belt._propose_appointment(first.id)
+        second = (
+            seeded_db.query(AppointmentSlot)
+            .filter(
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                AppointmentSlot.doctor_id == first.doctor_id,
+                AppointmentSlot.id != first.id,
+                AppointmentSlot.start_time > clock.now(),
+            )
+            .order_by(AppointmentSlot.start_time)
+            .first()
+        )
+
+        belt._propose_appointment(second.id)
+
+        assert run.state["offered_slot_ids"] == [first.id, second.id]

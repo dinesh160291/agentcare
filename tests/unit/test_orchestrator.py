@@ -2713,3 +2713,482 @@ class TestACommitSettlesTheStepWhateverThePlanCallsIt:
         assert detail["step"] != detail["committed"], (
             "this test is only meaningful while the plan and the commit disagree"
         )
+
+
+class TestOfferedMeansShown:
+    """Round 7, item 2 — the union grew four times faster than the patient knew.
+
+    ``_list_other_slots`` used to record everything the search returned, on the
+    reasoning that a time below the fold is still answerable. A search returns
+    up to twenty slots and a reply renders three, so a run that had shown six
+    slots held an offered set of **twenty**, spanning two doctors and two days.
+
+    That is not merely untidy. Both readers of the set — the re-proposal guard
+    and ``read_selection`` — mean "times this patient has seen" by it, and the
+    selection reader resolves a clock time only when it names *one* slot. Live,
+    the patient pasted a rendered line back verbatim, "Monday 3 August at 04:00
+    PM with Dr. Rahul Bose"; two slots in the union sat at 16:00, the unique
+    rule correctly refused to guess, and the turn fell through to the classifier
+    and drew another list. The slot they meant had been rendered. The one that
+    made it ambiguous never was.
+    """
+
+    def _run(self, run_id: int) -> WorkflowRun:
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            session.expunge(run)
+            return run
+        finally:
+            session.close()
+
+    def test_a_search_of_twenty_records_only_what_was_drawn(self, patient):
+        """The proposal reply renders three of what the search found, and three
+        is what the set holds — the held one among them."""
+        result = turn(patient, BOOKING, "s-shown-1")
+        run = self._run(result.run_id)
+
+        offered = run.state["offered_slot_ids"]
+        rendered = [
+            line for line in result.reply.splitlines() if line[:2] in ("1.", "2.", "3.")
+        ]
+        assert len(rendered) == 3
+        assert len(offered) == 3
+        assert run.proposed_slot_id in offered
+
+    def test_asking_for_other_times_records_the_three_it_lists(self, patient):
+        """Not the twenty it found. The search is unchanged; only what is
+        remembered as *shown* is."""
+        first = turn(patient, BOOKING, "s-shown-2")
+        before = set(self._run(first.run_id).state["offered_slot_ids"])
+
+        turn(patient, "what else is free that week?", "s-shown-2")
+        after = set(self._run(first.run_id).state["offered_slot_ids"])
+
+        assert len(after - before) <= 3, "slots nobody was shown entered the set"
+
+    def test_every_offered_slot_appears_in_something_the_patient_read(
+        self, patient
+    ):
+        """The invariant, stated over a whole conversation rather than a turn.
+        Every id in the set has to be traceable to a line somebody read."""
+        replies = [turn(patient, BOOKING, "s-shown-3").reply]
+        replies.append(turn(patient, "any other times?", "s-shown-3").reply)
+        run = self._run(active_run(fresh(), 1).id)
+
+        session = fresh()
+        try:
+            for slot_id in run.state["offered_slot_ids"]:
+                slot = session.get(AppointmentSlot, slot_id)
+                when = clock_time(slot.start_time)
+                assert any(when in reply for reply in replies), (
+                    f"slot {slot_id} at {when} is recorded as offered but was "
+                    "never in a reply"
+                )
+        finally:
+            session.close()
+
+
+class TestASelectionIsReadWhileASlotIsHeld:
+    """Round 7, item 3 — the reader ran one state too late.
+
+    Round 6 put ``read_selection`` at ``in_progress`` and left
+    ``pending_confirmation`` alone, on the reasoning that a held slot means the
+    model's ``slot_question`` path already covers it. Live run 4 says otherwise,
+    twice in consecutive turns, with a three-slot list on screen:
+
+    * **"option 3"** — the exact-token reader said unread, the Coordinator
+      called it *conflicting*, the refinement rule correctly refused the
+      supersede, and the patient got a fresh morning list. The afternoon they
+      had asked for was gone from it.
+    * **"I want the 4pm appointment on august 3"** — read as a **decline**, with
+      the reason "Patient specified a different time". The verdict enum is
+      ``decline | non_answer | slot_question`` and has no selection in it, so a
+      choice among the times on screen had no verdict it could be expressed as.
+
+    They then booked 9:00 AM. They had asked for 4:00 PM four times.
+
+    Nothing about the commit gate moves: the reader runs *before* the exact
+    tokens and neither "yes" nor "no" names a time or a position, so they pass
+    straight through it. The last two tests are that statement, falsifiable.
+    """
+
+    def _holding(self, patient, session_id: str) -> tuple[int, list[str]]:
+        """A run at ``pending_confirmation`` with a numbered list on screen."""
+        first = turn(patient, BOOKING, session_id)
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, first.run_id)
+            times = [
+                clock_time(session.get(AppointmentSlot, slot_id).start_time)
+                for slot_id in run.state["shortlist_slot_ids"]
+            ]
+        finally:
+            session.close()
+        return first.run_id, times
+
+    def _held_time(self, run_id: int) -> str:
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            return clock_time(session.get(AppointmentSlot, run.proposed_slot_id).start_time)
+        finally:
+            session.close()
+
+    def test_a_list_number_moves_the_offer(self, patient):
+        run_id, times = self._holding(patient, "s-hold-1")
+
+        result = turn(patient, "option 3", "s-hold-1")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert result.run_id == run_id, "the run was replaced instead of moved"
+        assert self._held_time(run_id) == times[2]
+
+    def test_a_named_time_is_not_read_as_a_decline(self, patient):
+        """The live sentence's shape. It named a time on the list and was
+        recorded as a refusal of the list."""
+        run_id, times = self._holding(patient, "s-hold-2")
+
+        result = turn(patient, f"I want the {times[2].lower()} appointment", "s-hold-2")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert self._held_time(run_id) == times[2]
+        assert "nothing has been booked" not in result.reply.lower()
+
+    def test_no_model_is_asked(self, patient):
+        """Read before the Coordinator, so a turn that needs no judgement
+        spends none."""
+        self._holding(patient, "s-hold-3")
+
+        result = turn(patient, "option 2", "s-hold-3")
+
+        session = fresh()
+        try:
+            agents = {
+                event.agent_name
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+            }
+        finally:
+            session.close()
+        assert "coordinator" not in agents
+
+    def test_an_exact_yes_still_commits_the_held_slot(self, patient):
+        """The pinned rule, unmoved. "yes" names no time and no position, so
+        the reader above never sees it."""
+        run_id, _ = self._holding(patient, "s-hold-4")
+        held = self._held_time(run_id)
+
+        result = turn(patient, "yes", "s-hold-4")
+
+        assert result.status == WorkflowStatus.COMPLETED.value
+        session = fresh()
+        try:
+            booked = appointments_for(session, run_id)
+            assert len(booked) == 1
+            slot = session.get(AppointmentSlot, booked[0].slot_id)
+            assert clock_time(slot.start_time) == held
+        finally:
+            session.close()
+
+    def test_an_exact_no_still_declines(self, patient):
+        run_id, _ = self._holding(patient, "s-hold-5")
+
+        result = turn(patient, "no", "s-hold-5")
+
+        assert result.status == WorkflowStatus.IN_PROGRESS.value
+
+    def test_a_number_outside_the_list_is_not_rounded_into_range(self, patient):
+        """A near miss is not a choice. It falls through to the model, which is
+        where a message nobody anticipated belongs."""
+        run_id, times = self._holding(patient, "s-hold-6")
+
+        turn(patient, "option 9", "s-hold-6")
+
+        assert self._held_time(run_id) == times[0], "the offer moved on a number nobody showed"
+
+    def test_a_true_non_answer_still_counts_against_the_cap(self, patient):
+        """The bound is untouched. A selection is not a non-answer, and a
+        non-answer is still one."""
+        run_id, _ = self._holding(patient, "s-hold-7")
+
+        turn(patient, "hmm let me think about it", "s-hold-7")
+
+        session = fresh()
+        try:
+            assert session.get(WorkflowRun, run_id).non_answer_count == 1
+        finally:
+            session.close()
+
+
+class TestATimingQuestionWhileHoldingIsAnswered:
+    """Round 7, item 4 — a question about days met a nag.
+
+    Live, at ``pending_confirmation``: "do you have any appointments at the end
+    of the same week like thursday or friday preferably in the afternoon?" The
+    Coordinator wrote prose about availability with no slot search behind it,
+    the grounding guard correctly threw the prose away, and the fallback was the
+    bare re-ask — with a stall counted against the patient for asking. The same
+    words one turn later, at ``in_progress``, produced a real Thursday list.
+
+    The trigger is the *destination*, not the class. Live it was a side
+    question; under the mock the same sentence is a continuation whose
+    confirmation verdict is ``non_answer``. Both end at the re-ask, so the
+    re-ask is what this stands in front of.
+    """
+
+    QUESTION = (
+        "do you have any appointments at the end of the same week like thursday "
+        "or friday preferably in the afternoon?"
+    )
+
+    def _holding(self, patient, session_id: str) -> int:
+        result = turn(patient, BOOKING, session_id)
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        return result.run_id
+
+    def test_the_question_gets_times(self, patient):
+        self._holding(patient, "s-timing-1")
+
+        result = turn(patient, self.QUESTION, "s-timing-1")
+
+        assert "Other times that are free" in result.reply
+        assert "Thursday" in result.reply
+
+    def test_the_proposal_still_stands_afterwards(self, patient):
+        """Answer-and-stay. A question is not an answer, and the time being
+        held is still the patient's."""
+        run_id = self._holding(patient, "s-timing-2")
+        session = fresh()
+        try:
+            before = session.get(WorkflowRun, run_id).proposed_slot_id
+        finally:
+            session.close()
+
+        result = turn(patient, self.QUESTION, "s-timing-2")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            assert session.get(WorkflowRun, run_id).proposed_slot_id == before
+        finally:
+            session.close()
+
+    def test_asking_is_not_stalling(self, patient):
+        """The counter bounds a re-ask loop, and a turn that rendered times is
+        not a re-ask. The message that used to be counted here was a patient
+        being told nothing and then charged for it."""
+        run_id = self._holding(patient, "s-timing-3")
+
+        turn(patient, self.QUESTION, "s-timing-3")
+
+        session = fresh()
+        try:
+            assert session.get(WorkflowRun, run_id).non_answer_count == 0
+        finally:
+            session.close()
+
+    def test_a_true_non_answer_still_counts(self, patient):
+        """The control that keeps the bound a bound. "hmm let me think" names
+        no day, so nothing here touches it."""
+        run_id = self._holding(patient, "s-timing-4")
+
+        turn(patient, "hmm let me think about it", "s-timing-4")
+
+        session = fresh()
+        try:
+            assert session.get(WorkflowRun, run_id).non_answer_count == 1
+        finally:
+            session.close()
+
+    def test_an_off_topic_message_naming_a_day_is_still_refused(self, patient):
+        """"today" is a timing word and a question about the weather is not a
+        question about this clinic's diary. Answering it with a slot list would
+        be a second defect introduced while fixing the first."""
+        self._holding(patient, "s-timing-5")
+
+        result = turn(patient, "what is the weather like today?", "s-timing-5")
+
+        assert "Other times that are free" not in result.reply
+
+
+class TestTheEngineDoesNotOfferATimeThePatientHas:
+    """Round 7, item 5 — a proposal built to bounce.
+
+    Live run 8: the proposal held Monday 9:00 AM for a patient who already had a
+    Dermatology appointment at Monday 9:00 AM with a different doctor. The
+    Confirm failed with "You already have an appointment at that time" — the
+    conflict guard working exactly as intended, on a collision the proposal
+    engine had arranged.
+    """
+
+    REQUEST = "I need a dermatology appointment for a skin rash next week"
+    AGAIN = "I need another dermatology appointment for a skin rash next week"
+
+    def _book(self, patient, session_id: str) -> AppointmentSlot:
+        turn(patient, self.REQUEST, session_id)
+        result = asyncio.run(apply_patient_action(patient, "confirm", session_id))
+        assert result.status == WorkflowStatus.COMPLETED.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            appointment = session.get(Appointment, run.state["appointment_id"])
+            slot = session.get(AppointmentSlot, appointment.slot_id)
+            session.expunge(slot)
+            return slot
+        finally:
+            session.close()
+
+    def test_the_second_proposal_avoids_the_first_appointments_time(self, patient):
+        held = self._book(patient, "s-clash-1")
+
+        second = turn(patient, self.AGAIN, "s-clash-2")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, second.run_id)
+            offered = session.get(AppointmentSlot, run.proposed_slot_id)
+            assert offered.start_time != held.start_time
+        finally:
+            session.close()
+
+    def test_the_second_booking_confirms_first_try(self, patient):
+        """Run 8's shape, end to end. The bounce was not a near miss — it was
+        the only possible outcome of the offer."""
+        self._book(patient, "s-clash-3")
+        turn(patient, self.AGAIN, "s-clash-4")
+
+        result = asyncio.run(apply_patient_action(patient, "confirm", "s-clash-4"))
+
+        assert result.status == WorkflowStatus.COMPLETED.value
+        assert "already have an appointment" not in result.reply
+
+    def test_a_clashing_time_is_not_even_listed(self, patient):
+        """Not only the held one. A time in the shortlist is a time the patient
+        may pick, and picking it would meet the same refusal."""
+        held = self._book(patient, "s-clash-5")
+
+        second = turn(patient, self.AGAIN, "s-clash-6")
+
+        assert clock_time(held.start_time) not in second.reply
+
+
+class TestATwoVerbMessageSaysWhatItDropped:
+    """Round 7, item 6 — one verb was done and the other vanished.
+
+    "One request confirms one thing" is a rule with a cost, and the cost was
+    invisible. Live: "okay lets cancel that appointment and book a new one for
+    skin rash" — the booking proceeded, the cancellation was neither done nor
+    mentioned. The model dropped the verb at *classification*, so the plan
+    validator never saw two and had nothing to report; only the sentence shows
+    that two things were asked for.
+    """
+
+    MESSAGE = "okay lets cancel that appointment and book a new one for skin rash"
+
+    VERBS = {"book": "the booking", "cancel": "the cancellation",
+             "reschedule": "the reschedule"}
+
+    def test_the_dropped_verb_is_acknowledged(self, patient):
+        result = turn(patient, self.MESSAGE, "s-twoverb-1")
+
+        assert "One change at a time" in result.reply
+        assert "ask me about the other one right after" in result.reply
+
+    def test_it_names_the_one_being_done(self, patient):
+        result = turn(patient, self.MESSAGE, "s-twoverb-2")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            doing = next(step for step in run.plan if step in self.VERBS)
+        finally:
+            session.close()
+        assert f"I'll start with {self.VERBS[doing]}" in result.reply
+
+    def test_the_line_is_part_of_what_the_trace_recorded(self, patient):
+        """Added inside the turn envelope, so the outbound event carries it. A
+        sentence appended after the turn was written down is a sentence the
+        trace does not vouch for."""
+        result = turn(patient, self.MESSAGE, "s-twoverb-3")
+
+        session = fresh()
+        try:
+            outbound = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.OUTBOUND
+            ]
+            assert len(outbound) == 1
+            assert "One change at a time" in outbound[0].payload["content"]
+        finally:
+            session.close()
+
+    def test_a_one_verb_message_says_nothing_of_the_kind(self, patient):
+        """The control. Most messages name one verb, and a note that appeared
+        beside them would read as the system being confused."""
+        result = turn(patient, BOOKING, "s-twoverb-4")
+
+        assert "One change at a time" not in result.reply
+
+
+class TestTheSelectionReaderLeavesChangeProposalsAlone:
+    """A reschedule proposal is not a shortlist of times to swap between.
+
+    The slot this reader holds is a *booking* — ``_propose_appointment`` sets
+    ``proposed_action`` to BOOK — so letting it run over a run holding a
+    reschedule would quietly turn one kind of proposal into another, and the
+    patient's Confirm would then commit something they were never shown. The
+    same rule the toolset already uses to decide who gets ``propose_another_slot``.
+    """
+
+    def _run_holding_a_reschedule(self, session_id: str) -> tuple[int, int]:
+        session = fresh()
+        try:
+            slots = (
+                session.query(AppointmentSlot)
+                .filter(
+                    AppointmentSlot.status == SlotStatus.AVAILABLE,
+                    AppointmentSlot.start_time > clock.now(),
+                )
+                .order_by(AppointmentSlot.start_time)
+                .limit(3)
+                .all()
+            )
+            run = WorkflowRun(
+                patient_id=1,
+                status=WorkflowStatus.PENDING_CONFIRMATION,
+                plan=["reschedule", "follow_up"],
+                completed_steps=[],
+                state={
+                    "offered_slot_ids": [slot.id for slot in slots],
+                    "shortlist_slot_ids": [slot.id for slot in slots],
+                },
+                request_text="reschedule my appointment",
+                proposed_action=ProposedAction.RESCHEDULE,
+                proposed_appointment_id=SEEDED_APPOINTMENT_ID,
+                proposed_slot_id=slots[0].id,
+                session_id=session_id,
+            )
+            session.add(run)
+            session.commit()
+            return run.id, slots[1].id
+        finally:
+            session.close()
+
+    def test_a_list_number_does_not_convert_it_to_a_booking(self, patient):
+        run_id, second = self._run_holding_a_reschedule("s-nochange-1")
+
+        turn(patient, "option 2", "s-nochange-1")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            assert run.proposed_action is ProposedAction.RESCHEDULE
+            assert run.proposed_slot_id != second
+        finally:
+            session.close()

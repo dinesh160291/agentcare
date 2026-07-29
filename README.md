@@ -254,6 +254,30 @@ code — no model output can reach it.
   pre-empting it would silently stop the verification the step performs — so
   some phrasings come back as "could you tell me a little more". *Floor:
   read-only either way; no document state changes.*
+- **A described symptom can be referred to a person even when it reads as
+  routine.** "Rashes in my stomach area" alongside a second complaint was sent
+  to a human by the model layer of the screen, where either phrase alone routes
+  to a department. It is the same conservatism as the severe-pain entry above
+  and it is not tuned down for the same reason: the screen's cheap direction is
+  the one that sends an administrative request to a person, and its expensive
+  direction is a missed emergency. *Floor: unchanged — the referral is
+  administrative, states nothing clinical, and no request routes past the
+  screen.*
+- **A stated time preference is not carried into the next list of options.**
+  "Wednesday afternoon" gets Wednesday afternoon; if the offer is then declined
+  or superseded, the following list starts again from the earliest free times
+  rather than from the window that was asked for. A question that *names* the
+  day is answered with that day (round 7 item 4), so the common case is
+  covered; what is not carried is a preference stated earlier in the
+  conversation. *Floor: read-only. Every time shown is real and free, and
+  naming one from any list holds it.*
+- **Routing prose still describes its own confidence.** "The request has been
+  routed to the Dermatology department with high confidence" is system-speak in
+  a patient's chat window. The routing decision itself is deterministic — the
+  Department table decides, and low confidence goes to a human — so this is
+  wording rather than behaviour, and the conversational layer is frozen.
+  *Floor: nothing about what the sentence describes is affected by how it
+  reads.*
 
 ---
 

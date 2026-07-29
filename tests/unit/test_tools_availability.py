@@ -13,7 +13,13 @@ from datetime import date, datetime, timedelta
 import pytest
 
 from app import clock
-from app.models import AppointmentSlot, Doctor, SlotStatus
+from app.models import (
+    Appointment,
+    AppointmentSlot,
+    AppointmentStatus,
+    Doctor,
+    SlotStatus,
+)
 from app.tools.availability import find_available_slots, get_slot
 
 MONDAY = date(2026, 8, 3)
@@ -143,3 +149,120 @@ class TestContract:
         result = get_slot(db, 999_999)
         assert result["found"] is False
         assert result["available"] is False
+
+
+class TestATimeThePatientAlreadyHas:
+    """Round 7, item 5 — the engine offered a slot the commit would refuse.
+
+    Live: a Dermatology proposal held Monday 9:00 AM for a patient who already
+    had a Dermatology appointment at Monday 9:00 AM. The conflict guard did its
+    job and the Confirm bounced with "You already have an appointment at that
+    time" — a refusal the proposal engine had guaranteed before the patient ever
+    saw the offer. A slot free in the department's diary is not necessarily a
+    time the patient is free.
+
+    The commit-time check stays exactly where it is. This only stops it being
+    set up to fail.
+    """
+
+    def _book(self, db, slot: AppointmentSlot, patient_id: int = 1) -> Appointment:
+        appointment = Appointment(
+            patient_id=patient_id,
+            department_id=slot.doctor.department_id,
+            doctor_id=slot.doctor_id,
+            slot_id=slot.id,
+            status=AppointmentStatus.CONFIRMED,
+            reference_code=f"AC-90{slot.id:04d}",
+            reason="",
+        )
+        slot.status = SlotStatus.BOOKED
+        db.add(appointment)
+        db.flush()
+        return appointment
+
+    def _first_free(self, db, department_id: int) -> AppointmentSlot:
+        found = find_available_slots(db, department_id=department_id)
+        return db.get(AppointmentSlot, found["slots"][0]["slot_id"])
+
+    def test_a_clashing_slot_in_another_department_is_withheld(self, db):
+        taken = self._first_free(db, 1)
+        self._book(db, taken)
+
+        clashing = (
+            db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .filter(
+                AppointmentSlot.start_time == taken.start_time,
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                Doctor.department_id != 1,
+            )
+            .first()
+        )
+        assert clashing is not None, "the seed has no same-time slot elsewhere"
+
+        found = find_available_slots(
+            db, department_id=clashing.doctor.department_id, free_for_patient=1
+        )
+        assert clashing.id not in {slot["slot_id"] for slot in found["slots"]}
+
+    def test_it_is_still_free_for_everybody_else(self, db):
+        """Scoped to the patient asking. Somebody else's diary is not this
+        patient's business, and a global exclusion would empty the schedule."""
+        taken = self._first_free(db, 1)
+        self._book(db, taken)
+        clashing = (
+            db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .filter(
+                AppointmentSlot.start_time == taken.start_time,
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                Doctor.department_id != 1,
+            )
+            .first()
+        )
+
+        found = find_available_slots(
+            db, department_id=clashing.doctor.department_id, free_for_patient=2
+        )
+        assert clashing.id in {slot["slot_id"] for slot in found["slots"]}
+
+    def test_without_the_argument_nothing_changes(self, db):
+        """The default is the old behaviour exactly. Callers opt in."""
+        taken = self._first_free(db, 1)
+        self._book(db, taken)
+        clashing = (
+            db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .filter(
+                AppointmentSlot.start_time == taken.start_time,
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                Doctor.department_id != 1,
+            )
+            .first()
+        )
+
+        found = find_available_slots(db, department_id=clashing.doctor.department_id)
+        assert clashing.id in {slot["slot_id"] for slot in found["slots"]}
+
+    def test_a_cancelled_appointment_frees_the_time_again(self, db):
+        """Live statuses only. A cancelled visit is not a commitment, and
+        treating it as one would shrink the schedule for good."""
+        taken = self._first_free(db, 1)
+        appointment = self._book(db, taken)
+        clashing = (
+            db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .filter(
+                AppointmentSlot.start_time == taken.start_time,
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                Doctor.department_id != 1,
+            )
+            .first()
+        )
+        appointment.status = AppointmentStatus.CANCELLED
+        db.flush()
+
+        found = find_available_slots(
+            db, department_id=clashing.doctor.department_id, free_for_patient=1
+        )
+        assert clashing.id in {slot["slot_id"] for slot in found["slots"]}

@@ -36,11 +36,14 @@ from app.models import (
     WorkflowStatus,
 )
 from app.trace import TraceWriter
+from app.tools.dates import WEEKDAYS
 from app.workflow.mapping import (
     CLASSIFICATION_ORDER,
     Consequence,
     apply_consequence,
     mentions_domain_subject,
+    names_appointment_verbs,
+    names_timing,
     primary_intent,
     says_withdrawal,
     validate_class,
@@ -1258,3 +1261,77 @@ class TestAContinuationThatNamesAnotherDepartment:
         assert [s["accepted"] for s in subjects] == [True, False]
         assert subjects[0]["detail"]["named_department"] == "Ophthalmology"
         assert subjects[1]["detail"]["named_department"] == "General Medicine"
+
+
+class TestCountingTheVerbsInOneMessage:
+    """Round 7, item 6 — what a two-verb message asked for.
+
+    ``validate_plan`` refuses a plan naming two appointment actions, and that
+    rule stays. This only counts what the *words* asked for, so the patient can
+    be told which half is being done. Same two rules as
+    :func:`names_change_verb`, deliberately: withdrawal wins, and a verb needs
+    an appointment noun beside it.
+    """
+
+    def test_the_live_message_names_two(self):
+        assert names_appointment_verbs(
+            "okay lets cancel that appointment and book a new one for skin rash"
+        ) == {PlanStep.CANCEL, PlanStep.BOOK}
+
+    def test_one_verb_is_one_verb(self):
+        assert names_appointment_verbs("please cancel my appointment") == {PlanStep.CANCEL}
+
+    def test_reschedule_does_not_read_as_a_booking(self):
+        """"schedule" is inside "reschedule", and a rule that counted it would
+        make every reschedule a two-verb message."""
+        assert names_appointment_verbs("reschedule my appointment") == {
+            PlanStep.RESCHEDULE
+        }
+
+    def test_a_verb_without_an_appointment_noun_is_not_one(self):
+        """"cancel" on its own declines a proposal. The same collision
+        ``names_change_verb`` already guards."""
+        assert names_appointment_verbs("cancel") == set()
+
+    def test_a_withdrawal_names_no_appointment_verb(self):
+        """"cancel that request" closes a run; it acts on no appointment."""
+        assert names_appointment_verbs("cancel that request") == set()
+
+    def test_a_plain_booking_names_one(self):
+        assert names_appointment_verbs("book me an appointment next week") == {
+            PlanStep.BOOK
+        }
+
+
+class TestReadingATimingPhrase:
+    """Round 7, item 4 — whether a message scopes itself to a day or a date.
+
+    A fact about the message, used only to widen what a turn *answers*. Its
+    false positives cost a slot list where a re-ask would have gone, which is
+    why the word list can afford to be generous — the opposite trade from the
+    safety screen's.
+    """
+
+    def test_a_weekday(self):
+        assert names_timing("thursday or friday preferably in the afternoon?")
+
+    def test_a_part_of_day(self):
+        assert names_timing("anything in the morning?")
+
+    def test_a_month(self):
+        assert names_timing("something in august please")
+
+    def test_a_relative_week(self):
+        assert names_timing("do you have anything next week")
+
+    def test_a_message_with_no_timing_in_it(self):
+        assert not names_timing("hmm let me think about it")
+
+    def test_a_bare_answer(self):
+        assert not names_timing("yes")
+
+    def test_the_words_come_from_resolve_dates_own_tables(self):
+        """So the two cannot drift: anything read here as a timing phrase is a
+        phrase ``resolve_date`` can turn into a window."""
+        for weekday in WEEKDAYS:
+            assert names_timing(f"how about {weekday}?"), weekday

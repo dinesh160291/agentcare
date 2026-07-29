@@ -50,6 +50,7 @@ from app.workflow.replies import (
     record_offered,
     was_offered,
 )
+from app.workflow.targets import resolve_target
 from app.tools import (
     apply_verification,
     diff_required_documents,
@@ -141,12 +142,20 @@ class Toolbelt:
         patient_id: int,
         writer: TraceWriter,
         run: WorkflowRun | None = None,
+        message: str = "",
     ) -> None:
         self.session = session
         self.user = user
         self.patient_id = patient_id
         self.writer = writer
         self.run = run
+        #: What the patient said this turn. Read by exactly one thing —
+        #: :meth:`_settle_target` — and read there because "which appointment"
+        #: is a question the words answer and the model was answering it
+        #: unchecked. Not a transcript and not a substitute for the typed task:
+        #: the context contract is about what a *specialist* is handed, and this
+        #: never leaves the toolbelt.
+        self.message = message
         self.proposals = TurnProposals()
 
     # --- helpers ---------------------------------------------------------
@@ -211,6 +220,77 @@ class Toolbelt:
         if len(live) != 1:
             return None
         return self.session.get(Appointment, live[0]["appointment_id"])
+
+    def _settle_target(self, appointment_id: int) -> tuple[int, dict | None]:
+        """Whose appointment the patient named, against the one the model chose.
+
+        Returns ``(appointment_id, refusal)``. The refusal is ``None`` on every
+        path that leaves a usable id.
+
+        Live, with a Monday Dermatology appointment and a Thursday Orthopedics
+        one, "reschedule the appointment on Monday" arrived here as the Thursday
+        one's id — and every check below this line passed it, because every
+        check below this line asks whether the id is *usable* and none of them
+        asks whether it is the one the patient meant. The Thursday appointment
+        moved. So the argument is compared against the words before it is
+        believed, and the comparison is code's: which weekday, which date, which
+        department, which reference code are facts about rows.
+
+        Two things are deliberately left alone. Where a numbered choice has
+        already been shown, ``listed_appointment_ids`` is the authority and this
+        stands aside — the patient answering "2" named no weekday and would
+        otherwise read as no cue at all. And where the patient has one live
+        appointment, :func:`resolve_target` says ``only_one`` and nothing is
+        overridden, because there was never a choice to get wrong.
+
+        Refusing rather than guessing is what makes the ambiguous case safe: no
+        proposal is recorded, so the orchestrator's own
+        ``render_appointment_choice`` asks which one — the same numbered list
+        the cancel path already draws, whose answer is then read by the guard
+        above.
+        """
+        run = self.run
+        if run is None or listed_appointment_ids(run):
+            return appointment_id, None
+
+        live = list_patient_appointments(
+            self.session, patient_id=self.patient_id, live_only=True
+        )
+        verdict = resolve_target(self.session, message=self.message, appointments=live)
+        if verdict.reason == "only_one":
+            # Nothing to disambiguate, so nothing to override — and *not* an
+            # override to the single live appointment either. A model asking to
+            # cancel an id that does not exist must still be told so; rewriting
+            # it into the one row that happens to be there would turn a slip
+            # into a cancellation, and the checks below exist to catch exactly
+            # that. No trace event: a check that did not apply has not passed.
+            return appointment_id, None
+
+        detail = {
+            "proposed": appointment_id,
+            "resolved": verdict.appointment_id,
+            "reason": verdict.reason,
+            "cues": verdict.cues,
+            "candidates": verdict.candidates,
+        }
+
+        if verdict.appointment_id is None and verdict.reason in ("no_cue", "ambiguous"):
+            if len(live) <= 1:
+                # Nothing to be ambiguous between. `resolve_target` only reaches
+                # here with an empty list, which the checks below report better.
+                return appointment_id, None
+            self.writer.validation("appointment_target", accepted=False, detail=detail)
+            return appointment_id, {
+                "accepted": False,
+                "problem": (
+                    "The patient has more than one appointment and this message "
+                    "does not say which. Ask them which one before proposing."
+                ),
+            }
+
+        accepted = verdict.appointment_id == appointment_id
+        self.writer.validation("appointment_target", accepted=accepted, detail=detail)
+        return verdict.appointment_id or appointment_id, None
 
     @staticmethod
     def _as_date(value: str) -> date | None:
@@ -439,6 +519,7 @@ class Toolbelt:
             start=start,
             end=end,
             part_of_day=window.get("part_of_day") or None,
+            free_for_patient=self.patient_id,
         )
         others = [
             slot
@@ -449,18 +530,25 @@ class Toolbelt:
         self.proposals.answered_with_slots = True
         self.proposals.searched_slots = True
         self.proposals.slot_window = window if window.get("resolved") else None
-        # Everything the search returned is answerable, not merely the three
-        # the reply lists. "Lets go with 4pm slot" named a time that was in
-        # this payload and below the fold, and recording only the rendered
-        # shortlist made the re-proposal guard refuse a slot the tool had just
-        # produced — the patient was shown alternatives again instead of being
-        # given the one they asked for.
+        # Nothing is recorded as offered here, and that is the correction. This
+        # used to record the whole payload on the reasoning that a time "below
+        # the fold" is still answerable — but a search returns up to twenty
+        # slots and a reply renders three, so the set grew four times faster
+        # than the patient's knowledge of it. Live, a run that had shown six
+        # slots held an offered set of twenty, spanning two doctors and two
+        # days; the patient pasted a line back verbatim — "Monday 3 August at
+        # 04:00 PM with Dr. Rahul Bose" — and the unique-time rule found *two*
+        # 4:00 PM slots in the union and correctly refused to guess. The one
+        # they meant had been rendered; the one that made it ambiguous never
+        # was.
         #
-        # The guarantee is unchanged and is the one that matters: an id has to
-        # come from a tool result rather than from the model's memory of the
-        # conversation. A slot in another department, or one no search
-        # returned, is still refused.
-        record_offered(run, others)
+        # The set has one job, and both readers of it — the re-proposal guard
+        # and `read_selection` — depend on it meaning the same thing: times
+        # this patient has actually seen. `render_proposal` and
+        # `render_alternatives` record what they draw, in the same breath as
+        # drawing it, and the held slot is recorded where it is held. Those are
+        # the only three places a slot becomes visible to a patient, so they
+        # are the only three that may write here.
         return {"slots": others, "total_matching": len(others), "window": window or None}
 
     def _propose_another_slot(self, slot_id: int) -> dict:
@@ -657,6 +745,7 @@ class Toolbelt:
                 start=self._as_date(start),
                 end=self._as_date(end),
                 part_of_day=part_of_day or None,
+                free_for_patient=self.patient_id,
             )
             self.proposals.offered_slots = list(found.get("slots") or [])
             self.proposals.searched_slots = True
@@ -703,6 +792,7 @@ class Toolbelt:
                 start=self._as_date(start),
                 end=self._as_date(end),
                 part_of_day=part_of_day or None,
+                free_for_patient=self.patient_id,
             )
             self.proposals.searched_slots = True
             return found
@@ -787,6 +877,12 @@ class Toolbelt:
         run.proposed_action = ProposedAction.BOOK
         run.proposed_slot_id = slot_id
         self.proposals.proposed_slot_id = slot_id
+        # A held slot is a slot the patient is being shown, whatever the reply
+        # around it ends up looking like — the proposal card names it even on
+        # the turns where `render_proposal` returns "" for want of a shortlist.
+        # Recording it here is what makes "offered" mean *shown* without a hole
+        # in the middle of it.
+        record_offered(run, [{"slot_id": slot_id}])
 
         if run.status is WorkflowStatus.IN_PROGRESS:
             transition(
@@ -821,6 +917,10 @@ class Toolbelt:
         run = self.run
         if run is None:
             return {"accepted": False, "problem": "There is no active request."}
+
+        appointment_id, refusal = self._settle_target(appointment_id)
+        if refusal is not None:
+            return refusal
 
         appointment = self.session.get(Appointment, appointment_id)
         # Ownership is checked as a refusal rather than a raise: this is a

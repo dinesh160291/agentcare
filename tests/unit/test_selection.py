@@ -183,3 +183,56 @@ class TestWhatIsNeverASelection:
     def test_a_reference_code_is_not_a_time(self):
         """AC-000003 ends in a digit and must not become row 3."""
         assert read("what about AC-000003") is None
+
+
+class TestThePastedSlotLine:
+    """Round 7 item 2, at the reader — the message that made the set's size matter.
+
+    Live run 4, verbatim: the patient copied a rendered option back into the
+    box, "Monday 3 August at 04:00 PM with Dr. Rahul Bose". The reader ran and
+    found nothing, and the trace says why — ``shortlist [391, 392, 393],
+    offered: 20``. Six slots had been rendered over the run's life; the offered
+    union held twenty, because the search recorded everything it found. Two of
+    those twenty sat at 16:00, one per dermatologist, so the unique-match rule
+    correctly refused to guess between them. The one the patient meant had been
+    on screen. The one that made it ambiguous never had.
+
+    Nothing here changed in ``read_selection``. What changed is what the caller
+    puts in ``offered``, and these two cases are the difference stated as a
+    test: the same message, the same rule, the same slot — shown-only resolves
+    it, and the polluted set cannot.
+    """
+
+    #: The six that were actually rendered: an afternoon page, then a morning one.
+    SHOWN = [
+        Offer(slot_id=394, start=datetime(2026, 8, 3, 14, 0)),
+        Offer(slot_id=395, start=datetime(2026, 8, 3, 15, 0)),
+        Offer(slot_id=396, start=datetime(2026, 8, 3, 16, 0)),
+        Offer(slot_id=391, start=datetime(2026, 8, 3, 9, 0)),
+        Offer(slot_id=392, start=datetime(2026, 8, 3, 10, 0)),
+        Offer(slot_id=393, start=datetime(2026, 8, 3, 11, 0)),
+    ]
+
+    #: The other dermatologist's fourteen, which no reply ever listed.
+    UNSHOWN = [
+        Offer(slot_id=468, start=datetime(2026, 8, 3, 16, 0)),
+        Offer(slot_id=466, start=datetime(2026, 8, 3, 14, 0)),
+        Offer(slot_id=400, start=datetime(2026, 8, 4, 14, 0)),
+    ]
+
+    MESSAGE = "Monday 3 August at 04:00 PM with Dr. Rahul Bose"
+
+    def test_the_shown_set_resolves_it(self):
+        assert read(self.MESSAGE, shortlist=[], offered=self.SHOWN) == 396
+
+    def test_the_polluted_set_cannot(self):
+        """Not a bug in the rule — the rule is right, and refusing to choose
+        between two 4:00 PMs is what it is for. The bug was upstream, in what
+        counted as offered."""
+        assert read(self.MESSAGE, shortlist=[], offered=self.SHOWN + self.UNSHOWN) is None
+
+    def test_two_shown_slots_at_the_same_time_still_refuse(self):
+        """The control that keeps the fix from over-reaching. If both 4:00 PMs
+        really were rendered, the ambiguity is real and asking is right."""
+        both = self.SHOWN + [Offer(slot_id=468, start=datetime(2026, 8, 3, 16, 0))]
+        assert read(self.MESSAGE, shortlist=[], offered=both) is None

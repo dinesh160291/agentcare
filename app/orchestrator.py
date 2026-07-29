@@ -71,7 +71,9 @@ from app.workflow.mapping import (
     Consequence,
     apply_consequence,
     mentions_domain_subject,
+    names_appointment_verbs,
     names_change_verb,
+    names_timing,
     primary_intent,
     says_only_withdrawal,
     validate_class,
@@ -86,6 +88,8 @@ from app.workflow.plan import (
     validate_plan,
 )
 from app.workflow.replies import (
+    ONE_VERB_AT_A_TIME,
+    VERB_WORDS,
     claims_availability,
     offered_slot_ids,
     promises_action,
@@ -372,7 +376,27 @@ def _settle_selection(
     slot, and only an exact "yes" or the ✅ button books it. That gate is what
     makes reading generously safe here: a misread selection costs one decline,
     where a misread confirmation would book against the patient's word.
+
+    **Both states, and originally only one.** The first version ran at
+    ``in_progress`` alone, on the reasoning that a held slot meant the model's
+    ``slot_question`` path already worked. It does not work often enough: with a
+    three-slot list on screen, "option 3" was classified *conflicting*, refused
+    a supersede, and answered with a fresh morning list; the next message, "I
+    want the 4pm appointment on august 3", came back from the confirmation
+    reader as a **decline** with the reason "Patient specified a different
+    time". That closed enum has no selection in it, so a choice among the times
+    on screen had no verdict it could be expressed as. The reader runs ahead of
+    the exact tokens now, and the tokens are untouched underneath: "yes" and
+    "no" name no time and no position, so they never reach it.
     """
+    # Reschedule and cancel proposals are not this reader's business. The slot
+    # it would hold is a *booking* — `_propose_appointment` sets
+    # `proposed_action` to BOOK — so applying it to a run holding a reschedule
+    # would quietly convert one proposal into another kind. The same rule the
+    # toolset already uses to decide who gets `propose_another_slot`.
+    if run.proposed_action not in (None, ProposedAction.BOOK):
+        return None
+
     # A message that is *only* a withdrawal phrase is the one thing that must
     # not be read as a choice. Live, "close the previous request" drew the same
     # availability list as the six selections before it — a patient asking to
@@ -839,6 +863,38 @@ async def _turn_envelope(
         session.close()
 
 
+def _one_verb_note(session: Session, result: TurnResult, *, message: str) -> str:
+    """The line owed to a message that asked for two appointment actions.
+
+    ``validate_plan`` refuses a plan naming two — one request confirms one thing
+    — and that rule is not in question. What was missing is that the patient
+    never heard about it. Live: "okay lets cancel that appointment and book a
+    new one for skin rash" produced a booking, no cancellation, and no mention
+    of one. The model had dropped the verb at *classification*, so the plan
+    validator never saw two and had nothing to complain about; the only record
+    that two things were asked for is the sentence itself.
+
+    Applied once, here, because the turn ends in a dozen different branches and
+    a note appended in some of them is a note that reads as an inconsistency.
+    It states what is being done and invites the rest — it promises nothing
+    about the half that was dropped, because nothing was done about it.
+    """
+    if result.run_id is None:
+        return ""
+    if len(names_appointment_verbs(message)) < 2:
+        return ""
+    run = session.get(WorkflowRun, result.run_id)
+    if run is None:  # pragma: no cover - a run named by a result always exists
+        return ""
+    doing = next(
+        (step for step in (run.plan or []) if step in VERB_WORDS),
+        None,
+    )
+    if doing is None:
+        return ""
+    return ONE_VERB_AT_A_TIME.format(verb=VERB_WORDS[doing])
+
+
 async def run_workflow(
     user: User,
     message: str,
@@ -866,6 +922,12 @@ async def run_workflow(
             conversation_id=envelope.conversation_id,
             provider=provider,
         )
+        # Inside the envelope, so the note is part of the reply the trace's
+        # outbound event records. A sentence added after the turn was written
+        # down is a sentence the trace does not vouch for.
+        note = _one_verb_note(envelope.session, envelope.result, message=message)
+        if note:
+            envelope.result.reply = f"{envelope.result.reply}\n\n{note}".strip()
     return envelope.result
 
 
@@ -985,7 +1047,7 @@ async def _turn(
         writer.bind_run(run.id)
 
     belt = Toolbelt(
-        session, user=user, patient_id=profile.id, writer=writer, run=run
+        session, user=user, patient_id=profile.id, writer=writer, run=run, message=message
     )
     base = dict(turn_id=writer.turn_id, session_id=conversation_id)
 
@@ -1064,7 +1126,38 @@ async def _turn(
                 **base,
             )
 
-    # --- 1. a pending confirmation is read in code, before any model call ---
+    # --- 1. a choice among times already shown, read in code ---------------
+    # The state one step earlier had no reader at all: a run holding nothing but
+    # a list of times it had shown could not hear an answer to that list, so
+    # "3pm will work for me" went to the Coordinator, came back a new request,
+    # was correctly refused a supersede, and was answered with the same list
+    # again. Seven times in a row, live.
+    #
+    # And the state *with* a slot held could not hear one either, for a
+    # different reason: the exact-token reader has no selection verdict, so
+    # "option 3" fell through to the model, which called it conflicting, and "I
+    # want the 4pm appointment on august 3" came back a **decline** — a choice
+    # among the times on screen recorded as a refusal of them. So this runs
+    # ahead of the tokens rather than after them. Nothing about the tokens
+    # changes: "yes" and "no" name no time and no position, so they pass
+    # straight through to the reader below.
+    if run is not None and run.status in (
+        WorkflowStatus.IN_PROGRESS,
+        WorkflowStatus.PENDING_CONFIRMATION,
+    ):
+        selected = _settle_selection(
+            session,
+            run=run,
+            belt=belt,
+            writer=writer,
+            user=user,
+            message=message,
+            base=base,
+        )
+        if selected is not None:
+            return selected
+
+    # --- 1b. a pending confirmation is read in code, before any model call ---
     if run is not None and run.status is WorkflowStatus.PENDING_CONFIRMATION:
         answer = read_confirmation(message)
         writer.guard_verdict(
@@ -1090,29 +1183,6 @@ async def _turn(
                 trigger="patient_declined", base=base,
             )
         # UNREAD falls through: the model may re-ask or decline, never confirm.
-
-    # --- 1b. a choice among times already shown, also read in code ---------
-    # The state one step earlier had no reader at all: a run holding nothing but
-    # a list of times it had shown could not hear an answer to that list, so
-    # "3pm will work for me" went to the Coordinator, came back a new request,
-    # was correctly refused a supersede, and was answered with the same list
-    # again. Seven times in a row, live.
-    #
-    # Only at `in_progress`. At `pending_confirmation` a slot is already held
-    # and the existing path — the model's `slot_question` and
-    # `propose_another_slot` — works and is left exactly as it is.
-    if run is not None and run.status is WorkflowStatus.IN_PROGRESS:
-        selected = _settle_selection(
-            session,
-            run=run,
-            belt=belt,
-            writer=writer,
-            user=user,
-            message=message,
-            base=base,
-        )
-        if selected is not None:
-            return selected
 
     # --- 2. the Coordinator: classify against a live run, or plan a new one ---
     # One service for the whole turn — each instance builds its own engine, and
@@ -1294,13 +1364,64 @@ async def _continue_run(
         detail={"class": outcome.message_class.value},
     )
 
+    # A question that names a day is answered with that day's times, in either
+    # state. Live, at `pending_confirmation`: "do you have any appointments at
+    # the end of the same week like thursday or friday preferably in the
+    # afternoon?" was classified a side question, and the answer half of
+    # answer-and-stay then had nothing to render — because at this state nothing
+    # searches. The model holds no `list_other_slots` here, so it wrote prose
+    # about availability instead, which the grounding guard rightly threw away
+    # for having no search behind it, and what reached the patient was the bare
+    # re-ask with a stall counted against it. The identical sentence one turn
+    # later, at `in_progress`, produced a real Thursday list.
+    #
+    # Keyed on the *outcome* rather than on the class, and that is the whole
+    # difference between this working and not. The live model called it a side
+    # question; the mock calls it a continuation whose confirmation verdict is
+    # `non_answer`. Two classes, one destination — the re-ask — so the re-ask is
+    # what this stands in front of. `scope_reply` is deliberately not in the
+    # list: "what's the weather like today" names a timing word, and answering
+    # an off-topic message with a slot list is the failure this would otherwise
+    # introduce while fixing another.
+    #
+    # Code runs the search itself, exactly as it does for a refused supersede,
+    # with the patient's own words as the phrase. It refuses itself when the run
+    # has no department, leaving `answered_with_slots` false — which is what
+    # keeps "answered" and "tried" different facts below.
+    answered_timing = False
+    if (
+        awaiting_confirmation
+        and run.status is WorkflowStatus.PENDING_CONFIRMATION
+        and outcome.consequence
+        in (Consequence.ANSWER_AND_STAY, Consequence.FEED_RUN, Consequence.APPEND_STEP)
+        and belt.proposals.confirmation_verdict != "decline"
+        and not belt.proposals.reproposed
+        and not belt.proposals.answered_with_slots
+        and names_timing(message)
+    ):
+        belt.answer_with_other_slots(message)
+        answered_timing = belt.proposals.answered_with_slots
+        writer.guard_verdict(
+            "timing_question", passed=answered_timing, detail={"message": message[:200]}
+        )
+
     # Stall containment, counted **independently of the class**. Deliberately
     # so: a message that leaves the run waiting is a non-answer whatever it was
     # classified as, and tying the counter to one class would let a
     # misclassification — an "hmm, maybe" read as off-topic — quietly make the
     # re-ask loop unbounded again. The bound must not be reachable only through
     # the paths that were classified correctly.
-    if awaiting_confirmation and run.status is WorkflowStatus.PENDING_CONFIRMATION:
+    #
+    # A timing question that got its answer is the one exception, and it is not
+    # a hole in the rule: the counter bounds a re-ask loop, and a turn that
+    # rendered times is not a re-ask. The message that *was* counted here — the
+    # Thursday-or-Friday question above — was a patient being told nothing and
+    # then charged for it.
+    if (
+        awaiting_confirmation
+        and run.status is WorkflowStatus.PENDING_CONFIRMATION
+        and not answered_timing
+    ):
         run.non_answer_count += 1
         session.flush()
 

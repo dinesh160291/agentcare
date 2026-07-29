@@ -45,6 +45,7 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
+from app.tools.dates import MONTHS, PARTS_OF_DAY, WEEKDAYS
 from app.tools.departments import resolve_department
 from app.tools.tasks import close_escalations_for_run
 from app.trace import TraceWriter
@@ -455,6 +456,79 @@ def names_change_verb(text: str) -> PlanStep | None:
     return None
 
 
+#: The words a patient scopes a timing question with. Weekdays and months come
+#: from ``resolve_date``'s own tables, so the two cannot drift: anything this
+#: reads as a timing phrase is a phrase that module can turn into a window.
+_TIMING_WORDS: tuple[str, ...] = (
+    tuple(WEEKDAYS)
+    + tuple(MONTHS)
+    + tuple(PARTS_OF_DAY)
+    + ("today", "tomorrow", "week", "weekend", "month", "earlier", "later", "sooner")
+)
+
+_TIMING_PATTERN = re.compile(
+    r"\b(?:" + "|".join(sorted(_TIMING_WORDS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def names_timing(text: str) -> bool:
+    """Whether a message scopes itself to a day, a date or a part of a day.
+
+    A fact about the message, like :func:`mentions_domain_subject`, and used the
+    same way: it may only widen what a turn *answers*, never what it does.
+
+    The live failure. At ``pending_confirmation``, "do you have any appointments
+    at the end of the same week like thursday or friday preferably in the
+    afternoon?" was classified a side question — defensibly — and then answered
+    with nothing. The Coordinator wrote prose about availability without running
+    a search, the grounding guard correctly suppressed it, and what reached the
+    patient was the bare re-ask, counted as a stall. The identical sentence one
+    turn later, at ``in_progress``, got a real Thursday list. A question that
+    names a day deserves the day's times in either state.
+
+    False positives cost a slot list where a re-ask would have gone, which is
+    the cheap direction — the opposite trade from the safety screen, and the
+    same one :func:`mentions_domain_subject` makes.
+    """
+    return bool(_TIMING_PATTERN.search(text or ""))
+
+
+#: "Book me something", "schedule a new one", "set up an appointment". Kept out
+#: of ``_CHANGE_VERBS`` because it names no existing appointment and so belongs
+#: to no plan correction — this is only ever counted, never applied.
+_BOOK_VERB = re.compile(r"\b(?:book|booking|schedule|set up|make)\b", re.IGNORECASE)
+
+
+def names_appointment_verbs(text: str) -> set[PlanStep]:
+    """Every appointment verb this message plainly states.
+
+    One request confirms one thing — ``validate_plan`` refuses a plan naming two
+    appointment actions, and that rule is right and stays. What was missing is
+    that the patient is never told which one survived. Live: "okay lets cancel
+    that appointment and book a new one for skin rash" produced a booking, and
+    the cancellation was neither done nor mentioned. The model had already
+    dropped it at classification, so the plan validator never saw two verbs and
+    had nothing to report; only the words show that two things were asked for.
+
+    Same construction as :func:`names_change_verb` and the same two rules —
+    withdrawal wins, and a verb needs an appointment noun beside it — so "cancel"
+    answering a proposal and "cancel that request" closing a run are still not
+    appointment verbs here.
+    """
+    message = text or ""
+    if says_withdrawal(message) or not _APPOINTMENT_NOUN.search(message):
+        return set()
+    found = {
+        step
+        for step, pattern in _CHANGE_VERBS
+        if re.search(pattern, message, re.IGNORECASE)
+    }
+    if _BOOK_VERB.search(message):
+        found.add(PlanStep.BOOK)
+    return found
+
+
 def _shows_no_difference(
     session: Session,
     run: WorkflowRun,
@@ -806,7 +880,9 @@ __all__ = [
     "apply_consequence",
     "WITHDRAWAL_CUES",
     "mentions_domain_subject",
+    "names_appointment_verbs",
     "names_change_verb",
+    "names_timing",
     "primary_intent",
     "says_only_withdrawal",
     "says_withdrawal",

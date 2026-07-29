@@ -57,6 +57,23 @@ UPLOAD_POINTER = "You can upload documents on the Documents page."
 
 REMINDER_LINE = "We'll remind you the day before."
 
+#: What a patient is owed when their message asked for two appointment actions
+#: and the system did one. "One request confirms one thing" is a rule with a
+#: cost, and the cost has to be visible: live, "okay lets cancel that
+#: appointment and book a new one for skin rash" booked, did not cancel, and
+#: said nothing about the half it dropped.
+ONE_VERB_AT_A_TIME = (
+    "One change at a time — I'll start with {verb}; ask me about the other one "
+    "right after."
+)
+
+#: The plan step in the patient's own words, for the line above.
+VERB_WORDS = {
+    "book": "the booking",
+    "reschedule": "the reschedule",
+    "cancel": "the cancellation",
+}
+
 #: Phrases where the assistant announces it is going off to do something. The
 #: live case: "I will proceed to find a suitable time for you. Please hold on"
 #: — said on a turn where a time was already being held, and followed by
@@ -696,8 +713,10 @@ def render_receipt(session: Session, run: WorkflowRun) -> str:
 
 __all__ = [
     "MAX_OPTIONS",
+    "ONE_VERB_AT_A_TIME",
     "REMINDER_LINE",
     "UPLOAD_POINTER",
+    "VERB_WORDS",
     "listed_appointment_ids",
     "offered_slot_ids",
     "promises_action",
