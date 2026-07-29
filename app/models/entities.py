@@ -364,6 +364,13 @@ class Escalation(Base):
     )
     occurrence_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     latest_message: Mapped[str | None] = mapped_column(Text)
+    #: Every message that triggered this escalation, oldest first and capped —
+    #: ``latest_message`` alone lost the evidence. Live, one safety row carried
+    #: ``occurrence_count`` 3 and the *third* message, so the request that
+    #: caused the escalation was nowhere in the staff view and the queue item
+    #: could not say what it was for. One row per case is still right; what was
+    #: wrong is that attaching replaced instead of accumulating.
+    messages: Mapped[list[str]] = mapped_column(JSON, default=list)
     reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     resolution_note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)

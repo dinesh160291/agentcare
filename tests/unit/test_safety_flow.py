@@ -36,7 +36,7 @@ from app.models import (
     WorkflowStatus,
 )
 from app.orchestrator import run_workflow
-from app.safety import CLINICAL_REPLY, EMERGENCY_REPLY
+from app.safety import BOOKING_HINT, CLINICAL_REPLY, EMERGENCY_REPLY
 
 PATIENT_EMAIL = "asha.patient@example.invalid"
 EMERGENCY = "I have chest pain and my left arm hurts"
@@ -324,6 +324,130 @@ class TestClinicalRequests:
         assert "administration" in lowered
         for clinical in ("dose", "mg", "take ", "medicine", "medication"):
             assert clinical not in lowered
+
+
+class TestAnEscalatedBookingIsSignposted:
+    """Round 9, item 4b — the rephrase the patient found by accident.
+
+    Live: "Need help to book an appointment for vision test as lately I'm
+    feeling little bit blurry on my right eye" was classified clinical advice
+    and escalated. That is the screen erring conservative, which for a hospital
+    is correct and is **not** being tuned. But the patient had also asked for
+    something this system does, and the refusal said only that it could not
+    help — so what actually recovered the booking was them guessing a wording
+    without the symptom in it ("Need help to book an appointment for vision
+    testing"). One deterministic sentence turns that guess into a signpost.
+
+    The screen itself is untouched, and the tests below assert that: same
+    verdicts, same escalation, same terminal run. Only the words after them
+    change.
+    """
+
+    #: The live sentence. Under the mock's screen it does *not* escalate — the
+    #: classification that escalated it was ``gpt-4o-mini``'s — so the reply
+    #: logic is pinned against it directly, through the function that composes
+    #: the refusal, rather than through a turn that would not reach it.
+    LIVE_SENTENCE = (
+        "Need help to book an appointment for vision test as lately I'm "
+        "feeling little bit blurry on my right eye"
+    )
+    #: An escalating message that also asks for something administrative, for
+    #: the end-to-end half. The dosage question is what the mock's own screen
+    #: fires on, deterministically and without a stubbed provider.
+    ESCALATED_BOOKING = (
+        "what dose of my tablets should I take? "
+        "I also want to book an appointment about it"
+    )
+
+    @staticmethod
+    def _clinical():
+        from app.safety import SafetyCategory, SafetyVerdict
+
+        return SafetyVerdict(
+            fired=True,
+            category=SafetyCategory.CLINICAL_ADVICE,
+            rule="stub",
+            source="llm",
+        )
+
+    @staticmethod
+    def _emergency():
+        from app.safety import SafetyCategory, SafetyVerdict
+
+        return SafetyVerdict(
+            fired=True,
+            category=SafetyCategory.EMERGENCY,
+            rule="stub",
+            source="llm",
+        )
+
+    def test_the_live_sentence_is_signposted(self):
+        from app.safety import reply_for
+
+        reply = reply_for(self._clinical(), self.LIVE_SENTENCE)
+
+        assert reply.startswith(CLINICAL_REPLY)
+        assert BOOKING_HINT in reply
+
+    def test_the_refusal_itself_is_unchanged(self):
+        """Appended, never a rewrite: the sentence that refuses is the one this
+        layer exists to say, and it still says it verbatim — with the blank
+        line CommonMark needs, or the signpost welds onto it as one paragraph.
+        """
+        from app.safety import reply_for
+
+        reply = reply_for(self._clinical(), self.LIVE_SENTENCE)
+
+        assert reply == f"{CLINICAL_REPLY}\n\n{BOOKING_HINT}"
+
+    def test_a_pure_clinical_question_gets_no_hint(self):
+        """Nothing to recover into. Inviting a booking here would answer a
+        question nobody asked."""
+        from app.safety import reply_for
+
+        reply = reply_for(self._clinical(), "what dose of sleeping syrup should I take?")
+
+        assert reply == CLINICAL_REPLY
+
+    def test_an_emergency_is_never_invited_to_book(self):
+        """The direction that matters most, and the one the work order did not
+        have to specify. The emergency reply says this needs urgent help
+        *rather than* an appointment; appending an invitation to book one would
+        argue with it, in front of the most frightened reader the system has.
+        """
+        from app.safety import reply_for
+
+        reply = reply_for(
+            self._emergency(), "I have severe chest pain, can I book an appointment?"
+        )
+
+        assert reply == EMERGENCY_REPLY
+        assert BOOKING_HINT not in reply
+
+    def test_the_hint_reaches_the_patient_through_a_real_turn(self, patient):
+        """The wiring half: ``escalate`` passes the message, not just the
+        verdict. Without that the composer above is correct and unreachable."""
+        result = turn(patient, self.ESCALATED_BOOKING, "s-signpost-e2e")
+
+        assert result.status == WorkflowStatus.ESCALATED.value
+        assert BOOKING_HINT in result.reply
+        assert result.author is TraceAuthor.GUARD
+
+    def test_the_screen_still_escalates_what_it_always_did(self, patient):
+        """The pin that item 4 changed no classification: same verdict, same
+        escalation kind, same terminal run."""
+        result = turn(patient, "what dose of my tablets should I take?", "s-signpost-v")
+
+        assert result.status == WorkflowStatus.ESCALATED.value
+        assert result.reply == CLINICAL_REPLY
+
+        session = fresh()
+        try:
+            assert {e.kind for e in session.query(Escalation).all()} == {
+                EscalationKind.SAFETY
+            }
+        finally:
+            session.close()
 
 
 class TestTheLlmScreenCatchesWhatThePhraseListCannot:

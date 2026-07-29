@@ -19,6 +19,7 @@ from app.models import (
     WorkflowStatus,
 )
 from app.tools.tasks import (
+    MAX_ESCALATION_MESSAGES,
     close_escalations_for_run,
     close_followup_tasks,
     create_escalation,
@@ -195,6 +196,73 @@ class TestEscalationDedup:
         create_escalation(seeded_db, workflow_run_id=run.id, kind=EscalationKind.SAFETY,
                           reason="r", message="second")
         assert seeded_db.query(Escalation).one().latest_message == "second"
+
+    def test_every_message_is_kept_not_only_the_latest(self, seeded_db, run):
+        """Round 9, item 4a — dedup must not cost a human the evidence.
+
+        Live: one escalation row, ``occurrence_count`` 3, and a
+        ``latest_message`` about sleeping syrup. The message that actually
+        caused the escalation — "book an appointment for vision test as lately
+        I'm feeling little bit blurry on my right eye" — was gone, overwritten
+        by the two that followed. The staff view showed the third and named the
+        first nowhere, so the queue item said a patient had been escalated and
+        could not say what for.
+
+        One row is still right: five triggers are one case, not five. What was
+        wrong is that attaching *replaced* rather than accumulated.
+        """
+        for message in ("vision test, blurry right eye", "painkiller dose?",
+                        "sleeping syrup dose?"):
+            create_escalation(
+                seeded_db, workflow_run_id=run.id, kind=EscalationKind.SAFETY,
+                reason="clinical advice sought", message=message,
+            )
+
+        escalation = seeded_db.query(Escalation).one()
+        assert escalation.occurrence_count == 3
+        assert escalation.messages == [
+            "vision test, blurry right eye",
+            "painkiller dose?",
+            "sleeping syrup dose?",
+        ]
+
+    def test_the_messages_reach_the_staff_view(self, seeded_db, run):
+        """The row is only worth as much as what the queue serialises."""
+        for message in ("first", "second"):
+            create_escalation(
+                seeded_db, workflow_run_id=run.id, kind=EscalationKind.SAFETY,
+                reason="r", message=message,
+            )
+
+        listed = list_open_escalations(seeded_db)
+        assert listed[0]["messages"] == ["first", "second"]
+
+    def test_the_message_list_is_bounded(self, seeded_db, run):
+        """It is a growth rule like every other automated writer's.
+
+        ``occurrence_count`` stays the true count, so nothing is misreported —
+        what is capped is only how much text one queue item can accumulate.
+        """
+        for index in range(MAX_ESCALATION_MESSAGES + 5):
+            create_escalation(
+                seeded_db, workflow_run_id=run.id, kind=EscalationKind.SAFETY,
+                reason="r", message=f"message {index}",
+            )
+
+        escalation = seeded_db.query(Escalation).one()
+        assert escalation.occurrence_count == MAX_ESCALATION_MESSAGES + 5
+        assert len(escalation.messages) == MAX_ESCALATION_MESSAGES
+        # The first is kept: it is the one that opened the case.
+        assert escalation.messages[0] == "message 0"
+        assert escalation.messages[-1] == f"message {MAX_ESCALATION_MESSAGES + 4}"
+
+    def test_a_repeat_with_no_message_adds_no_row(self, seeded_db, run):
+        create_escalation(seeded_db, workflow_run_id=run.id,
+                          kind=EscalationKind.SAFETY, reason="r", message="only one")
+        create_escalation(seeded_db, workflow_run_id=run.id,
+                          kind=EscalationKind.SAFETY, reason="r", message=None)
+
+        assert seeded_db.query(Escalation).one().messages == ["only one"]
 
     def test_every_trigger_is_audited_even_when_no_row_is_created(self, seeded_db, run):
         """Nothing is lost by not creating a row — the trail is in the audit log."""

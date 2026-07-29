@@ -44,9 +44,11 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
+from app.models.enums import PlanStep
 from app.safety.screen import SafetyCategory, SafetyVerdict
 from app.tools.tasks import OPEN_ESCALATION_STATUSES, create_escalation
 from app.trace import TraceWriter
+from app.workflow.mapping import names_appointment_verbs
 from app.workflow.state_machine import create_run, transition
 
 #: Code-authored, identical in mock and live. It directs the patient to urgent
@@ -65,10 +67,39 @@ CLINICAL_REPLY = (
 )
 
 
-def reply_for(verdict: SafetyVerdict) -> str:
-    """The template that answers a fired verdict."""
+#: Appended when an escalated message *also* asked for something this system
+#: does. Deterministic, and one sentence: the refusal is the important part and
+#: stays exactly as it is.
+BOOKING_HINT = (
+    "If you'd like to book an appointment, just tell me the department or the "
+    "reason for the visit."
+)
+
+
+def reply_for(verdict: SafetyVerdict, message: str = "") -> str:
+    """The template that answers a fired verdict.
+
+    A clinical refusal gains a signpost when the same message named a booking.
+    Live, "Need help to book an appointment for vision test as lately I'm
+    feeling little bit blurry on my right eye" escalated — correctly; the
+    screen erring conservative is the trade this project chose — and the reply
+    said only that it could not help. What recovered the booking was the
+    patient guessing a wording with no symptom in it. That guess is now a
+    signpost, and the screen is untouched.
+
+    **Never on an emergency.** That reply says this needs urgent help *rather
+    than* an appointment, and appending an invitation to book one would argue
+    with it in front of a frightened patient. The hint exists for the case
+    where administration was genuinely part of what was asked; an emergency is
+    the case where it is beside the point.
+
+    Two newlines, because the chat renders CommonMark and one would weld the
+    signpost onto the refusal as a single paragraph.
+    """
     if verdict.category is SafetyCategory.EMERGENCY:
         return EMERGENCY_REPLY
+    if names_appointment_verbs(message) == {PlanStep.BOOK}:
+        return f"{CLINICAL_REPLY}\n\n{BOOKING_HINT}"
     return CLINICAL_REPLY
 
 
@@ -194,7 +225,7 @@ def escalate(
         metadata=verdict.as_trace_detail(),
     )
 
-    return run, reply_for(verdict), TraceAuthor.GUARD
+    return run, reply_for(verdict, message), TraceAuthor.GUARD
 
 
-__all__ = ["CLINICAL_REPLY", "EMERGENCY_REPLY", "escalate", "reply_for"]
+__all__ = ["BOOKING_HINT", "CLINICAL_REPLY", "EMERGENCY_REPLY", "escalate", "reply_for"]

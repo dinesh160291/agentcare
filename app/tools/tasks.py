@@ -45,6 +45,31 @@ def _serialise_task(task: FollowUpTask) -> dict[str, Any]:
     }
 
 
+#: How many triggering messages one escalation keeps. A growth rule, like every
+#: other automated writer's here: repeats attach without bound, so the text they
+#: carry has to stop somewhere. ``occurrence_count`` remains the true count, so
+#: capping the list never misreports how often this fired.
+MAX_ESCALATION_MESSAGES = 10
+
+
+def _appended(messages: list[str] | None, message: str) -> list[str]:
+    """Add a triggering message, keeping the first and the most recent.
+
+    Assigned as a new list rather than mutated in place: the column is plain
+    ``JSON``, not ``MutableList``, so SQLAlchemy sees an append to the existing
+    object as no change at all and never writes it.
+
+    When the cap bites, the *first* message is what survives alongside the tail
+    — it is the one that opened the case, and the live failure was precisely
+    that the opening message had been overwritten by later ones.
+    """
+    kept = list(messages or [])
+    kept.append(message)
+    if len(kept) > MAX_ESCALATION_MESSAGES:
+        kept = kept[:1] + kept[-(MAX_ESCALATION_MESSAGES - 1) :]
+    return kept
+
+
 def _serialise_escalation(escalation: Escalation) -> dict[str, Any]:
     return {
         "escalation_id": escalation.id,
@@ -54,6 +79,7 @@ def _serialise_escalation(escalation: Escalation) -> dict[str, Any]:
         "reason": escalation.reason,
         "occurrence_count": escalation.occurrence_count,
         "latest_message": escalation.latest_message,
+        "messages": list(escalation.messages or []),
     }
 
 
@@ -292,6 +318,7 @@ def create_escalation(
         existing.occurrence_count += 1
         if message is not None:
             existing.latest_message = message
+            existing.messages = _appended(existing.messages, message)
         session.flush()
         write_audit(
             session,
@@ -312,6 +339,7 @@ def create_escalation(
         status=EscalationStatus.OPEN,
         occurrence_count=1,
         latest_message=message,
+        messages=[message] if message is not None else [],
     )
     session.add(escalation)
     session.flush()

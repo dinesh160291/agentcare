@@ -17,6 +17,31 @@ import streamlit as st
 from ui import theme
 from ui.shell import act, client, fetch, header, token
 
+def _messages(escalation: dict) -> str:
+    """Every message that triggered this case, oldest first.
+
+    Not just the latest one. Dedup is right — five triggers are one case — but
+    it used to *overwrite*, so a queue item could say a patient had been
+    escalated three times and show only the third thing they said. The message
+    that opened the case is usually the one a human needs.
+    """
+    messages = escalation.get("messages") or []
+    if not messages:
+        single = escalation.get("latest_message")
+        messages = [single] if single else []
+    if not messages:
+        return ""
+    # ``esc`` is not optional here: these are the patient's own words going
+    # into markup rendered with ``unsafe_allow_html``.
+    rows = "".join(
+        f'<li style="margin:2px 0;">{theme.esc(message)}</li>' for message in messages
+    )
+    return (
+        '<div class="ac-dim" style="margin-top:8px;">Messages</div>'
+        f'<ol style="margin:4px 0 0 18px;padding:0;">{rows}</ol>'
+    )
+
+
 header("Escalations & reviews", "Paused workflows, and everything awaiting a human.")
 
 escalations = fetch(lambda: client().escalations(token()), default=[]) or []
@@ -49,10 +74,10 @@ with approvals_tab:
             + theme.facts(
                 [
                     ("Reason", escalation.get("reason")),
-                    ("Latest message", escalation.get("latest_message")),
                     ("Triggers", escalation.get("occurrence_count")),
                 ]
             )
+            + _messages(escalation)
         )
         st.markdown(theme.card(body), unsafe_allow_html=True)
 
@@ -129,9 +154,9 @@ with safety_tab:
             + theme.facts(
                 [
                     ("Reason", escalation.get("reason")),
-                    ("Latest message", escalation.get("latest_message")),
                 ]
             )
+            + _messages(escalation)
         )
         st.markdown(
             f'<div class="ac-card" style="border-left:3px solid #a33a2a;">{body}</div>',

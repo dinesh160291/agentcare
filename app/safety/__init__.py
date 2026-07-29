@@ -19,6 +19,7 @@ and keeps it there.
 
 from app.safety.classifier import llm_screen
 from app.safety.escalate import (
+    BOOKING_HINT,
     CLINICAL_REPLY,
     EMERGENCY_REPLY,
     escalate,
@@ -32,6 +33,7 @@ from app.safety.screen import (
 )
 
 __all__ = [
+    "BOOKING_HINT",
     "CLINICAL_REPLY",
     "EMERGENCY_REPLY",
     "PASSED",
