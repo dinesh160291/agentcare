@@ -357,7 +357,11 @@ def render_proposal(session: Session, run: WorkflowRun, slots: Sequence[dict]) -
 
 
 def render_alternatives(
-    session: Session, run: WorkflowRun, slots: Sequence[dict]
+    session: Session,
+    run: WorkflowRun,
+    slots: Sequence[dict],
+    *,
+    heading: str = "Other times that are free:",
 ) -> str:
     """Answer "what else is there?" without disturbing what is held.
 
@@ -365,6 +369,11 @@ def render_alternatives(
     get an answer — and the proposal they have not answered yet is still
     theirs. The re-ask follows so the turn ends where it began, on a question
     the patient can settle.
+
+    ``heading`` is what introduces the list, and the caller overrides it when
+    the list is not the answer the patient asked for — an unreadable constraint
+    or an empty window. The default is the plain case and says nothing extra,
+    because a note on every list is a note nobody reads.
     """
     shortlist = _shortlist(slots, held=run.proposed_slot_id, first=False)
     options = render_options(shortlist, proposed_slot_id=None)
@@ -375,9 +384,41 @@ def render_alternatives(
         )
     record_offered(run, shortlist)
     record_shortlist(run, shortlist)
-    return (
-        f"Other times that are free:\n{options}\n\n" + render_reask(session, run)
-    )
+    # The note *replaces* the heading rather than sitting above it: both
+    # introduce the same list, and "Nothing free on Tuesday — the earliest
+    # other times are:" followed by "Other times that are free:" reads as two
+    # answers to one question.
+    return f"{heading}\n{options}\n\n" + render_reask(session, run)
+
+
+def window_note(*, unreadable: bool, empty_label: str | None) -> str:
+    """What to say when a timing constraint did not produce the list below it.
+
+    The third layer of the window reader, and the one the other two rest on:
+    they widen what can be *read*, and neither can promise that everything will
+    be. What made the live failure a failure was not the unparsed phrase — it
+    was that the reply then showed the earliest three slots as though they
+    answered the question. "Thursday next week or after August 6th" came back
+    as Monday times, with nothing said about either constraint.
+
+    Two sentences for two different facts, and they must not be swapped. "I
+    couldn't read that" is about this system; "nothing is free then" is a claim
+    about the schedule, and making it after a search that never carried the
+    constraint would be asserting a result nobody looked for. Where the state
+    somehow says both, the admission wins.
+
+    "" when the constraint was honoured and answered — a rule that worked is
+    not something to apologise for, and a note on every list would train the
+    patient to skip the one that matters.
+    """
+    if unreadable:
+        return (
+            "I couldn't read that as a day or time — here are the earliest "
+            "times free:"
+        )
+    if empty_label:
+        return f"Nothing free {empty_label} — the earliest other times are:"
+    return ""
 
 
 def clash_note(withheld: Iterable[dict[str, Any]], message: str) -> str:
@@ -762,6 +803,7 @@ __all__ = [
     "UPLOAD_POINTER",
     "VERB_WORDS",
     "clash_note",
+    "window_note",
     "listed_appointment_ids",
     "offered_slot_ids",
     "promises_action",

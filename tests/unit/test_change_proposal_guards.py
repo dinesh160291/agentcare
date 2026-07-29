@@ -16,6 +16,8 @@ nothing exercised them. A guard nobody has ever tripped is a decoration.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from app import clock
@@ -402,6 +404,118 @@ class TestTheSlotMustBeFreeInThePatientsOwnDiary:
         )
 
         assert result["accepted"] is True
+
+
+class TestAProposedSearchWindowIsDisposedByCode:
+    """Round 9, item 5b — the model may propose a window; code decides.
+
+    The deterministic vocabulary (5a) covers the forms patients actually write,
+    and it will never cover all of them. This is the fallback for the phrase
+    nobody anticipated, and it is shaped so that being wrong is cheap: the
+    model hands over two dates and no prose, cannot name a slot, cannot commit,
+    and the search that runs is the same one every other path runs, bound to
+    the same patient.
+
+    A rejection falls through to layer (c), which says plainly that the
+    constraint could not be read — the honest answer, and the one the live turn
+    should have given instead of silently showing the earliest three.
+    """
+
+    @pytest.fixture
+    def holding(self, seeded_db, asha, run):
+        """A run holding a proposal, which is where timing questions land."""
+        run.status = WorkflowStatus.PENDING_CONFIRMATION
+        run.proposed_action = ProposedAction.BOOK
+        run.state = {"department_id": 1}
+        target = slot_in(seeded_db, "Cardiology")
+        run.proposed_slot_id = target.id
+        seeded_db.flush()
+        return run
+
+    def test_a_usable_window_is_searched(self, seeded_db, asha, holding):
+        belt = belt_for(seeded_db, asha, holding)
+        today = clock.today()
+
+        result = belt._propose_search_window(
+            today.isoformat(), (today + timedelta(days=6)).isoformat()
+        )
+
+        assert result["accepted"] is True
+        assert belt.proposals.offered_slots
+        assert belt.proposals.searched_slots is True
+
+    @pytest.mark.parametrize(
+        "start,end,fragment",
+        [
+            ("2026-08-10", "2026-08-03", "not be after"),
+            ("not-a-date", "2026-08-10", "calendar dates"),
+            ("2027-06-01", "2027-06-07", "beyond what can be booked"),
+            ("2020-01-01", "2020-01-07", "in the past"),
+        ],
+    )
+    def test_an_unusable_window_is_refused(
+        self, seeded_db, asha, holding, start, end, fragment
+    ):
+        belt = belt_for(seeded_db, asha, holding)
+
+        result = belt._propose_search_window(start, end)
+
+        assert result["accepted"] is False
+        assert fragment in result["problem"]
+
+    def test_a_refusal_leaves_the_turn_to_admit_it(self, seeded_db, asha, holding):
+        """The handover to layer (c): nothing was searched, so nothing may be
+        rendered as though it had been."""
+        belt = belt_for(seeded_db, asha, holding)
+
+        belt._propose_search_window("2027-06-01", "2027-06-07")
+
+        assert belt.proposals.offered_slots == []
+        assert belt.proposals.searched_slots is False
+
+    def test_both_directions_are_traced(self, seeded_db, asha, holding):
+        """A refused window changes nothing, so the row is the only evidence
+        the guard ran — and an accepted one has to say a window was code's
+        decision rather than the model's."""
+        belt = belt_for(seeded_db, asha, holding)
+        today = clock.today()
+        belt._propose_search_window("2027-06-01", "2027-06-07")
+        belt._propose_search_window(
+            today.isoformat(), (today + timedelta(days=6)).isoformat()
+        )
+        seeded_db.flush()
+
+        verdicts = [
+            event.payload
+            for event in seeded_db.query(TraceEvent)
+            .filter(TraceEvent.event_type == TraceEventType.VALIDATION)
+            .all()
+            if event.payload.get("what") == "search_window"
+        ]
+        assert [v["accepted"] for v in verdicts] == [False, True]
+
+    def test_the_window_cannot_reach_another_patient(self, seeded_db, asha, holding):
+        """The binding is the guard: the tool takes dates, never a patient."""
+        belt = belt_for(seeded_db, asha, holding)
+        today = clock.today()
+
+        belt._propose_search_window(
+            today.isoformat(), (today + timedelta(days=6)).isoformat()
+        )
+
+        assert belt.patient_id == ASHA_PROFILE_ID
+
+    def test_it_is_offered_only_while_a_proposal_stands(self, seeded_db, asha, run):
+        """Handed out where the timing questions land, and nowhere else."""
+        run.status = WorkflowStatus.IN_PROGRESS
+        seeded_db.flush()
+        names = {tool.__name__ for tool in belt_for(seeded_db, asha, run).coordinator_tools()}
+        assert "propose_search_window" not in names
+
+        run.status = WorkflowStatus.PENDING_CONFIRMATION
+        seeded_db.flush()
+        names = {tool.__name__ for tool in belt_for(seeded_db, asha, run).coordinator_tools()}
+        assert "propose_search_window" in names
 
 
 class TestWhatTheSearchHandsTheModel:

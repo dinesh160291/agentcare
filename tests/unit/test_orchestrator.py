@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 import os
 import subprocess
 import sys
@@ -135,6 +136,20 @@ def _guard(session, turn_id: str, name: str) -> dict:
             if (event.payload or {}).get("guard") == name:
                 return event.payload
     raise AssertionError(f"no {name!r} guard verdict in turn {turn_id}")
+
+
+def _appointment_count(patient_id: int) -> int:
+    """Live appointments for one patient, baselined per patient because the
+    seed ships one already."""
+    session = fresh()
+    try:
+        return (
+            session.query(Appointment)
+            .filter(Appointment.patient_id == patient_id)
+            .count()
+        )
+    finally:
+        session.close()
 
 
 def _guard_or_none(session, turn_id: str, name: str) -> dict | None:
@@ -4435,6 +4450,175 @@ class TestARescheduleCannotLandOnTheirOwnAppointment:
             assert rejected, "the clash refusal left no trace row"
         finally:
             session.close()
+
+
+class TestATimingConstraintIsHonouredOrNamed:
+    """Round 9, item 5 — end to end, through a real turn.
+
+    The live failures, in one place: "Thursday next week or after August 6th"
+    parsed to nothing and was answered with Monday slots; "after August 6th"
+    included the 6th; "more slots in the afternoon?" came back with 10 and
+    11 AM. Each is a constraint the patient stated and the reply ignored
+    without saying so.
+    """
+
+    def _holding(self, patient, session_id: str):
+        """A run holding a proposal, which is where timing questions land."""
+        first = turn(patient, BOOKING, session_id)
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        return first
+
+    def test_an_unreadable_constraint_is_admitted_not_hidden(self, patient):
+        self._holding(patient, "s-window-1")
+
+        # Names a timing word ("later", "week") that `resolve_date` cannot turn
+        # into a window, and is phrased as the availability question the
+        # classifier routes to the timing path — both are needed, and the first
+        # phrasing I tried satisfied only one of them and was answered as
+        # off-topic.
+        result = turn(patient, "what else is free later in the week?", "s-window-1")
+
+        assert "couldn't read that as a day or time" in result.reply
+
+    def test_a_readable_constraint_is_answered_without_apology(self, patient):
+        """The negative control. A window that worked must not be narrated —
+        a note on every list is a note nobody reads."""
+        self._holding(patient, "s-window-2")
+
+        result = turn(patient, "what else is free next week?", "s-window-2")
+
+        assert "couldn't read that" not in result.reply
+        assert "Nothing free" not in result.reply
+
+    def test_reading_a_window_never_costs_an_llm_call(self, patient):
+        """Layer order, falsified from the trace rather than from the reply.
+
+        Layer (a) is deterministic vocabulary, and the whole point of putting
+        it first is that a phrase it can read must never reach a model. Two
+        turns, and the second one's request count is the assertion.
+        """
+        self._holding(patient, "s-window-3")
+
+        result = turn(patient, "anything on thursday next week?", "s-window-3")
+
+        session = fresh()
+        try:
+            calls = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.LLM_REQUEST
+                and event.agent_name == "appointment"
+            ]
+        finally:
+            session.close()
+
+        assert not calls, "a phrase layer (a) can read reached a specialist"
+
+    def test_after_a_date_starts_the_day_after(self, patient):
+        """The off-by-one, end to end: "after August 6th" showed August 6th."""
+        self._holding(patient, "s-window-4")
+
+        result = turn(patient, "any availability after august 6th?", "s-window-4")
+
+        assert "6 August" not in result.reply
+
+
+class WindowProposingLlm(MockLlm):
+    """A model that answers a timing question by proposing a window.
+
+    The mock never does this on its own — layer (a) reads the phrases it knows
+    and the mock asks for a list — so without a stub, layer (b) is code with no
+    caller and its wiring is unproven. ``window`` is what this one proposes,
+    so a test can hand it a good window or an impossible one.
+    """
+
+    model: str = "window-proposing-stub"
+    window_start: str = ""
+    window_end: str = ""
+
+    def _classify(self, llm_request, available, done, text):  # noqa: ANN001
+        if (
+            "propose_search_window" in available
+            and "propose_search_window" not in done
+        ):
+            return function_call_response(
+                "propose_search_window",
+                {"start": self.window_start, "end": self.window_end},
+            )
+        return super()._classify(llm_request, available, done, text)
+
+
+class TestAModelProposedWindowIsDisposedByCode:
+    """Round 9, item 5b, through a real turn — the tool exists and is reachable.
+
+    The validation itself is pinned at the toolbelt seam. What only a turn can
+    show is that a model at ``pending_confirmation`` can actually reach the
+    tool, and that a window code refuses leaves the patient with the honest
+    answer rather than with silence.
+    """
+
+    def _holding(self, patient, session_id: str):
+        first = turn(patient, BOOKING, session_id)
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+    def test_an_impossible_window_still_answers_the_patient(self, patient, monkeypatch):
+        self._holding(patient, "s-propwin-1")
+        monkeypatch.setattr(
+            "app.agents.base.get_provider",
+            lambda name=None: WindowProposingLlm(
+                window_start="2029-06-01", window_end="2029-06-07"
+            ),
+        )
+
+        result = turn(patient, "what else is free around then?", "s-propwin-1")
+
+        assert result.reply
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+    def test_the_refusal_is_recorded(self, patient, monkeypatch):
+        self._holding(patient, "s-propwin-2")
+        monkeypatch.setattr(
+            "app.agents.base.get_provider",
+            lambda name=None: WindowProposingLlm(
+                window_start="2029-06-01", window_end="2029-06-07"
+            ),
+        )
+
+        result = turn(patient, "what else is free around then?", "s-propwin-2")
+
+        session = fresh()
+        try:
+            refused = [
+                event.payload
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.VALIDATION
+                and event.payload.get("what") == "search_window"
+            ]
+        finally:
+            session.close()
+
+        assert refused and refused[0]["accepted"] is False
+
+    def test_nothing_is_booked_by_a_window(self, patient, monkeypatch):
+        """The bound that makes reading a window freely safe: it searches, and
+        that is all it can do."""
+        self._holding(patient, "s-propwin-3")
+        before = _appointment_count(1)
+        monkeypatch.setattr(
+            "app.agents.base.get_provider",
+            lambda name=None: WindowProposingLlm(
+                window_start=clock.today().isoformat(),
+                window_end=(clock.today() + timedelta(days=6)).isoformat(),
+            ),
+        )
+
+        turn(patient, "what else is free around then?", "s-propwin-3")
+
+        assert _appointment_count(1) == before
 
 
 class TestSayingWhyATimeIsMissing:

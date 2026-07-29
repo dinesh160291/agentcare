@@ -101,6 +101,7 @@ from app.workflow.replies import (
     shortlist_slot_ids,
     render_alternatives,
     render_appointment_choice,
+    window_note,
     render_change_proposal,
     render_proposal,
     render_reask,
@@ -814,7 +815,21 @@ def _answer_while_holding(
         # the chat renders CommonMark and a sentence one newline above a list
         # is read as part of it.
         note = belt.proposals.clash_note
-        times = render_alternatives(session, run, belt.proposals.offered_slots)
+        # A constraint that was stated and not honoured is said out loud, and it
+        # takes the list's heading rather than sitting above it. Live, "Thursday
+        # next week or after August 6th" produced three Monday slots under
+        # "Other times that are free:" — a silent fallback the patient reads as
+        # an answer.
+        heading = window_note(
+            unreadable=belt.proposals.window_unreadable,
+            empty_label=belt.proposals.window_empty_label,
+        )
+        times = render_alternatives(
+            session,
+            run,
+            belt.proposals.offered_slots,
+            **({"heading": heading} if heading else {}),
+        )
         return TurnResult(
             reply=f"{note}\n\n{times}" if note else times,
             author=TraceAuthor.TEMPLATE,

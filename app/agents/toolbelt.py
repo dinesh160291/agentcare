@@ -24,7 +24,7 @@ trace rows, and the change they describe commit or roll back together.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 from sqlalchemy.orm import Session
@@ -72,9 +72,22 @@ from app.tools import (
     upsert_followup_task,
     validate_department,
 )
-from app.workflow.mapping import ClassVerdict, validate_class
+from app.workflow.mapping import ClassVerdict, names_timing, validate_class
 from app.workflow.plan import validate_plan
 from app.workflow.state_machine import transition
+
+#: How far ahead a model-proposed window may reach. The seed lays two weeks of
+#: slots; a window past that is not a search, it is a guess about a calendar
+#: nobody has opened yet.
+WINDOW_HORIZON_DAYS = 30
+
+
+def _window_label(first: date, last: date) -> str:
+    """The window in the words a reply can use, from the dates code accepted."""
+    if first == last:
+        return f"on {first:%A} {first.day} {first:%B}"
+    return f"between {first.day} {first:%B} and {last.day} {last:%B}"
+
 
 #: The closed set the model may answer a proposal with. ``confirm`` is
 #: deliberately absent: commitment requires a click or an exact token, and the
@@ -135,6 +148,14 @@ class TurnProposals:
     #: or when the time they named was simply not free — an absence and a clash
     #: are different facts and only one of them is safe to assert.
     clash_note: str = ""
+    #: The patient scoped their question to a day or a period and this system
+    #: could not read it. Distinct from "nothing was free then", which is a
+    #: claim about the schedule — see :func:`app.workflow.replies.window_note`.
+    window_unreadable: bool = False
+    #: The window that *was* honoured and returned nothing, in the patient's
+    #: own terms. ``None`` when a window was honoured and answered, which is
+    #: the case that must stay silent.
+    window_empty_label: str | None = None
     rejections: list[str] = field(default_factory=list)
 
 
@@ -456,6 +477,17 @@ class Toolbelt:
             This books nothing: they still have to confirm."""
             return self._propose_another_slot(slot_id)
 
+        def propose_search_window(
+            start: str,
+            end: str,
+            part_of_day: Literal["", "morning", "afternoon", "evening"] = "",
+        ) -> dict:
+            """Say which dates to search when `list_other_slots` could not read
+            the patient's words. `start` and `end` are calendar dates as
+            YYYY-MM-DD, and `start` must not be after `end`. This searches and
+            shows times; it books nothing and changes no appointment."""
+            return self._propose_search_window(start, end, part_of_day)
+
         # The toolset itself says which decision is wanted. A Coordinator with
         # no active run cannot classify against one, and a Coordinator with a
         # live run must not quietly start a second — so the wrong tool is
@@ -478,6 +510,12 @@ class Toolbelt:
             # place the proposal could be disturbed.
             if self.run.proposed_action is ProposedAction.BOOK:
                 tools.append(propose_another_slot)
+            # Layer (b). Handed out beside the confirmation verdict because
+            # that is where the timing questions land, and it is the fallback
+            # for the one case the deterministic vocabulary cannot cover: a
+            # phrase nobody anticipated. It cannot commit and cannot name a
+            # slot, so the worst it can do is search the wrong fortnight.
+            tools.append(propose_search_window)
         elif self.run is not None and not self.run.is_terminal:
             # Answering "what else is free?" is the other half of the mapping
             # table's answer-and-stay, and it needs data. Live, at
@@ -487,6 +525,99 @@ class Toolbelt:
             # itself when no department has been decided.
             tools.append(list_other_slots)
         return tools
+
+    def _propose_search_window(
+        self, start: str, end: str, part_of_day: str = ""
+    ) -> dict:
+        """Layer (b): the model proposes a window, code disposes of it.
+
+        Deliberately the narrowest shape that could work. The model may not
+        write prose here and may not name a slot — it hands over two dates, and
+        code checks them, runs *the same* search every other path runs, and
+        renders *the same* template. Everything that made the deterministic
+        vocabulary safe is therefore still true of this: the window is validated
+        against the clock, the search is the one bound to this patient, and the
+        reply is assembled from rows.
+
+        A rejection is not a failure. It falls through to layer (c), which says
+        plainly that the constraint could not be read — which is the honest
+        answer and the one the live turn should have given.
+        """
+        run = self.run
+        if run is None:
+            return {"accepted": False, "problem": "There is no active request."}
+
+        department_id = self._department_id()
+        if department_id is None:
+            return {"accepted": False, "problem": "No department has been decided yet."}
+
+        first, last = self._as_date(start), self._as_date(end)
+        today = clock.today()
+        horizon = today + timedelta(days=WINDOW_HORIZON_DAYS)
+        problem = None
+        if first is None or last is None:
+            problem = "start and end must both be calendar dates, as YYYY-MM-DD."
+        elif first > last:
+            problem = "start must not be after end."
+        elif last < today:
+            problem = "that window is in the past."
+        elif first > horizon:
+            problem = (
+                f"that window is beyond what can be booked "
+                f"(nothing later than {horizon.isoformat()})."
+            )
+
+        if problem is not None:
+            # Traced in both directions: a refused window leaves no other mark,
+            # and "the model proposed nothing" and "the model proposed
+            # something impossible" are different facts about a turn.
+            self.writer.validation(
+                "search_window",
+                accepted=False,
+                detail={"start": start, "end": end, "problem": problem},
+            )
+            return {"accepted": False, "problem": problem}
+
+        first = max(first, today)
+        self.writer.validation(
+            "search_window",
+            accepted=True,
+            detail={"start": first.isoformat(), "end": last.isoformat()},
+        )
+
+        found = find_available_slots(
+            self.session,
+            department_id=department_id,
+            start=first,
+            end=last,
+            part_of_day=part_of_day or None,
+            free_for_patient=self.patient_id,
+        )
+        others = [
+            slot
+            for slot in found.get("slots") or []
+            if slot.get("slot_id") != run.proposed_slot_id
+        ]
+        self.proposals.offered_slots = others
+        self.proposals.answered_with_slots = True
+        self.proposals.searched_slots = True
+        # A window was read after all, so layer (c) has nothing to admit.
+        self.proposals.window_unreadable = False
+        self.proposals.window_empty_label = (
+            None if others else _window_label(first, last)
+        )
+        if not others:
+            widest = find_available_slots(
+                self.session,
+                department_id=department_id,
+                free_for_patient=self.patient_id,
+            )
+            self.proposals.offered_slots = [
+                slot
+                for slot in widest.get("slots") or []
+                if slot.get("slot_id") != run.proposed_slot_id
+            ]
+        return self._offerable(found) | {"accepted": True}
 
     def answer_with_other_slots(self, phrase: str = "") -> dict:
         """The same search, run by code rather than asked for by the model.
@@ -667,6 +798,34 @@ class Toolbelt:
             for slot in found.get("slots") or []
             if slot.get("slot_id") != run.proposed_slot_id
         ]
+
+        # A constraint the patient stated must never be dropped in silence. It
+        # can fail in two different ways and they are not interchangeable: the
+        # phrase was unreadable (this system's failure, and no search carried
+        # it), or it was honoured and the schedule is empty (a fact about the
+        # schedule). Live, the first was answered with the earliest three slots
+        # and nothing said at all.
+        self.proposals.window_unreadable = bool(
+            phrase and not window.get("resolved") and names_timing(phrase)
+        )
+        self.proposals.window_empty_label = None
+        if window.get("resolved") and not others:
+            # The window was real and there is nothing in it. Search again
+            # without it, so the sentence naming the empty window has something
+            # true to offer underneath.
+            widest = find_available_slots(
+                self.session,
+                department_id=department_id,
+                part_of_day=window.get("part_of_day") or None,
+                free_for_patient=self.patient_id,
+            )
+            others = [
+                slot
+                for slot in widest.get("slots") or []
+                if slot.get("slot_id") != run.proposed_slot_id
+            ]
+            self.proposals.window_empty_label = window.get("label") or None
+
         self.proposals.offered_slots = others
         self.proposals.answered_with_slots = True
         self.proposals.searched_slots = True

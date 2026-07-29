@@ -32,6 +32,7 @@ from app.models import (
 from app.workflow.replies import (
     UPLOAD_POINTER,
     clash_note,
+    window_note,
     claims_availability,
     offered_slot_ids,
     promises_action,
@@ -535,6 +536,50 @@ class TestTheRenderersSurviveMarkdown:
         text = render_receipt(session, run)
         assert "\n\n" in text
         assert "\n" not in text.replace("\n\n", "")
+
+
+class TestAConstraintIsNeverDroppedInSilence:
+    """Round 9, item 5c — the layer under the other two.
+
+    Layers (a) and (b) widen what can be read. Neither can promise everything
+    will be, and the failure that matters is not the unread phrase: it is that
+    the reply then showed the earliest three slots as though they were an
+    answer. Live, "Thursday next week or after August 6th" produced a list of
+    Monday times with nothing said about either constraint.
+
+    Two sentences, two different facts. "I could not read that" is about the
+    system; "nothing is free then" is about the schedule. Saying the second
+    when the first is true would be a claim about a search that never ran with
+    the constraint in it.
+    """
+
+    def test_an_unreadable_constraint_is_admitted(self):
+        note = window_note(unreadable=True, empty_label=None)
+
+        assert note == (
+            "I couldn't read that as a day or time — here are the earliest "
+            "times free:"
+        )
+
+    def test_an_honoured_but_empty_window_says_what_was_searched(self):
+        note = window_note(unreadable=False, empty_label="Tuesday 4 August 2026")
+
+        assert note.startswith("Nothing free")
+        assert "Tuesday 4 August 2026" in note
+        assert note.endswith(":")
+
+    def test_a_window_that_was_honoured_and_answered_says_nothing(self):
+        """The negative control, and the one that keeps the other two
+        meaningful: a constraint that worked must not be apologised for."""
+        assert window_note(unreadable=False, empty_label=None) == ""
+
+    def test_the_unreadable_note_wins_over_an_empty_one(self):
+        """They cannot both be true — an unread constraint was never searched
+        with — and if the state ever says both, the honest half is the one
+        that admits the failure rather than the one that reports a result."""
+        note = window_note(unreadable=True, empty_label="Tuesday 4 August 2026")
+
+        assert note.startswith("I couldn't read")
 
 
 class TestSayingWhyATimeIsMissing:

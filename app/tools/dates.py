@@ -52,6 +52,25 @@ PARTS_OF_DAY = {
 
 _MONTH_NAMES = "|".join(MONTHS)
 
+#: Weekday names as patients write them: plural ("Tuesdays"), possessive
+#: ("Tuesday's"), abbreviated ("tue", "tues"). Longest-first so "tuesday" wins
+#: the alternation ahead of "tue" and the suffix group has something to match.
+#:
+#: Exported because ``workflow/targets.py`` reads weekday cues out of a
+#: patient's message too, and two regexes over one vocabulary is how the two
+#: drift: a plural this module learns and that one does not is a reschedule
+#: that stops recognising the day it was told.
+WEEKDAY_PATTERN = re.compile(
+    rf"\b({'|'.join(sorted(WEEKDAYS, key=len, reverse=True))})(?:'s|’s|s)?\b",
+    re.IGNORECASE,
+)
+
+#: How far an open-ended window runs. "After the 6th" names no end and a search
+#: needs one; two weeks matches the horizon the seed lays slots across, so the
+#: answer covers everything actually bookable rather than trailing into empty
+#: calendar.
+OPEN_ENDED_DAYS = 13
+
 
 def _result(
     *,
@@ -143,6 +162,69 @@ def _explicit_date(text: str, today: date) -> date | None:
     return None
 
 
+#: "after the 6th", "from Tuesday", "before August 10th". The verb decides
+#: whether the named day is included, and *after* excluding it is the whole
+#: point: live, "after August 6th" answered with August 6th.
+_BOUNDARY = re.compile(r"\b(after|from|starting|before|until|till|by)\b")
+
+
+def _bounded_by_a_date(text: str, today: date) -> tuple[date, date, str] | None:
+    """A window opened or closed by a named day, or ``None``.
+
+    Only fires when a boundary word sits beside something this module can
+    already resolve to a day, so it adds a *direction* to the existing
+    vocabulary rather than a second parser. An open end runs to
+    :data:`OPEN_ENDED_DAYS`, because a search needs one and the bookable
+    horizon is the honest place to stop.
+    """
+    boundary = _BOUNDARY.search(text)
+    if boundary is None:
+        return None
+
+    anchor = _explicit_date(text, today)
+    if anchor is None:
+        named = WEEKDAY_PATTERN.search(text)
+        if named is None:
+            return None
+        index = WEEKDAYS[named.group(1).lower()]
+        anchor = today + timedelta(days=(index - today.weekday()) % 7 or 7)
+
+    word = boundary.group(1)
+    if word in ("after",):
+        start = anchor + timedelta(days=1)
+        return start, start + timedelta(days=OPEN_ENDED_DAYS), "range"
+    if word in ("from", "starting"):
+        return anchor, anchor + timedelta(days=OPEN_ENDED_DAYS), "range"
+    if word in ("before",):
+        return today, anchor - timedelta(days=1), "range"
+    # "until"/"till"/"by" include the day named.
+    return today, anchor, "range"
+
+
+def _weekday_in_a_week(text: str, today: date) -> date | None:
+    """"Tuesday next week", "Thursday the week after next" — or ``None``.
+
+    Both halves of these phrases match branches of their own, and neither
+    branch is right on its own: the weekday loop answers with *this* week's
+    Tuesday, and the period branch answers with the whole week. The compound
+    has to be read before either.
+    """
+    named = WEEKDAY_PATTERN.search(text)
+    if named is None:
+        return None
+    index = WEEKDAYS[named.group(1).lower()]
+
+    if re.search(r"\bweek after next\b", text):
+        weeks = 2
+    elif re.search(r"\bnext week\b", text):
+        weeks = 1
+    else:
+        return None
+
+    monday = today + timedelta(days=(0 - today.weekday()) % 7 or 7)
+    return monday + timedelta(days=index, weeks=weeks - 1)
+
+
 def resolve_date(phrase: str, *, today: date | None = None) -> dict[str, Any]:
     """Resolve a natural-language date phrase to a concrete date or range.
 
@@ -159,6 +241,19 @@ def resolve_date(phrase: str, *, today: date | None = None) -> dict[str, Any]:
         return _result(phrase=original, resolved=False, reason="unparseable")
 
     text, part_of_day = _extract_part_of_day(text)
+
+    def unreadable(reason: str) -> dict[str, Any]:
+        """A refusal that still carries what *was* read.
+
+        The part of day is extracted before the date is parsed, so a phrase
+        whose date fails had its "afternoon" understood and thrown away with
+        it. Live: "more slots in the afternoon?" searched unfiltered and came
+        back with 10 and 11 AM. No dates are returned — that part of the
+        refusal is unchanged and is the whole point of the module.
+        """
+        return _result(
+            phrase=original, resolved=False, reason=reason, part_of_day=part_of_day
+        )
 
     def ok(start: date, end: date, kind: str) -> dict[str, Any]:
         if end < today:
@@ -195,7 +290,35 @@ def resolve_date(phrase: str, *, today: date | None = None) -> dict[str, Any]:
         start = today + timedelta(weeks=weeks)
         return ok(start, start + timedelta(days=6), "range")
 
+    # --- compounds -------------------------------------------------------
+    # "Tuesday next week" names a day *and* the week it falls in, and both
+    # halves match branches below — the weekday loop would answer with this
+    # week's Tuesday and "next week" with the whole week. Neither is what was
+    # asked, and the whole-week answer is the one that looks right.
+    compound = _weekday_in_a_week(text, today)
+    if compound is not None:
+        return ok(compound, compound, "exact")
+
     # --- named periods ---------------------------------------------------
+    # "The week after next" is checked ahead of "next week", which it contains.
+    if re.search(r"\bweek after next\b", text):
+        next_monday = today + timedelta(days=7 - today.weekday())
+        start = next_monday + timedelta(days=7)
+        return ok(start, start + timedelta(days=6), "range")
+
+    if re.search(r"\bweekends?\b", text):
+        # The coming Saturday and Sunday. Saturday is 5.
+        ahead = (5 - today.weekday()) % 7
+        saturday = today + timedelta(days=ahead)
+        return ok(saturday, saturday + timedelta(days=1), "range")
+
+    if re.search(r"\bweekdays?\b", text):
+        # Monday to Friday of the working week the patient is asking about:
+        # this one while it still has days left, otherwise the next.
+        ahead = (0 - today.weekday()) % 7 if today.weekday() > 4 else 0
+        monday = today + timedelta(days=ahead)
+        return ok(max(monday, today), monday + timedelta(days=4), "range")
+
     if re.search(r"\bnext week\b", text):
         # Monday of the week after the one containing today, whatever day it is.
         next_monday = today + timedelta(days=7 - today.weekday())
@@ -212,24 +335,36 @@ def resolve_date(phrase: str, *, today: date | None = None) -> dict[str, Any]:
         last = calendar.monthrange(year, month)[1]
         return ok(date(year, month, 1), date(year, month, last), "range")
 
+    # --- boundaries ------------------------------------------------------
+    # After the periods and before the plain-date branch. Before, because
+    # "after august 6th" contains a date that branch reads as *the 6th itself*
+    # — live, that answered a question excluding the 6th by showing it. After,
+    # because "week after next" contains the word "after" and this branch would
+    # otherwise read it as a boundary on the Tuesday beside it.
+    boundary = _bounded_by_a_date(text, today)
+    if boundary is not None:
+        start, end, kind = boundary
+        return ok(start, end, kind)
+
     # --- explicit calendar dates ----------------------------------------
     explicit = _explicit_date(text, today)
     if explicit is not None:
         return ok(explicit, explicit, "exact")
     if re.search(r"\b\d{4}-\d{1,2}-\d{1,2}\b", text):
         # Looked like a date and was not one (e.g. 30 February).
-        return _result(phrase=original, resolved=False, reason="unparseable")
+        return unreadable("unparseable")
 
     # --- weekday names ---------------------------------------------------
-    for name, index in WEEKDAYS.items():
-        if not re.search(rf"\b{name}\b", text):
-            continue
+    named = WEEKDAY_PATTERN.search(text)
+    if named:
+        name = named.group(1).lower()
+        index = WEEKDAYS[name]
         # A bare weekday means the next one coming, never today: today's slots
         # are already partly gone.
         ahead = (index - today.weekday()) % 7 or 7
-        if re.search(rf"\bnext\s+{name}\b", text):
+        if re.search(rf"\bnext\s+{name}", text):
             ahead += 7
         target = today + timedelta(days=ahead)
         return ok(target, target, "exact")
 
-    return _result(phrase=original, resolved=False, reason="unparseable")
+    return unreadable("unparseable")

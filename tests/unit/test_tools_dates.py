@@ -136,6 +136,90 @@ class TestPartOfDay:
         assert resolve_date("next week")["part_of_day"] is None
 
 
+class TestTheVocabularyAPatientActuallyWrites:
+    """Round 9, item 5a — the forms that resolved to nothing.
+
+    Live, "Thursday next week or after August 6th" parsed to *nothing* and the
+    reply quietly showed the earliest three slots — Monday times, for a
+    question that named neither Monday nor "earliest". A constraint that is
+    dropped in silence is worse than one that is refused out loud, because the
+    patient reads the answer as an answer.
+
+    A phrase table rather than prose tests: every form below is one a patient
+    wrote or would obviously write, and the expected window is the whole
+    assertion. Clock frozen to Monday 3 August 2026.
+    """
+
+    @pytest.mark.parametrize(
+        "phrase,start,end",
+        [
+            # Plurals and possessives. "Tuesdays" fails `\btuesday\b` — the
+            # trailing "s" is a word character, so the boundary never matches.
+            ("tuesday", "2026-08-04", "2026-08-04"),
+            ("tuesdays", "2026-08-04", "2026-08-04"),
+            ("tuesday's", "2026-08-04", "2026-08-04"),
+            ("tue", "2026-08-04", "2026-08-04"),
+            ("tues", "2026-08-04", "2026-08-04"),
+            ("thurs", "2026-08-06", "2026-08-06"),
+            # Periods.
+            ("this week", "2026-08-03", "2026-08-09"),
+            ("next week", "2026-08-10", "2026-08-16"),
+            ("the week after next", "2026-08-17", "2026-08-23"),
+            ("week after next", "2026-08-17", "2026-08-23"),
+            ("the weekend", "2026-08-08", "2026-08-09"),
+            ("this weekend", "2026-08-08", "2026-08-09"),
+            # Compounds: the weekday names the day, the period names the week.
+            ("tuesday next week", "2026-08-11", "2026-08-11"),
+            ("thursday next week", "2026-08-13", "2026-08-13"),
+            ("tuesday the week after next", "2026-08-18", "2026-08-18"),
+            # Boundaries. "After the 6th" starts on the 7th — inclusive was the
+            # live bug, and it showed August 6 for a question that excluded it.
+            ("after august 6th", "2026-08-07", None),
+            ("after 6 august", "2026-08-07", None),
+            ("from august 6th", "2026-08-06", None),
+            ("before august 6th", "2026-08-03", "2026-08-05"),
+            ("until august 6th", "2026-08-03", "2026-08-06"),
+        ],
+    )
+    def test_the_phrase_resolves_to_the_window(self, phrase, start, end):
+        result = resolve_date(phrase)
+
+        assert result["resolved"] is True, result["reason"]
+        assert result["start"] == start
+        if end is not None:
+            assert result["end"] == end
+
+    def test_an_open_ended_window_still_ends_somewhere(self):
+        """"After the 6th" has no end in the sentence, and a search needs one.
+        It runs to the end of the bookable horizon rather than forever."""
+        result = resolve_date("after august 6th")
+
+        assert result["end"] is not None
+        assert result["end"] > result["start"]
+
+    def test_a_part_of_day_survives_an_unreadable_date(self):
+        """The live "more slots in the afternoon?" bug, and it is a *shape*
+        bug rather than a vocabulary one: the part of day was extracted
+        correctly and then thrown away with the failed date, so the search ran
+        unfiltered and answered an afternoon question with 10 and 11 AM.
+        """
+        result = resolve_date("more slots in the afternoon?")
+
+        assert result["resolved"] is False
+        assert result["part_of_day"] == "afternoon"
+
+    def test_a_part_of_day_rides_with_a_compound(self):
+        result = resolve_date("tuesday next week in the afternoon")
+
+        assert result["start"] == "2026-08-11"
+        assert result["part_of_day"] == "afternoon"
+
+    def test_a_weekday_that_is_today_means_next_week_not_today(self):
+        """Unchanged by any of the above: today's slots are already partly
+        gone, so a bare weekday is always the next one coming."""
+        assert resolve_date("monday")["start"] == "2026-08-10"
+
+
 class TestRefusals:
     def test_a_past_date_is_refused(self):
         result = resolve_date("2026-07-01")
