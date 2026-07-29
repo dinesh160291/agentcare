@@ -36,6 +36,7 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
+from app.tools.dates import resolve_date
 from app.trace import TraceWriter
 
 SEEDED_APPOINTMENT_ID = 1
@@ -504,6 +505,88 @@ class TestAProposedSearchWindowIsDisposedByCode:
         )
 
         assert belt.patient_id == ASHA_PROFILE_ID
+
+    def test_a_withheld_time_is_still_explained(self, seeded_db, asha, holding):
+        """Found by the live sweep, not by this suite — the round's one
+        regression, and it was mine.
+
+        `gpt-4o-mini` answered "how about 9am next monday?" by calling this
+        tool rather than `list_other_slots`. The search withheld the 9:00 that
+        the patient's own Cardiology appointment occupied, exactly as it
+        should; the reply then listed other times and said nothing about it,
+        because this path did not compute the clash note. Round 8's guard was
+        intact and simply not on the road the turn took.
+
+        A second route to one answer owes everything the first one produced.
+        """
+        seeded = seeded_db.get(Appointment, SEEDED_APPOINTMENT_ID)
+        when = seeded.slot.start_time
+        belt = belt_for(seeded_db, asha, holding)
+        hour = when.hour % 12 or 12
+        belt.message = f"how about {hour}{'am' if when.hour < 12 else 'pm'}?"
+
+        belt._propose_search_window(
+            when.date().isoformat(), when.date().isoformat()
+        )
+
+        assert "clashes with your Cardiology appointment" in belt.proposals.clash_note
+
+    def test_the_patients_own_words_outrank_the_models_window(
+        self, seeded_db, asha, holding
+    ):
+        """Found by the live sweep, and the sharper half of the same lesson.
+
+        "How about 9am next monday?" is a phrase layer (a) resolves exactly.
+        The live model called this tool anyway and proposed a window covering
+        *today* — accepted, because it was well-formed and in horizon — so the
+        search ran over the wrong week entirely.
+
+        A fallback that can be chosen *instead of* the thing it falls back from
+        is not a fallback. Where the patient's words resolve, they decide, and
+        the model's dates are discarded.
+        """
+        belt = belt_for(seeded_db, asha, holding)
+        belt.message = "how about 9am next monday?"
+        expected = resolve_date("next monday", today=clock.today())
+
+        belt._propose_search_window("2026-08-03", "2026-08-03")
+
+        offered = {slot["start"][:10] for slot in belt.proposals.offered_slots}
+        assert offered, "the deterministic window returned nothing to check"
+        assert offered == {expected["start"]}
+
+    def test_the_override_is_traced(self, seeded_db, asha, holding):
+        belt = belt_for(seeded_db, asha, holding)
+        belt.message = "how about 9am next monday?"
+        belt._propose_search_window("2026-08-03", "2026-08-03")
+        seeded_db.flush()
+
+        overrides = [
+            event.payload
+            for event in seeded_db.query(TraceEvent)
+            .filter(TraceEvent.event_type == TraceEventType.VALIDATION)
+            .all()
+            if event.payload.get("what") == "search_window"
+            and event.payload.get("accepted") is False
+        ]
+        assert any(
+            "own words" in (o.get("detail") or {}).get("problem", "") for o in overrides
+        )
+
+    def test_the_model_still_decides_when_the_words_say_nothing(
+        self, seeded_db, asha, holding
+    ):
+        """The negative control that keeps layer (b) alive: with no readable
+        phrase, the model's window is what there is."""
+        belt = belt_for(seeded_db, asha, holding)
+        belt.message = "what else have you got?"
+        today = clock.today()
+
+        result = belt._propose_search_window(
+            today.isoformat(), (today + timedelta(days=6)).isoformat()
+        )
+
+        assert result["accepted"] is True
 
     def test_it_is_offered_only_while_a_proposal_stands(self, seeded_db, asha, run):
         """Handed out where the timing questions land, and nowhere else."""

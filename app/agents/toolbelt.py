@@ -526,6 +526,67 @@ class Toolbelt:
             tools.append(list_other_slots)
         return tools
 
+    def _answer_with_slots(
+        self,
+        found: dict,
+        *,
+        department_id: int,
+        empty_label: str | None,
+        unreadable: bool,
+    ) -> list[dict]:
+        """The bookkeeping every path that answers with times owes.
+
+        There are two such paths — the patient's own words through
+        :meth:`_list_other_slots`, and a window the model proposed — and the
+        second one arrived without all of this. Live, the model chose
+        ``propose_search_window`` for "how about 9am next monday?", the search
+        correctly withheld the 9:00 the patient's own Cardiology appointment
+        occupied, and the reply listed other times **without the sentence
+        saying why**. Round 8's guard was intact; it simply was not on the path
+        the turn took.
+
+        So the facts a shown list carries live here once: what was offered,
+        that a search ran, why a named time is missing, and what to say when
+        the window came back empty. A second route to one answer has to
+        produce everything the first one did, or it is a downgrade wearing a
+        feature's name.
+        """
+        run = self.run
+        held = run.proposed_slot_id if run is not None else None
+        others = [
+            slot
+            for slot in found.get("slots") or []
+            if slot.get("slot_id") != held
+        ]
+
+        self.proposals.window_unreadable = unreadable
+        self.proposals.window_empty_label = None
+        if not others and empty_label:
+            # The window was real and there is nothing in it. Search again
+            # without it, so the sentence naming the empty window has something
+            # true to offer underneath.
+            widest = find_available_slots(
+                self.session,
+                department_id=department_id,
+                free_for_patient=self.patient_id,
+            )
+            others = [
+                slot
+                for slot in widest.get("slots") or []
+                if slot.get("slot_id") != held
+            ]
+            self.proposals.window_empty_label = empty_label
+
+        self.proposals.offered_slots = others
+        self.proposals.answered_with_slots = True
+        self.proposals.searched_slots = True
+        # Read from the patient's words against the rows the search actually
+        # removed, so the sentence can only be said about a real clash.
+        self.proposals.clash_note = clash_note(
+            found.get("withheld_for_patient") or [], self.message
+        )
+        return others
+
     def _propose_search_window(
         self, start: str, end: str, part_of_day: str = ""
     ) -> dict:
@@ -550,6 +611,30 @@ class Toolbelt:
         department_id = self._department_id()
         if department_id is None:
             return {"accepted": False, "problem": "No department has been decided yet."}
+
+        # Layer (a) outranks layer (b) — always, and this is where that is
+        # enforced rather than merely intended. The tool exists for phrases the
+        # vocabulary cannot read, but binding it at this state lets the model
+        # reach for it whenever it likes, and live it did: "how about 9am next
+        # monday?" came back as a window covering *today*. "Next monday" is
+        # squarely in layer (a)'s vocabulary, so the search ran over the wrong
+        # week, the 9:00 the patient's own Cardiology appointment occupies was
+        # never considered, and a time guaranteed to clash was offered as free.
+        #
+        # A fallback that can be chosen instead of the thing it falls back from
+        # is not a fallback. Where the patient's own words resolve, they decide.
+        own = resolve_date(self.message, today=clock.today()) if self.message else {}
+        if own.get("resolved"):
+            self.writer.validation(
+                "search_window",
+                accepted=False,
+                detail={
+                    "proposed": {"start": start, "end": end},
+                    "applied": {"start": own.get("start"), "end": own.get("end")},
+                    "problem": "the patient's own words already name a window",
+                },
+            )
+            return self._list_other_slots(self.message)
 
         first, last = self._as_date(start), self._as_date(end)
         today = clock.today()
@@ -593,30 +678,13 @@ class Toolbelt:
             part_of_day=part_of_day or None,
             free_for_patient=self.patient_id,
         )
-        others = [
-            slot
-            for slot in found.get("slots") or []
-            if slot.get("slot_id") != run.proposed_slot_id
-        ]
-        self.proposals.offered_slots = others
-        self.proposals.answered_with_slots = True
-        self.proposals.searched_slots = True
         # A window was read after all, so layer (c) has nothing to admit.
-        self.proposals.window_unreadable = False
-        self.proposals.window_empty_label = (
-            None if others else _window_label(first, last)
+        self._answer_with_slots(
+            found,
+            department_id=department_id,
+            empty_label=_window_label(first, last),
+            unreadable=False,
         )
-        if not others:
-            widest = find_available_slots(
-                self.session,
-                department_id=department_id,
-                free_for_patient=self.patient_id,
-            )
-            self.proposals.offered_slots = [
-                slot
-                for slot in widest.get("slots") or []
-                if slot.get("slot_id") != run.proposed_slot_id
-            ]
         return self._offerable(found) | {"accepted": True}
 
     def answer_with_other_slots(self, phrase: str = "") -> dict:
@@ -793,50 +861,21 @@ class Toolbelt:
             part_of_day=window.get("part_of_day") or None,
             free_for_patient=self.patient_id,
         )
-        others = [
-            slot
-            for slot in found.get("slots") or []
-            if slot.get("slot_id") != run.proposed_slot_id
-        ]
-
         # A constraint the patient stated must never be dropped in silence. It
         # can fail in two different ways and they are not interchangeable: the
         # phrase was unreadable (this system's failure, and no search carried
         # it), or it was honoured and the schedule is empty (a fact about the
         # schedule). Live, the first was answered with the earliest three slots
         # and nothing said at all.
-        self.proposals.window_unreadable = bool(
-            phrase and not window.get("resolved") and names_timing(phrase)
+        others = self._answer_with_slots(
+            found,
+            department_id=department_id,
+            empty_label=window.get("label") if window.get("resolved") else None,
+            unreadable=bool(
+                phrase and not window.get("resolved") and names_timing(phrase)
+            ),
         )
-        self.proposals.window_empty_label = None
-        if window.get("resolved") and not others:
-            # The window was real and there is nothing in it. Search again
-            # without it, so the sentence naming the empty window has something
-            # true to offer underneath.
-            widest = find_available_slots(
-                self.session,
-                department_id=department_id,
-                part_of_day=window.get("part_of_day") or None,
-                free_for_patient=self.patient_id,
-            )
-            others = [
-                slot
-                for slot in widest.get("slots") or []
-                if slot.get("slot_id") != run.proposed_slot_id
-            ]
-            self.proposals.window_empty_label = window.get("label") or None
-
-        self.proposals.offered_slots = others
-        self.proposals.answered_with_slots = True
-        self.proposals.searched_slots = True
         self.proposals.slot_window = window if window.get("resolved") else None
-        # A time this patient asked for that the search withheld for their own
-        # diary. Read from the patient's words, which the toolbelt already
-        # holds, against the rows the search actually removed — so the sentence
-        # can only be said about a slot that exists and a clash that is real.
-        self.proposals.clash_note = clash_note(
-            found.get("withheld_for_patient") or [], self.message
-        )
         # Nothing is recorded as offered here, and that is the correction. This
         # used to record the whole payload on the reasoning that a time "below
         # the fold" is still answerable — but a search returns up to twenty
