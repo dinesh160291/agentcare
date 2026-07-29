@@ -49,18 +49,28 @@ def _serialise_slot(slot: AppointmentSlot, doctor: Doctor, department: Departmen
     }
 
 
-def _patient_busy(session: Session, patient_id: int) -> list[tuple[datetime, datetime]]:
-    """When this patient is already committed — their live appointments' times."""
+def _patient_busy(
+    session: Session, patient_id: int
+) -> list[tuple[datetime, datetime, str]]:
+    """When this patient is already committed, and with whom.
+
+    The department name rides along because withholding a time silently reads
+    as ignoring the question: "how about 11am?" answered with 9, 10 and 2
+    tells the patient nothing about where their 11 went.
+    """
     rows = (
-        session.query(AppointmentSlot.start_time, AppointmentSlot.end_time)
+        session.query(
+            AppointmentSlot.start_time, AppointmentSlot.end_time, Department.name
+        )
         .join(Appointment, Appointment.slot_id == AppointmentSlot.id)
+        .join(Department, Department.id == Appointment.department_id)
         .filter(
             Appointment.patient_id == patient_id,
             Appointment.status.in_((AppointmentStatus.PENDING, AppointmentStatus.CONFIRMED)),
         )
         .all()
     )
-    return [(start, end) for start, end in rows]
+    return [(start, end, name) for start, end, name in rows]
 
 
 def find_available_slots(
@@ -91,6 +101,11 @@ def find_available_slots(
     already had a Dermatology appointment at Monday 9:00 AM, so the Confirm was
     guaranteed to bounce before it was ever offered. The commit-time check
     stays exactly where it is; this only stops the engine setting it up to fail.
+
+    Those drops are returned in ``withheld_for_patient`` rather than only
+    subtracted. A patient who asks "how about 11am?" and gets 9, 10 and 2 back
+    with no explanation has been answered as though they said nothing; the
+    caller needs the times and the clashing department to say otherwise.
     """
     query = (
         session.query(AppointmentSlot, Doctor, Department)
@@ -124,16 +139,32 @@ def find_available_slots(
         first_hour, last_hour = window
         rows = [row for row in rows if first_hour <= row[0].start_time.hour < last_hour]
 
+    # What was withheld, not merely how many: the caller has to be able to say
+    # *why* a time the patient asked for is not on the list it got back.
+    withheld: list[dict[str, Any]] = []
     if free_for_patient is not None:
         busy = _patient_busy(session, free_for_patient)
-        rows = [
-            row
-            for row in rows
-            if not any(
-                row[0].start_time < finish and start_at < row[0].end_time
-                for start_at, finish in busy
+        keep = []
+        for row in rows:
+            clash = next(
+                (
+                    name
+                    for start_at, finish, name in busy
+                    if row[0].start_time < finish and start_at < row[0].end_time
+                ),
+                None,
             )
-        ]
+            if clash is None:
+                keep.append(row)
+            else:
+                withheld.append(
+                    {
+                        "slot_id": row[0].id,
+                        "start": row[0].start_time.isoformat(),
+                        "department_name": clash,
+                    }
+                )
+        rows = keep
 
     total = len(rows)
     limited = rows[: max(0, limit)] if limit is not None else rows
@@ -146,6 +177,7 @@ def find_available_slots(
         "part_of_day": part_of_day,
         "total_matching": total,
         "slots": [_serialise_slot(slot, doctor, dept) for slot, doctor, dept in limited],
+        "withheld_for_patient": withheld,
     }
 
 

@@ -121,12 +121,19 @@ class MappingOutcome:
     ``spawns_new_run`` is the orchestrator's cue: the mapping owns the fate of
     the *existing* run, and creating its replacement needs the plan for the new
     message, which the mapping never sees.
+
+    ``overruled`` says code disagreed with the model about this message — the
+    class was adjusted, or the consequence the class maps to was not the one
+    applied. It is the same set of facts the ``validation`` events above record;
+    what it adds is a single thing for the reply to key on, so that a verdict
+    code rejected cannot ship the prose the model wrote to go with it.
     """
 
     consequence: Consequence
     message_class: MessageClass
     spawns_new_run: bool
     run_id: int
+    overruled: bool = False
 
 
 #: Widest first. Every appointment verb outranks the supporting steps, because
@@ -867,6 +874,11 @@ def apply_consequence(
         message_class=message_class,
         spawns_new_run=consequence is Consequence.SUPERSEDE,
         run_id=run.id,
+        # Either half counts: `validate_class` may have changed the class before
+        # this function saw it, and every downgrade above changes what the class
+        # is allowed to do. Both mean the same thing to a reply — the model's
+        # account of this message was not the one that was acted on.
+        overruled=verdict.adjusted or consequence is not CONSEQUENCE_FOR[message_class],
     )
 
 

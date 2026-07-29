@@ -45,6 +45,7 @@ from app.models import (
 from app.tools.appointments import LIVE_STATUSES
 from app.trace import TraceWriter
 from app.workflow.replies import (
+    clash_note,
     listed_appointment_ids,
     offered_slot_ids,
     record_offered,
@@ -128,6 +129,11 @@ class TurnProposals:
     #: This turn moved the proposal to a different slot the patient had been
     #: shown. Never a commit — the run is still waiting on an exact answer.
     reproposed: bool = False
+    #: Why a time the patient asked for is not in the list they are about to be
+    #: shown: it is one of their own appointments. "" when they named no time,
+    #: or when the time they named was simply not free — an absence and a clash
+    #: are different facts and only one of them is safe to assert.
+    clash_note: str = ""
     rejections: list[str] = field(default_factory=list)
 
 
@@ -149,12 +155,13 @@ class Toolbelt:
         self.patient_id = patient_id
         self.writer = writer
         self.run = run
-        #: What the patient said this turn. Read by exactly one thing —
-        #: :meth:`_settle_target` — and read there because "which appointment"
-        #: is a question the words answer and the model was answering it
-        #: unchecked. Not a transcript and not a substitute for the typed task:
-        #: the context contract is about what a *specialist* is handed, and this
-        #: never leaves the toolbelt.
+        #: What the patient said this turn. Read by two things —
+        #: :meth:`_settle_target`, because "which appointment" is a question the
+        #: words answer and the model was answering it unchecked, and
+        #: :meth:`_list_other_slots`, because "which time did you ask for" is
+        #: the other one. Not a transcript and not a substitute for the typed
+        #: task: the context contract is about what a *specialist* is handed,
+        #: and this never leaves the toolbelt.
         self.message = message
         self.proposals = TurnProposals()
 
@@ -203,6 +210,10 @@ class Toolbelt:
 
         for candidate_id in (
             run.proposed_appointment_id,
+            # The one the patient picked off the numbered list. Settled by
+            # their answer, not by a guess — and it has to be readable here or
+            # a chosen reschedule has no department to search in.
+            (run.state or {}).get("chosen_appointment_id"),
             (run.state or {}).get("appointment_id"),
         ):
             if candidate_id is None:
@@ -237,11 +248,11 @@ class Toolbelt:
         department, which reference code are facts about rows.
 
         Two things are deliberately left alone. Where a numbered choice has
-        already been shown, ``listed_appointment_ids`` is the authority and this
-        stands aside — the patient answering "2" named no weekday and would
-        otherwise read as no cue at all. And where the patient has one live
-        appointment, :func:`resolve_target` says ``only_one`` and nothing is
-        overridden, because there was never a choice to get wrong.
+        been shown but *not yet answered*, ``listed_appointment_ids`` is the
+        authority and this stands aside — the patient answering "2" named no
+        weekday and would otherwise read as no cue at all. And where the patient
+        has one live appointment, :func:`resolve_target` says ``only_one`` and
+        nothing is overridden, because there was never a choice to get wrong.
 
         Refusing rather than guessing is what makes the ambiguous case safe: no
         proposal is recorded, so the orchestrator's own
@@ -250,7 +261,27 @@ class Toolbelt:
         above.
         """
         run = self.run
-        if run is None or listed_appointment_ids(run):
+        if run is None:
+            return appointment_id, None
+
+        # The patient answered the numbered list, and code read the answer. That
+        # is a decision, not a cue, so it outranks anything the model proposes —
+        # including a proposal for the *other* appointment on the same list,
+        # which is exactly what the listed-ids check below would wave through.
+        chosen = (run.state or {}).get("chosen_appointment_id")
+        if chosen is not None:
+            self.writer.validation(
+                "appointment_target",
+                accepted=int(chosen) == appointment_id,
+                detail={
+                    "proposed": appointment_id,
+                    "resolved": int(chosen),
+                    "reason": "chosen",
+                },
+            )
+            return int(chosen), None
+
+        if listed_appointment_ids(run):
             return appointment_id, None
 
         live = list_patient_appointments(
@@ -463,8 +494,99 @@ class Toolbelt:
         run's offered set, and the slot must still be free at the moment it is
         held. Two paths to a proposal with two sets of rules would be one path
         with rules and one without.
+
+        **A run holding a reschedule holds it through this.** The slot moves;
+        the verb and the appointment do not. ``_propose_appointment`` sets
+        ``proposed_action`` to ``BOOK``, so sending a reschedule's re-hold
+        through it would silently convert one kind of proposal into another —
+        which is why the selection reader used to stand aside here entirely.
+        Standing aside cost more than it saved: live, three alternatives were
+        rendered under a held reschedule, the patient answered "3", the reader
+        matched it and was suppressed, and the turn fell to the classifier,
+        which called it a withdrawal. Two turns later the patient re-stated the
+        time in words and the run was superseded into a routed staff review.
+        So the narrow rule replaces the wide one: same verb, same appointment,
+        new time.
         """
+        run = self.run
+        if (
+            run is not None
+            and run.proposed_action is ProposedAction.RESCHEDULE
+            and run.proposed_appointment_id
+        ):
+            return self._rehold_for_reschedule(slot_id)
         return self._propose_another_slot(slot_id)
+
+    def _rehold_for_reschedule(self, slot_id: int) -> dict:
+        """Move a held reschedule to another time the patient has been shown."""
+        run = self.run
+        refusal = self._refuse_unoffered(slot_id)
+        if refusal is not None:
+            return refusal
+
+        result = self._propose_change(
+            ProposedAction.RESCHEDULE,
+            appointment_id=run.proposed_appointment_id,
+            slot_id=slot_id,
+        )
+        if not result.get("accepted"):
+            # Gone since it was shown, exactly as in `_propose_another_slot` —
+            # and answered the same way, with something to choose from.
+            return {**result, **self._list_other_slots()}
+
+        self.proposals.reproposed = True
+        return result
+
+    def _refuse_unoffered(self, slot_id: int) -> dict | None:
+        """``None`` if this run has shown the patient this slot; a refusal if not.
+
+        One check with two callers, because the two ways a proposal can move —
+        the model's ``propose_another_slot`` and the reader's re-hold — must
+        answer "was it offered?" identically. A model naming an id it recalls
+        from its context window is indistinguishable from one inventing an id;
+        both arrive as an integer, so the only safe source is a tool result.
+        The rejection is written to the trace: a refused invention leaves no
+        other mark.
+        """
+        run = self.run
+        if run is None:
+            return {"accepted": False, "problem": "There is no active request."}
+
+        if not was_offered(run, slot_id):
+            self.writer.validation(
+                "reproposal_slot_offered",
+                accepted=False,
+                detail={
+                    "slot_id": slot_id,
+                    "offered": offered_slot_ids(run),
+                    "problem": "that slot was never shown to this patient",
+                },
+            )
+            return {
+                "accepted": False,
+                "problem": (
+                    "You may only offer a time this patient has already been "
+                    "shown. Ask for the times first, and use an id from that list."
+                ),
+            }
+
+        self.writer.validation(
+            "reproposal_slot_offered", accepted=True, detail={"slot_id": slot_id}
+        )
+        return None
+
+    def propose_cancellation_for(self, appointment_id: int) -> dict:
+        """Propose cancelling the appointment the patient picked from the list.
+
+        The code-driven twin of ``propose_cancellation``, and the same function
+        underneath for the same reason ``hold_offered_slot`` is: ownership,
+        liveness and the listed-choice check are the rules that make a
+        cancellation proposal safe, and a second door into one without them
+        would be a door with no rules.
+        """
+        return self._propose_change(
+            ProposedAction.CANCEL, appointment_id=appointment_id, slot_id=None
+        )
 
     def _list_other_slots(self, phrase: str = "") -> dict:
         """Free times other than the one being held. Read-only, always.
@@ -530,6 +652,13 @@ class Toolbelt:
         self.proposals.answered_with_slots = True
         self.proposals.searched_slots = True
         self.proposals.slot_window = window if window.get("resolved") else None
+        # A time this patient asked for that the search withheld for their own
+        # diary. Read from the patient's words, which the toolbelt already
+        # holds, against the rows the search actually removed — so the sentence
+        # can only be said about a slot that exists and a clash that is real.
+        self.proposals.clash_note = clash_note(
+            found.get("withheld_for_patient") or [], self.message
+        )
         # Nothing is recorded as offered here, and that is the correction. This
         # used to record the whole payload on the reasoning that a time "below
         # the fold" is still answerable — but a search returns up to twenty
@@ -556,12 +685,8 @@ class Toolbelt:
 
         Two checks, and the order matters.
 
-        **Was it offered?** The id must be in the set this run built from
-        ``find_available_slots`` payloads. A model naming an id it recalls from
-        its context window is indistinguishable from one inventing an id —
-        both arrive as an integer — so the only safe source is a tool result.
-        The rejection is written to the trace, because a refused invention is
-        exactly the event a reviewer needs to see and it leaves no other mark.
+        **Was it offered?** :meth:`_refuse_unoffered`, shared with the
+        reschedule re-hold so both doors ask it the same way.
 
         **Is it still free?** A slot on the shown list can be taken between
         being shown and being chosen. This is the commit-time slot-taken
@@ -571,31 +696,9 @@ class Toolbelt:
         already held is left standing throughout — a failed swap must never
         leave the patient holding nothing.
         """
-        run = self.run
-        if run is None:
-            return {"accepted": False, "problem": "There is no active request."}
-
-        if not was_offered(run, slot_id):
-            self.writer.validation(
-                "reproposal_slot_offered",
-                accepted=False,
-                detail={
-                    "slot_id": slot_id,
-                    "offered": offered_slot_ids(run),
-                    "problem": "that slot was never shown to this patient",
-                },
-            )
-            return {
-                "accepted": False,
-                "problem": (
-                    "You may only offer a time this patient has already been "
-                    "shown. Ask for the times first, and use an id from that list."
-                ),
-            }
-
-        self.writer.validation(
-            "reproposal_slot_offered", accepted=True, detail={"slot_id": slot_id}
-        )
+        refusal = self._refuse_unoffered(slot_id)
+        if refusal is not None:
+            return refusal
 
         result = self._propose_appointment(slot_id)
         if not result.get("accepted"):

@@ -5,5 +5,6 @@
   "part_of_day": null,
   "slots": [],
   "start": "2027-09-07",
-  "total_matching": 0
+  "total_matching": 0,
+  "withheld_for_patient": []
 }

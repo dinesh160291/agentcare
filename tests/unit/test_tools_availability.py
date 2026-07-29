@@ -266,3 +266,36 @@ class TestATimeThePatientAlreadyHas:
             db, department_id=clashing.doctor.department_id, free_for_patient=1
         )
         assert clashing.id in {slot["slot_id"] for slot in found["slots"]}
+
+    def test_what_was_withheld_is_reported_back(self, db):
+        """Subtracting silently is how "how about 11am?" came back as 9, 10 and
+        2 with no mention of the patient's own 11:00. A caller cannot say why a
+        time is missing unless it is told which times went and to whom."""
+        taken = self._first_free(db, 1)
+        appointment = self._book(db, taken)
+        clashing = (
+            db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .filter(
+                AppointmentSlot.start_time == taken.start_time,
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                Doctor.department_id != 1,
+            )
+            .first()
+        )
+
+        found = find_available_slots(
+            db, department_id=clashing.doctor.department_id, free_for_patient=1
+        )
+
+        withheld = found["withheld_for_patient"]
+        assert clashing.id in {row["slot_id"] for row in withheld}
+        row = next(row for row in withheld if row["slot_id"] == clashing.id)
+        assert row["start"] == taken.start_time.isoformat()
+        assert row["department_name"] == appointment.department.name
+
+    def test_nothing_withheld_is_an_empty_list_not_a_missing_key(self, db):
+        """Callers read it unconditionally; a key that appears only sometimes
+        is the shape that silently reads as "nothing"."""
+        found = find_available_slots(db, department_id=1, free_for_patient=2)
+        assert found["withheld_for_patient"] == []

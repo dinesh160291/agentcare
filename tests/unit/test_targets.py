@@ -22,7 +22,7 @@ import pytest
 
 from datetime import date
 
-from app.workflow.targets import resolve_target
+from app.workflow.targets import read_choice, resolve_target
 
 #: Monday 3 August 2026, Dermatology. The one the live patient meant.
 MONDAY = {
@@ -150,3 +150,65 @@ class TestWhenThereIsNothingToChooseBetween:
         verdict = resolve("please reschedule my appointment", [])
         assert verdict.appointment_id is None
         assert verdict.reason == "no_cue"
+
+
+class TestTheAnswerToANumberedList:
+    """``read_choice`` — the other half, and the half that was missing.
+
+    ``render_appointment_choice`` numbers the rows *so that* "2" means
+    something, and then nothing in code read the answer. Live, a cancel run
+    asked "which one? 1..., 2...", the patient answered "2", and the run
+    **failed**: the Coordinator called the answer a new cancellation request,
+    the supersede was refused for naming no new subject, and the recovery
+    searched for slots on a run that had no department to search in.
+    """
+
+    LISTED = [2, 3]
+
+    def test_a_bare_number(self):
+        assert read_choice("2", listed=self.LISTED) == 3
+
+    def test_the_first_row(self):
+        assert read_choice("1", listed=self.LISTED) == 2
+
+    def test_an_announced_position(self):
+        assert read_choice("option 1", listed=self.LISTED) == 2
+
+    def test_an_ordinal_word(self):
+        assert read_choice("the second one please", listed=self.LISTED) == 3
+
+    def test_a_leading_position_with_an_instruction_after_it(self):
+        """The live sentence. A number at the front of a list answer is the
+        answer; the date at the back is what to do next."""
+        assert (
+            read_choice(
+                "1. Move it to after I finish my General Medicine appointment "
+                "which is on 6th August at 10am",
+                listed=self.LISTED,
+            )
+            == 2
+        )
+
+    def test_a_leading_position_in_brackets(self):
+        assert read_choice("2) and please make it quick", listed=self.LISTED) == 3
+
+    def test_a_number_outside_the_list_is_not_rounded_into_it(self):
+        """It goes to the model, which is where a message nobody anticipated
+        belongs — rounding 7 down to 2 would cancel an appointment on a
+        misreading."""
+        assert read_choice("7", listed=self.LISTED) is None
+
+    def test_a_time_at_the_front_is_not_a_position(self):
+        assert read_choice("1.30pm suits me", listed=self.LISTED) is None
+
+    def test_a_sentence_naming_no_position(self):
+        assert read_choice("cancel the dermatology one", listed=self.LISTED) is None
+
+    def test_a_withdrawal_is_never_a_choice(self):
+        """"Never mind" ends the request; read as a position it would propose
+        cancelling an appointment instead."""
+        assert read_choice("never mind, forget it", listed=self.LISTED) is None
+
+    def test_nothing_listed_means_nothing_to_answer(self):
+        """An empty list imposes nothing: "2" against no listing is a number."""
+        assert read_choice("2", listed=[]) is None

@@ -94,7 +94,7 @@ _ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3}
 _BARE_NUMBER = re.compile(r"^(\d{1,2})$")
 
 
-def _times_named(text: str) -> set[tuple[int, int]]:
+def times_named(text: str) -> set[tuple[int, int]]:
     """Every (hour, minute) this message states, as 24-hour pairs.
 
     The meridiem pattern runs first and its matches are *removed* before the
@@ -118,8 +118,14 @@ def _times_named(text: str) -> set[tuple[int, int]]:
     return found
 
 
-def _position_named(text: str) -> int | None:
-    """The 1-based list position this message states, if it states one."""
+def position_named(text: str) -> int | None:
+    """The 1-based list position this message states, if it states one.
+
+    Public because slots are not the only numbered list a patient answers:
+    :mod:`app.workflow.targets` reads the same three notations against the
+    appointment choice. What differs between the two readers is what a position
+    *means* and what may outrank it, never how "option 2" is spelled.
+    """
     message = text or ""
     match = _NUMBERED.search(message)
     if match:
@@ -162,13 +168,13 @@ def read_selection(
     if says_withdrawal(message):
         return None
 
-    times = _times_named(message)
+    times = times_named(message)
 
     # A position, but only when the message is not also naming a time — "book
     # the 2pm one" contains a 2 that is an hour and not a row number, and
-    # `_position_named` would happily read it as one.
+    # `position_named` would happily read it as one.
     if not times:
-        position = _position_named(message)
+        position = position_named(message)
         if position is not None and 1 <= position <= len(shortlist):
             return shortlist[position - 1].slot_id
         # A number outside the list is not a near miss to be rounded into
@@ -202,4 +208,4 @@ def read_selection(
     return None
 
 
-__all__ = ["Offer", "read_selection"]
+__all__ = ["Offer", "position_named", "read_selection", "times_named"]

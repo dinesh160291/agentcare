@@ -1335,3 +1335,62 @@ class TestReadingATimingPhrase:
         phrase ``resolve_date`` can turn into a window."""
         for weekday in WEEKDAYS:
             assert names_timing(f"how about {weekday}?"), weekday
+
+
+class TestSayingWhenCodeDisagreed:
+    """``overruled`` — one flag over the five places code changes the verdict.
+
+    It exists because a rejected classification used to keep its prose. The
+    model classified "3" — a patient choosing the third option — as a
+    withdrawal and wrote "it seems you've decided to withdraw your request
+    again" to match. The cue guard refused the class, so nothing was withdrawn,
+    and the sentence went out anyway, above a re-ask offering the very time
+    they had picked. The action was blocked; only the words got through.
+
+    The reply cannot ask five separate questions about what happened to the
+    verdict, so the mapping answers one: was the model's account of this
+    message the one that was acted on?
+    """
+
+    def test_an_ordinary_class_is_not_overruled(self, seeded_db, writer):
+        run = make_run(seeded_db, status=S.PENDING_CONFIRMATION)
+        outcome = apply_consequence(
+            seeded_db, run, _verdict(M.SIDE_QUESTION), writer=writer,
+            message="what else is free that week?",
+        )
+        assert outcome.overruled is False
+
+    def test_a_withdrawal_with_no_cue_is_overruled(self, seeded_db, writer):
+        run = make_run(seeded_db, status=S.PENDING_CONFIRMATION)
+        outcome = apply_consequence(
+            seeded_db, run, _verdict(M.WITHDRAWAL), writer=writer, message="3"
+        )
+        assert outcome.consequence is Consequence.FEED_RUN
+        assert outcome.overruled is True
+
+    def test_a_withdrawal_the_patient_actually_asked_for_is_not(self, seeded_db, writer):
+        """The narrowness that matters: a real withdrawal is applied as it
+        always was, and its reply is a template either way."""
+        run = make_run(seeded_db)
+        outcome = apply_consequence(
+            seeded_db, run, _verdict(M.WITHDRAWAL), writer=writer,
+            message="never mind, forget it",
+        )
+        assert outcome.consequence is Consequence.WITHDRAW
+        assert outcome.overruled is False
+
+    def test_an_adjusted_class_is_overruled_too(self, seeded_db, writer):
+        """``validate_class`` changes the class before this function sees it,
+        and the prose was written for the class the model proposed."""
+        from app.workflow.mapping import ClassVerdict
+
+        run = make_run(seeded_db, plan=("route", "book"))
+        adjusted = ClassVerdict(
+            message_class=M.CONFLICTING, proposed=M.COMPLEMENTARY, adjusted=True,
+            reason="same intent as the active run (book)",
+        )
+        outcome = apply_consequence(
+            seeded_db, run, adjusted, writer=writer,
+            message="actually make it an orthopedics appointment",
+        )
+        assert outcome.overruled is True

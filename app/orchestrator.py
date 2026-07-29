@@ -104,6 +104,7 @@ from app.workflow.replies import (
     render_receipt,
 )
 from app.workflow.state_machine import create_run, is_legal, transition
+from app.workflow.targets import read_choice
 
 # Code-authored replies. They are templates on purpose: a guard's output and a
 # failure notice are the system's most deterministic moments, and they must
@@ -218,7 +219,17 @@ def _task_for(step: PlanStep, run: WorkflowRun, *, message: str, extra: dict) ->
         # Which appointments the patient actually has. The specialist gets no
         # history, so "my appointment" means nothing to it without this — and
         # guessing the referent is the one thing story 20 forbids.
-        task["appointments"] = _live_appointments(run)
+        #
+        # Once the patient has answered the numbered list, that is the whole
+        # list: the choice has been made, and handing a specialist two rows to
+        # pick between is inviting it to make it again. `_settle_target` still
+        # stands under this, so a model that proposes the other id anyway is
+        # corrected rather than believed.
+        chosen = (run.state or {}).get("chosen_appointment_id")
+        rows = _live_appointments(run)
+        if chosen is not None:
+            rows = [row for row in rows if row["appointment_id"] == int(chosen)] or rows
+        task["appointments"] = rows
         # And, once a numbered list has been shown, which ids that list held —
         # in the order the patient saw. Without it "2" is a number the model
         # has to map against a listing it wrote itself, which is how a bare
@@ -388,13 +399,22 @@ def _settle_selection(
     on screen had no verdict it could be expressed as. The reader runs ahead of
     the exact tokens now, and the tokens are untouched underneath: "yes" and
     "no" name no time and no position, so they never reach it.
+
+    **And both verbs that hold a slot**, for the reason given at the guard
+    below: a reschedule's re-hold moves the time and nothing else.
     """
-    # Reschedule and cancel proposals are not this reader's business. The slot
-    # it would hold is a *booking* — `_propose_appointment` sets
-    # `proposed_action` to BOOK — so applying it to a run holding a reschedule
-    # would quietly convert one proposal into another kind. The same rule the
-    # toolset already uses to decide who gets `propose_another_slot`.
-    if run.proposed_action not in (None, ProposedAction.BOOK):
+    # A cancellation holds no slot, so a time cannot be an answer to it: the
+    # patient naming one is asking for something else and the model should
+    # hear it. A *reschedule* does hold one, and this used to stand aside from
+    # that too — because the hold went through `_propose_appointment`, which
+    # sets `proposed_action` to BOOK and would have converted one kind of
+    # proposal into another. The conversion is what was unsafe, not the
+    # reading: `hold_offered_slot` now moves a reschedule's slot as a
+    # reschedule, so the verb cannot flip and only the time moves. Standing
+    # aside cost a live run — "3", answering three alternatives rendered under
+    # a held reschedule, was matched by this reader, suppressed here, and then
+    # classified a withdrawal by the model.
+    if run.proposed_action is ProposedAction.CANCEL:
         return None
 
     # A message that is *only* a withdrawal phrase is the one thing that must
@@ -470,6 +490,145 @@ def _settle_selection(
         message_class=MessageClass.CONTINUATION,
         **base,
     )
+
+
+def _pending_change_verb(run: WorkflowRun) -> str | None:
+    """The reschedule or cancel this run is still waiting to make.
+
+    ``None`` once something has been proposed or committed: at that point the
+    run is waiting on an answer to the proposal, not on which appointment.
+    """
+    if run.proposed_action is not None or (run.state or {}).get("committed_action"):
+        return None
+    return next(
+        (step for step in (run.plan or []) if step in ("reschedule", "cancel")), None
+    )
+
+
+def _awaiting_choice(run: WorkflowRun) -> bool:
+    """Is this run about to ask which appointment, and has it not been told?
+
+    The question is a halt, not a failure — the same shape as a proposal
+    waiting on a "yes". What makes the distinction load-bearing is the re-plan
+    budget: see the call site.
+    """
+    if _pending_change_verb(run) is None:
+        return False
+    if (run.state or {}).get("chosen_appointment_id"):
+        return False
+    return len(_live_appointments(run)) > 1
+
+
+def _choice_reask(session: Session, run: WorkflowRun) -> str:
+    """The numbered list again, when this turn has nothing else to offer.
+
+    "" unless the run is a change run still waiting to learn which appointment
+    it is about — where there is a proposal, or a commit, or only one
+    appointment, ``render_appointment_choice`` has nothing to ask.
+    """
+    verb = _pending_change_verb(run)
+    if verb is None:
+        return ""
+    return render_appointment_choice(session, run, _live_appointments(run), verb=verb)
+
+
+async def _settle_choice(
+    session: Session,
+    *,
+    run: WorkflowRun,
+    belt: Toolbelt,
+    writer: TraceWriter,
+    callbacks: TurnCallbacks,
+    user: User,
+    message: str,
+    provider: str | None,
+    settings,
+    base: dict,
+) -> TurnResult | None:
+    """The answer to "which appointment?", read in code before any model call.
+
+    ``None`` when the message answers no list, which leaves the turn as it was.
+
+    ``render_appointment_choice`` numbers the patient's appointments and records
+    the ids *so that* "2" can mean something. Nothing read it. The number went
+    to the Coordinator like any other message, and live it came back classified
+    a fresh cancellation request — the supersede was refused for naming no new
+    subject, the refusal's recovery searched for slots on a run with no
+    department and could only be told so, the re-plan budget went, and the run
+    **failed**. The patient had answered the question they were asked.
+
+    So the same placement the slot reader has, and for the same reason: a
+    numbered answer to a list this run drew is not a judgement call, and a turn
+    that needs no model should not spend one on a decision it might get wrong.
+
+    What the answer does depends on the verb the run is already carrying, and
+    it can never introduce one: a **cancel** run proposes cancelling that
+    appointment — a proposal, so nothing is cancelled until the patient says the
+    word — and a **reschedule** run carries on into its own plan with the target
+    settled, which is where the slot search lives. Neither commits anything.
+    """
+    verb = _pending_change_verb(run)
+    listed = listed_appointment_ids(run)
+    if verb is None or not listed:
+        return None
+
+    appointment_id = read_choice(message, listed=listed)
+    writer.guard_verdict(
+        "appointment_selection",
+        passed=appointment_id is not None,
+        detail={"appointment_id": appointment_id, "listed": listed, "verb": verb},
+    )
+    if appointment_id is None:
+        # Out of range, or not a position at all. The model gets it, exactly as
+        # it did before this existed.
+        return None
+
+    def record() -> None:
+        """The choice, and the words that carried it, onto the run.
+
+        Written only once this turn is certainly ours. A path that recorded
+        first and then handed the turn back to the model would append the
+        message twice — once here and once when ``FEED_RUN`` appends it — and
+        the duplicate is read later by routing and by slot matching.
+        """
+        run.request_text = f"{run.request_text}\n{message}".strip()
+        state = dict(run.state or {})
+        state["chosen_appointment_id"] = appointment_id
+        run.state = state
+        session.flush()
+
+    if verb == "cancel":
+        proposed = belt.propose_cancellation_for(appointment_id)
+        if not proposed.get("accepted"):
+            # Gone, or not theirs. The refusal is already traced; handing the
+            # turn to the model is a better answer than a dead end.
+            return None
+        record()
+        return TurnResult(
+            reply=render_change_proposal(session, run),
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            message_class=MessageClass.CONTINUATION,
+            **base,
+        )
+
+    record()
+    result = await _execute_plan(
+        session,
+        run=run,
+        belt=belt,
+        writer=writer,
+        callbacks=callbacks,
+        user=user,
+        message=message,
+        fallback_reply="",
+        provider=provider,
+        settings=settings,
+        base=base,
+    )
+    result.message_class = MessageClass.CONTINUATION
+    return result
 
 
 def _settle_confirmation(
@@ -633,8 +792,17 @@ def _answer_while_holding(
         )
 
     if belt.proposals.answered_with_slots:
+        # A time the patient asked for that the search withheld because they
+        # are already busy at it. Without the sentence the list reads as an
+        # answer to a question nobody asked: "how about 11am?" came back as 9,
+        # 10 and 2, with the patient's own 11:00 in another department the only
+        # reason 11 was missing. Prefixed with a blank line between, because
+        # the chat renders CommonMark and a sentence one newline above a list
+        # is read as part of it.
+        note = belt.proposals.clash_note
+        times = render_alternatives(session, run, belt.proposals.offered_slots)
         return TurnResult(
-            reply=render_alternatives(session, run, belt.proposals.offered_slots),
+            reply=f"{note}\n\n{times}" if note else times,
             author=TraceAuthor.TEMPLATE,
             run_id=run.id,
             status=run.status.value,
@@ -1141,6 +1309,28 @@ async def _turn(
     # ahead of the tokens rather than after them. Nothing about the tokens
     # changes: "yes" and "no" name no time and no position, so they pass
     # straight through to the reader below.
+    # The appointment-side twin runs first, and only one of them can apply: a
+    # numbered list of appointments is outstanding exactly while no proposal
+    # exists, and a list of *times* only ever exists once one does. "2" against
+    # a choice of appointments and "2" against a choice of slots are the same
+    # word answering two different questions, and the run's own state is what
+    # says which was asked.
+    if run is not None and run.status is WorkflowStatus.IN_PROGRESS:
+        chosen = await _settle_choice(
+            session,
+            run=run,
+            belt=belt,
+            writer=writer,
+            callbacks=callbacks,
+            user=user,
+            message=message,
+            provider=provider,
+            settings=settings,
+            base=base,
+        )
+        if chosen is not None:
+            return chosen
+
     if run is not None and run.status in (
         WorkflowStatus.IN_PROGRESS,
         WorkflowStatus.PENDING_CONFIRMATION,
@@ -1354,6 +1544,30 @@ async def _continue_run(
         actor=user,
     )
 
+    # A classification code overruled takes its prose with it. The model wrote
+    # its sentence *believing* the verdict code has just rejected, so the two
+    # cannot both be right — and shipping the sentence anyway is how a patient
+    # who chose option 3 was told "it seems you've decided to withdraw your
+    # request again", above a re-ask offering them the time they had just
+    # picked. The action was blocked; only the words got through.
+    #
+    # One rule, one place, at the point where the reply is still the model's to
+    # lose. Everything downstream — the confirmation re-ask, the answer-and-stay
+    # branch, `_execute_plan`'s fallback — reads this same variable, and the
+    # specialists' own replies are untouched: they run *after* the correction
+    # and speak about the work, not about the class.
+    if outcome.overruled:
+        writer.guard_verdict(
+            "overruled_prose",
+            passed=False,
+            detail={
+                "class": outcome.message_class.value,
+                "applied": outcome.consequence.value,
+                "reply": coordinator_reply[:200],
+            },
+        )
+        coordinator_reply = ""
+
     # The scope gate runs inside the mapping too, not only at run creation.
     # An off-topic message that fell through to continuation would be appended
     # to the run's stored request text, contaminating what routing and slot
@@ -1478,6 +1692,27 @@ async def _continue_run(
         )
         if answered is not None:
             return answered
+
+        # Nothing came back, and on a run that has not decided which appointment
+        # it is about, nothing could: the search needs a department and the
+        # department lives on the appointment nobody has picked yet. Falling
+        # through from here re-dispatched the specialist, which asked "which
+        # one?" again, failed to propose, and spent the run's last re-plan —
+        # the patient's answer to a question, answered with "I couldn't complete
+        # this request". Ask again instead; a re-ask is not progress, but it is
+        # a turn the patient can act on, and the list it draws is the one the
+        # reader above can read.
+        if not belt.proposals.answered_with_slots:
+            choice = _choice_reask(session, run)
+            if choice:
+                return TurnResult(
+                    reply=choice,
+                    author=TraceAuthor.TEMPLATE,
+                    run_id=run.id,
+                    status=run.status.value,
+                    message_class=outcome.message_class,
+                    **base,
+                )
 
     # Text the exact tokens could not read, on a run that is still waiting.
     # This is the third and last step of the reading order, and the only one
@@ -1777,6 +2012,28 @@ async def _execute_plan(
         if halted:
             break
         if not completed:
+            # Asking which appointment is not getting nowhere. The step is
+            # waiting on the patient, exactly as a proposal waits on a "yes",
+            # and the turn ends either way — so charging it a re-plan spends
+            # the run's only retry on asking a legitimate question, and every
+            # change run that has to ask then has **none left for the answer**.
+            # Live: the patient answered "1. and please make it sometime the
+            # week after", the reader took the 1, and the specialist read "the
+            # week after" as unparseable and stopped without searching. One
+            # fumble, no budget, and the reply to a correct answer was "I'm
+            # sorry — I couldn't complete this request."
+            #
+            # The bound is unchanged where it bounds something: a re-plan loop
+            # is automated and this is not, because nothing continues until the
+            # patient sends another message.
+            if step in APPOINTMENT_VERBS and _awaiting_choice(run):
+                writer.guard_verdict(
+                    "awaiting_choice",
+                    passed=True,
+                    detail={"step": step.value, "run_id": run.id},
+                )
+                break
+
             # The step ran and got nowhere. Ask for a new plan once — the
             # budget is what stops "widen the search and try again" becoming
             # a loop of perfectly successful calls.
@@ -1868,6 +2125,11 @@ async def _execute_plan(
         change_step is not None
         and run.status is WorkflowStatus.IN_PROGRESS
         and run.proposed_action is None
+        # A patient who has already answered this must not be asked again. The
+        # answering turn only reaches here at all because asking no longer
+        # spends the re-plan above — before that it died of the budget first,
+        # which is why this line was briefly deleted for being unfalsifiable.
+        and not (run.state or {}).get("chosen_appointment_id")
         and not (run.state or {}).get("committed_action")
     ):
         choice = render_appointment_choice(

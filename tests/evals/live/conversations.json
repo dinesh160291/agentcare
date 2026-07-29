@@ -895,5 +895,107 @@
         "expect": {"reply_contains": ["One change at a time"]}
       }
     ]
+  },
+
+  {
+    "name": "a-position-with-an-instruction-is-still-a-choice",
+    "pins": "Round 8 item 1. The run numbers the patient's appointments and records the ids so that a number means something — and nothing read the answer. Live, '2' went to the Coordinator, came back a new cancellation request, was refused a supersede, and the run failed. This is the harder shape of the same message: a choice with the errand attached, where the leading numeral is the answer and the date at the back is what to do next.",
+    "patient": "asha.patient@example.invalid",
+    "turns": [
+      {
+        "message": "I need a dermatology appointment for a rash next week",
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
+      },
+      {
+        "action": "confirm",
+        "expect": {"status": "completed", "appointments_created": 1}
+      },
+      {
+        "message": "please reschedule my appointment",
+        "expect": {
+          "status": "in_progress",
+          "proposed_action": null,
+          "reply_contains": ["1. Cardiology", "2. Dermatology"],
+          "reply_author": "template"
+        }
+      },
+      {
+        "message": "1. and please make it sometime next week",
+        "expect": {
+          "same_run": true,
+          "status": "pending_confirmation",
+          "proposed_action": "reschedule",
+          "reply_contains": ["Cardiology"],
+          "reply_excludes": ["couldn't complete", "closed that request"]
+        }
+      }
+    ]
+  },
+
+  {
+    "name": "a-shown-time-moves-a-held-reschedule",
+    "pins": "Round 8 item 2. Three alternatives rendered under a held reschedule, the patient answered '3', and the selection reader — which had matched it — was suppressed, to stop it converting the reschedule into a booking. The turn fell to the classifier, which called it a withdrawal, and two turns later the run was superseded into a routed staff review. The slot moves now; the verb does not.",
+    "patient": "asha.patient@example.invalid",
+    "turns": [
+      {
+        "message": "lets reschedule my appointment to next week",
+        "expect": {"status": "pending_confirmation", "proposed_action": "reschedule"}
+      },
+      {
+        "message": "can you show me other times for this appointment next week?",
+        "expect": {
+          "same_run": true,
+          "status": "pending_confirmation",
+          "proposed_action": "reschedule",
+          "reply_contains": ["Other times that are free"]
+        }
+      },
+      {
+        "message": "3",
+        "expect": {
+          "same_run": true,
+          "status": "pending_confirmation",
+          "proposed_action": "reschedule",
+          "reply_contains": ["move it"],
+          "reply_excludes": ["book it", "withdraw"]
+        }
+      },
+      {
+        "action": "confirm",
+        "expect": {
+          "status": "completed",
+          "audit_actions": {"appointment_rescheduled": 1},
+          "appointment_status": {"1": "confirmed"}
+        }
+      }
+    ]
+  },
+
+  {
+    "name": "a-clashing-time-says-why-it-is-missing",
+    "pins": "Round 8 item 4. 'how about 11am on july 29?' was answered with 9:00, 10:00 and 2:00. The 11:00 was withheld correctly — the patient had an Orthopedics appointment at 11:00 that day and the commit would have refused it — and nothing said so, so a specific question got a list that reads as though it had not been asked.",
+    "patient": "asha.patient@example.invalid",
+    "turns": [
+      {
+        "message": "I need a cardiology appointment next monday at 9am",
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
+      },
+      {
+        "action": "confirm",
+        "expect": {"status": "completed", "appointments_created": 1}
+      },
+      {
+        "message": "I also need a dermatology appointment next monday",
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
+      },
+      {
+        "message": "how about 9am next monday?",
+        "expect": {
+          "same_run": true,
+          "status": "pending_confirmation",
+          "reply_contains": ["clashes with your Cardiology appointment", "Other times that are free"]
+        }
+      }
+    ]
   }
 ]

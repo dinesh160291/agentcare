@@ -40,6 +40,14 @@ appointment they already have — the day of the week, the date, the department,
 and the reference code we gave them. A time of day is not among them: "the 9am
 one" names a slot far more often than an appointment, and the slot reader owns
 that sentence.
+
+**And when the run has already asked.** :func:`read_choice` is the other half:
+once ``render_appointment_choice`` has numbered the rows, "2" is an answer to
+that list and needs no cues at all. It had no reader for a whole round — the
+list was drawn, the number came back, and the turn went to the Coordinator,
+which called it a new request. Both readers answer the same question from
+different evidence, so they live together; which one applies is decided by
+whether a list is outstanding.
 """
 
 from __future__ import annotations
@@ -54,6 +62,8 @@ from sqlalchemy.orm import Session
 from app import clock
 from app.tools.dates import MONTHS, WEEKDAYS
 from app.tools.departments import resolve_department
+from app.workflow.mapping import says_withdrawal
+from app.workflow.selection import position_named
 
 _MONTH_NAMES = "|".join(MONTHS)
 _WEEKDAY_NAMES = "|".join(sorted(WEEKDAYS, key=len, reverse=True))
@@ -197,4 +207,57 @@ def resolve_target(
     return TargetVerdict(None, "no_cue", cues, [])
 
 
-__all__ = ["TargetVerdict", "resolve_target"]
+#: A position that opens the message: "1. Move it to after my other one". The
+#: dot or bracket is required and so is the space after it — "1.30pm" is a time
+#: and "2)" is an answer. Kept apart from
+#: :func:`~app.workflow.selection.position_named`, which reads a bare number
+#: only when it is the *whole* message, because here the rest of the sentence
+#: is the patient elaborating on the choice they just made.
+_LEADING_POSITION = re.compile(r"^\s*(\d{1,2})\s*[.)]\s+\S")
+
+
+def read_choice(text: str, *, listed: Sequence[int]) -> int | None:
+    """The appointment id this message picks out of a numbered list.
+
+    ``None`` when it picks none, which leaves the turn exactly as it was.
+
+    **The hole this fills.** ``render_appointment_choice`` numbers the rows and
+    records the ids precisely so that "2" means something — and then nothing in
+    code read the answer. ``_settle_target`` stands aside once a list has been
+    shown, on the reasoning that the list's own answer would be read; it was
+    not. Live, a cancel run asked "which one? 1..., 2..." and the patient
+    answered "2". The Coordinator called that a *new cancellation request*, the
+    supersede was correctly refused, the refusal's recovery searched for slots
+    on a run that had no department, and the run failed: "I'm sorry — I couldn't
+    complete this request."
+
+    **A leading position outranks a date here, and only here.** "1. Move it to
+    after I finish my General Medicine appointment which is on 6th August at
+    10am" is a choice followed by an instruction. The referent list is
+    appointments, so the numeral at the front is the answer and the date at the
+    back is what to do next — the opposite of
+    :func:`~app.workflow.selection.read_selection`, where a list of *times*
+    makes "the 2pm one" a time and never row two.
+
+    Out of range falls through to the model. A number that does not name a row
+    is not a near miss to be rounded into one.
+    """
+    rows = list(listed or [])
+    if not rows:
+        return None
+
+    message = text or ""
+    # "Forget it" is not a choice, checked first for the reason it is checked
+    # first everywhere else here: the withdrawal reading has to win outright or
+    # a patient asking to be let go is answered with a cancellation proposal.
+    if says_withdrawal(message):
+        return None
+
+    match = _LEADING_POSITION.match(message)
+    position = int(match.group(1)) if match else position_named(message)
+    if position is None or not 1 <= position <= len(rows):
+        return None
+    return int(rows[position - 1])
+
+
+__all__ = ["TargetVerdict", "read_choice", "resolve_target"]

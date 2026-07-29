@@ -31,6 +31,7 @@ from app.models import (
 )
 from app.workflow.replies import (
     UPLOAD_POINTER,
+    clash_note,
     claims_availability,
     offered_slot_ids,
     promises_action,
@@ -534,3 +535,64 @@ class TestTheRenderersSurviveMarkdown:
         text = render_receipt(session, run)
         assert "\n\n" in text
         assert "\n" not in text.replace("\n\n", "")
+
+
+class TestSayingWhyATimeIsMissing:
+    """A time withheld silently reads as a question ignored.
+
+    Live: "how about 11am on july 29?" was answered with 9:00, 10:00 and 2:00
+    and nothing else. The 11:00 was withheld correctly — the patient had an
+    Orthopedics appointment at 11:00 that day and the commit would have refused
+    it — but nothing said so, so the reply reads as though the question had not
+    been asked.
+
+    The sentence is a claim about the patient's own diary, so it is drawn from
+    the rows the search actually removed and from nowhere else.
+    """
+
+    WITHHELD = [
+        {
+            "slot_id": 391,
+            "start": "2026-07-29T11:00:00",
+            "department_name": "Orthopedics",
+        }
+    ]
+
+    def test_the_time_they_named_was_withheld(self):
+        note = clash_note(self.WITHHELD, "how about 11am on july 29?")
+        assert note == "That time clashes with your Orthopedics appointment that day."
+
+    def test_a_time_that_was_simply_not_free_makes_no_claim(self):
+        """"Nothing is free at 2" and "your 2 is spoken for" are different
+        facts, and only one of them may be asserted from these rows."""
+        assert clash_note(self.WITHHELD, "how about 2pm on july 29?") == ""
+
+    def test_a_message_naming_no_time_at_all(self):
+        assert clash_note(self.WITHHELD, "what else is there?") == ""
+
+    def test_nothing_was_withheld(self):
+        assert clash_note([], "how about 11am?") == ""
+
+    def test_two_days_withheld_at_that_hour_name_neither(self):
+        """The sentence says "that day". A search over a week can withhold
+        11:00 twice, and naming the wrong one is worse than saying nothing."""
+        both = self.WITHHELD + [
+            {
+                "slot_id": 402,
+                "start": "2026-07-31T11:00:00",
+                "department_name": "Cardiology",
+            }
+        ]
+        assert clash_note(both, "how about 11am?") == ""
+
+    def test_the_same_day_twice_is_still_one_day(self):
+        """Two doctors free at 11:00, both withheld by one appointment. The day
+        is unambiguous, so the sentence stands."""
+        twice = self.WITHHELD + [
+            {
+                "slot_id": 392,
+                "start": "2026-07-29T11:00:00",
+                "department_name": "Orthopedics",
+            }
+        ]
+        assert "Orthopedics" in clash_note(twice, "how about 11am?")

@@ -44,6 +44,7 @@ from app.models import (
 from app.tools.availability import get_slot
 from app.tools.confirmations import render_confirmation
 from app.tools.documents import diff_required_documents
+from app.workflow.selection import times_named
 
 #: The shortlist's length. The typed proposal is always exactly one slot — the
 #: state machine is untouched by any of this — and the list beside it is a
@@ -66,6 +67,14 @@ ONE_VERB_AT_A_TIME = (
     "One change at a time — I'll start with {verb}; ask me about the other one "
     "right after."
 )
+
+#: Why a time the patient named is not among the times they were offered. The
+#: search withholds slots that overlap the patient's own live appointments —
+#: correctly, since the commit would refuse them — but withholding without
+#: saying so reads as the question having been ignored. Live: "how about 11am
+#: on july 29?" was answered with 9:00, 10:00 and 2:00 and no mention of the
+#: Orthopedics appointment sitting at 11:00 that day.
+TIME_CLASHES = "That time clashes with your {department} appointment that day."
 
 #: The plan step in the patient's own words, for the line above.
 VERB_WORDS = {
@@ -369,6 +378,40 @@ def render_alternatives(
     return (
         f"Other times that are free:\n{options}\n\n" + render_reask(session, run)
     )
+
+
+def clash_note(withheld: Iterable[dict[str, Any]], message: str) -> str:
+    """Why a time the patient named is missing from the list they were given.
+
+    "" unless the message named a time and the search withheld that time for
+    this patient's own diary. The two are different facts and only one of them
+    is a claim: "nothing is free at 11" needs a search, "your 11 is spoken for"
+    needs a row, and stating the second about a time that was simply
+    unavailable would invent an appointment. So the sentence is drawn from
+    ``withheld_for_patient`` — the slots the search actually removed — and from
+    nowhere else.
+
+    One day only. The sentence says "that day", so it may not be said when the
+    withheld matches span two of them; a search over a week can withhold 11:00
+    on Tuesday and on Thursday, and naming neither is better than naming the
+    wrong one. The same unique-match reasoning
+    :func:`~app.workflow.selection.read_selection` uses for the offered set.
+    """
+    wanted = times_named(message)
+    if not wanted:
+        return ""
+
+    matches = []
+    for slot in withheld or []:
+        start = slot.get("start")
+        if not start:
+            continue
+        moment = start if isinstance(start, datetime) else datetime.fromisoformat(start)
+        if (moment.hour, moment.minute) in wanted:
+            matches.append((moment.date(), slot))
+    if not matches or len({day for day, _ in matches}) != 1:
+        return ""
+    return TIME_CLASHES.format(department=matches[0][1].get("department_name"))
 
 
 def listed_appointment_ids(run: WorkflowRun) -> list[int]:
@@ -715,8 +758,10 @@ __all__ = [
     "MAX_OPTIONS",
     "ONE_VERB_AT_A_TIME",
     "REMINDER_LINE",
+    "TIME_CLASHES",
     "UPLOAD_POINTER",
     "VERB_WORDS",
+    "clash_note",
     "listed_appointment_ids",
     "offered_slot_ids",
     "promises_action",
