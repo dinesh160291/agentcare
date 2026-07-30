@@ -111,6 +111,7 @@ from app.workflow.replies import (
     shortlist_slot_ids,
     render_alternatives,
     render_appointment_choice,
+    window_heading,
     window_note,
     render_change_proposal,
     render_proposal,
@@ -958,10 +959,18 @@ def _answer_while_holding(
         # next week or after August 6th" produced three Monday slots under
         # "Other times that are free:" — a silent fallback the patient reads as
         # an answer.
+        # Three things a heading can be, and the order is a precedence. The two
+        # failures come first — an unread constraint and an honoured-but-empty
+        # window are both about the list not being the answer asked for. Only
+        # when neither applies is there room to say whose window it *was*, and
+        # that is set solely by the model-proposed path.
         heading = window_note(
             unreadable=belt.proposals.window_unreadable,
             empty_label=belt.proposals.window_empty_label,
+            part_of_day=belt.proposals.window_part_of_day,
         )
+        if not heading and belt.proposals.window_provenance:
+            heading = window_heading(belt.proposals.window_provenance)
         times = render_alternatives(
             session,
             run,

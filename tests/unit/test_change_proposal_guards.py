@@ -16,7 +16,7 @@ nothing exercised them. A guard nobody has ever tripped is a decoration.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -38,6 +38,7 @@ from app.models import (
 )
 from app.tools.dates import resolve_date
 from app.trace import TraceWriter
+from app.workflow.replies import window_heading, window_note
 
 SEEDED_APPOINTMENT_ID = 1
 ASHA_PROFILE_ID = 1
@@ -599,6 +600,145 @@ class TestAProposedSearchWindowIsDisposedByCode:
         seeded_db.flush()
         names = {tool.__name__ for tool in belt_for(seeded_db, asha, run).coordinator_tools()}
         assert "propose_search_window" in names
+
+
+class TestThePhraseTheSearchActuallyUses:
+    """Round 10 item 4 — the last door a stated constraint could vanish through.
+
+    ``phrase`` is the model's summary of the patient's timing words, and an
+    *empty* one is not evidence that nothing was said. The mock's own extractor
+    returns "" for "more slots in the afternoon?", so that question searched
+    unfiltered and came back with 10 AM, 11 AM and 2 PM — and layer (c) stayed
+    silent, because ``unreadable`` is computed from the phrase and the phrase was
+    empty. Round 9 closed the front door and this was the side one.
+    """
+
+    @pytest.fixture
+    def holding(self, seeded_db, asha, run):
+        run.status = WorkflowStatus.PENDING_CONFIRMATION
+        run.proposed_action = ProposedAction.BOOK
+        run.state = {"department_id": 1}
+        run.proposed_slot_id = slot_in(seeded_db, "Cardiology").id
+        seeded_db.flush()
+        return run
+
+    def test_an_absent_phrase_falls_back_to_the_patients_words(
+        self, seeded_db, asha, holding
+    ):
+        belt = belt_for(seeded_db, asha, holding)
+        belt.message = "more slots in the afternoon?"
+
+        listed = belt._list_other_slots()
+
+        assert listed["slots"], "nothing came back, so nothing is being checked"
+        hours = {
+            datetime.fromisoformat(slot["start"]).hour for slot in listed["slots"]
+        }
+        assert hours and all(hour >= 12 for hour in hours)
+
+    def test_the_note_names_what_it_could_not_read(self, seeded_db, asha, holding):
+        """Both halves of that phrase are now true at once. The day was
+        unreadable and the time of day was honoured, so apologising for reading
+        nothing — directly above a list of afternoon times — would be false as
+        well as confusing."""
+        belt = belt_for(seeded_db, asha, holding)
+        belt.message = "more slots in the afternoon?"
+
+        belt._list_other_slots()
+
+        assert belt.proposals.window_unreadable is True
+        assert belt.proposals.window_part_of_day == "afternoon"
+        assert window_note(
+            unreadable=True, empty_label=None, part_of_day="afternoon"
+        ) == (
+            "I couldn't read that as a day — here are the earliest afternoon "
+            "times free:"
+        )
+
+    def test_a_model_supplied_phrase_still_wins(self, seeded_db, asha, holding):
+        """It may legitimately be narrower than the whole sentence, and
+        second-guessing that would put code in the reading bin for a failure
+        nobody has seen."""
+        belt = belt_for(seeded_db, asha, holding)
+        belt.message = "anything in the afternoon or maybe next week?"
+        expected = resolve_date("next week", today=clock.today())
+
+        belt._list_other_slots("next week")
+
+        days = {slot["start"][:10] for slot in belt.proposals.offered_slots}
+        assert days
+        assert min(days) >= expected["start"]
+
+    def test_a_message_with_no_timing_words_changes_nothing(
+        self, seeded_db, asha, holding
+    ):
+        """The negative control. The fallback must not turn every recovery
+        listing into a filtered search: "option 3" names no time, so the list is
+        the one it always was and layer (c) has nothing to admit."""
+        belt = belt_for(seeded_db, asha, holding)
+        belt.message = "option 3"
+
+        belt._list_other_slots()
+
+        assert belt.proposals.window_unreadable is False
+        assert belt.proposals.window_part_of_day is None
+        assert belt.proposals.offered_slots
+
+
+class TestWhoseWindowTheListAnswers:
+    """Round 10 item 4a — a working answer that reads as an ignored question.
+
+    Live: "got anything whenever the moon is full?" Layer (b) worked
+    mechanically — the model proposed an Aug-1 window, code validated it, the
+    search ran, the astronomy prose was suppressed and Saturday times were
+    rendered. Nothing false shipped, and nothing said why Saturday.
+    """
+
+    @pytest.fixture
+    def holding(self, seeded_db, asha, run):
+        run.status = WorkflowStatus.PENDING_CONFIRMATION
+        run.proposed_action = ProposedAction.BOOK
+        run.state = {"department_id": 1}
+        run.proposed_slot_id = slot_in(seeded_db, "Cardiology").id
+        seeded_db.flush()
+        return run
+
+    def test_a_model_proposed_window_is_named(self, seeded_db, asha, holding):
+        belt = belt_for(seeded_db, asha, holding)
+        belt.message = "got anything whenever the moon is full?"
+        target = clock.today() + timedelta(days=5)
+
+        belt._propose_search_window(target.isoformat(), target.isoformat())
+
+        assert belt.proposals.window_provenance == f"on {target:%A} {target.day} {target:%B}"
+        assert window_heading(belt.proposals.window_provenance).startswith(
+            "Times that are free on"
+        )
+
+    def test_a_window_the_vocabulary_read_is_not_captioned(
+        self, seeded_db, asha, holding
+    ):
+        """A rule that worked is not something to caption, and a caption on
+        every list is a caption nobody reads."""
+        belt = belt_for(seeded_db, asha, holding)
+        belt.message = "what else is free next week?"
+
+        belt._list_other_slots("next week")
+
+        assert belt.proposals.window_provenance is None
+
+    def test_the_patients_own_words_take_their_heading_with_them(
+        self, seeded_db, asha, holding
+    ):
+        """The round-9 override and the round-10 caption are one path: when the
+        patient's words win, the model's window never happened, so there is
+        nothing of the model's to name."""
+        belt = belt_for(seeded_db, asha, holding)
+        belt.message = "how about next monday?"
+
+        belt._propose_search_window("2026-08-03", "2026-08-03")
+
+        assert belt.proposals.window_provenance is None
 
 
 class TestWhatTheSearchHandsTheModel:

@@ -156,6 +156,16 @@ class TurnProposals:
     #: own terms. ``None`` when a window was honoured and answered, which is
     #: the case that must stay silent.
     window_empty_label: str | None = None
+    #: The time of day the search actually filtered on, when one was read. Only
+    #: the admission above needs it: a phrase whose *day* was unreadable may
+    #: still have had its "afternoon" honoured, and apologising for reading
+    #: nothing above a list of afternoon times is false as well as confusing.
+    window_part_of_day: str | None = None
+    #: The dates a **model-proposed** window turned into, when the patient's own
+    #: words read as nothing. ``None`` everywhere else, which is most of the
+    #: time: a window the deterministic vocabulary read needs no caption, and
+    #: captioning every list is how a caption stops being read.
+    window_provenance: str | None = None
     rejections: list[str] = field(default_factory=list)
 
 
@@ -544,6 +554,8 @@ class Toolbelt:
         department_id: int,
         empty_label: str | None,
         unreadable: bool,
+        provenance: str | None = None,
+        part_of_day: str | None = None,
     ) -> list[dict]:
         """The bookkeeping every path that answers with times owes.
 
@@ -572,6 +584,8 @@ class Toolbelt:
 
         self.proposals.window_unreadable = unreadable
         self.proposals.window_empty_label = None
+        self.proposals.window_provenance = provenance
+        self.proposals.window_part_of_day = part_of_day or None
         if not others and empty_label:
             # The window was real and there is nothing in it. Search again
             # without it, so the sentence naming the empty window has something
@@ -689,12 +703,27 @@ class Toolbelt:
             part_of_day=part_of_day or None,
             free_for_patient=self.patient_id,
         )
-        # A window was read after all, so layer (c) has nothing to admit.
+        # A window was read after all, so layer (c) has nothing to admit — but
+        # something has to be said about *whose* window it is. Live, "got
+        # anything whenever the moon is full?" worked mechanically: the model
+        # proposed an Aug-1 window, code validated it, the search ran, the
+        # astronomy prose was suppressed and Saturday slots were rendered.
+        # Nothing false shipped and nothing said why Saturday, so a working
+        # answer read as an ignored question.
+        #
+        # Only this path passes a provenance, and that is the rule rather than an
+        # accident: the deterministic vocabulary read nothing here (the check
+        # above returns early when it does), so this window is the model's guess
+        # and the patient is entitled to see which dates it turned into. A window
+        # read from the patient's own words keeps today's heading — a rule that
+        # worked is not something to caption.
         self._answer_with_slots(
             found,
             department_id=department_id,
             empty_label=_window_label(first, last),
             unreadable=False,
+            provenance=_window_label(first, last),
+            part_of_day=part_of_day or None,
         )
         return self._offerable(found) | {"accepted": True}
 
@@ -847,6 +876,19 @@ class Toolbelt:
         if department_id is None:
             return {"slots": [], "problem": "No department has been decided yet."}
 
+        # An absent phrase falls back to what the patient actually said. The
+        # argument is the model's summary of their timing words, and a model that
+        # passes nothing is not evidence that nothing was said: the mock's own
+        # extractor returns "" for "more slots in the afternoon?", and that
+        # question came back with 10 AM, 11 AM and 2 PM — the stated constraint
+        # dropped in silence, through the one door round 9's honesty rule could
+        # not see, because `unreadable` is computed from the phrase and the
+        # phrase was empty.
+        #
+        # A non-empty argument still wins. The model may legitimately narrow
+        # ("the Tuesday one" out of a longer sentence), and second-guessing that
+        # would put code in the reading bin for no failure anybody has seen.
+        phrase = phrase or self.message
         window = resolve_date(phrase, today=clock.today()) if phrase else {}
         start = self._as_date(window.get("start") or "") if window.get("resolved") else None
         end = self._as_date(window.get("end") or "") if window.get("resolved") else None
@@ -885,6 +927,7 @@ class Toolbelt:
             unreadable=bool(
                 phrase and not window.get("resolved") and names_timing(phrase)
             ),
+            part_of_day=window.get("part_of_day"),
         )
         self.proposals.slot_window = window if window.get("resolved") else None
         # Nothing is recorded as offered here, and that is the correction. This

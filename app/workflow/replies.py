@@ -391,7 +391,9 @@ def render_alternatives(
     return f"{heading}\n{options}\n\n" + render_reask(session, run)
 
 
-def window_note(*, unreadable: bool, empty_label: str | None) -> str:
+def window_note(
+    *, unreadable: bool, empty_label: str | None, part_of_day: str | None = None
+) -> str:
     """What to say when a timing constraint did not produce the list below it.
 
     The third layer of the window reader, and the one the other two rest on:
@@ -410,8 +412,21 @@ def window_note(*, unreadable: bool, empty_label: str | None) -> str:
     "" when the constraint was honoured and answered — a rule that worked is
     not something to apologise for, and a note on every list would train the
     patient to skip the one that matters.
+
+    ``part_of_day`` narrows the admission to what was actually missed. A phrase
+    can fail in halves: "more slots in the afternoon?" has no readable *day* and
+    a perfectly readable time of day, and the search filters on it — so the
+    unqualified sentence would apologise for reading nothing directly above a
+    list of afternoon times, which is both false and self-contradicting. Round
+    9's own rule, one level up: a refusal that drops what it did understand is a
+    second bug, and that applies to the sentence as much as to the parser.
     """
     if unreadable:
+        if part_of_day:
+            return (
+                f"I couldn't read that as a day — here are the earliest "
+                f"{part_of_day} times free:"
+            )
         return (
             "I couldn't read that as a day or time — here are the earliest "
             "times free:"
@@ -419,6 +434,27 @@ def window_note(*, unreadable: bool, empty_label: str | None) -> str:
     if empty_label:
         return f"Nothing free {empty_label} — the earliest other times are:"
     return ""
+
+
+def window_heading(label: str) -> str:
+    """Name the window a list is answering about, when the patient did not.
+
+    The companion to :func:`window_note` and the third of the three things a
+    heading can be. ``window_note`` covers the two failures — the phrase could
+    not be read, or it could and nothing is free — and this covers the case that
+    is not a failure at all and still owes an explanation: **the dates were the
+    model's guess.**
+
+    Live: "got anything whenever the moon is full?" produced a validated Aug-1
+    window and a list of Saturday times. Every layer worked, nothing false was
+    said, and the patient had no way to know Saturday was an answer to their
+    question rather than the earliest thing free. A working answer that cannot be
+    recognised as one reads as an ignored question.
+
+    ``label`` comes from the dates code accepted, never from the model's words —
+    so this sentence can only ever describe a window that was actually searched.
+    """
+    return f"Times that are free {label}:"
 
 
 def clash_note(withheld: Iterable[dict[str, Any]], message: str) -> str:
@@ -803,6 +839,7 @@ __all__ = [
     "UPLOAD_POINTER",
     "VERB_WORDS",
     "clash_note",
+    "window_heading",
     "window_note",
     "listed_appointment_ids",
     "offered_slot_ids",
