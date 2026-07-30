@@ -8,12 +8,7 @@
         "message": "I need a cardiology appointment next week",
         "expect": {
           "status": "pending_confirmation",
-          "plan": [
-            "route",
-            "book",
-            "documents",
-            "follow_up"
-          ],
+          "plan": ["route", "book", "documents", "follow_up"],
           "proposed_action": "book",
           "appointments_created": 0,
           "runs_for_patient": 1
@@ -27,12 +22,7 @@
           "same_run": true,
           "runs_for_patient": 1,
           "appointments_created": 0,
-          "reply_excludes": [
-            "closed your earlier request",
-            "i will proceed",
-            "hold on",
-            "member of staff"
-          ]
+          "reply_excludes": ["closed your earlier request", "i will proceed", "hold on", "member of staff"]
         }
       },
       {
@@ -43,10 +33,7 @@
           "same_run": true,
           "runs_for_patient": 1,
           "appointments_created": 0,
-          "reply_excludes": [
-            "i can help with hospital administration",
-            "closed your earlier request"
-          ]
+          "reply_excludes": ["i can help with hospital administration", "closed your earlier request"]
         }
       },
       {
@@ -55,14 +42,13 @@
           "status": "completed",
           "proposed_action": null,
           "appointments_created": 1,
-          "reply_contains": [
-            "AC-"
-          ],
+          "reply_contains": ["AC-"],
           "reply_author": "template"
         }
       }
     ]
   },
+
   {
     "name": "slot-questions-while-holding",
     "pins": "Round 5 item 2, (a) and (b) together. Four dated availability questions and two open ones, all asked while a proposal stands. Each must refine: same run, offer still held, nothing booked, and no referral to staff.",
@@ -70,11 +56,7 @@
     "turns": [
       {
         "message": "I need a cardiology appointment next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book",
-          "runs_for_patient": 1
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book", "runs_for_patient": 1}
       },
       {
         "message": "show me more available slots",
@@ -84,11 +66,7 @@
           "same_run": true,
           "runs_for_patient": 1,
           "appointments_created": 0,
-          "reply_excludes": [
-            "member of staff",
-            "closed your earlier request",
-            "i've booked"
-          ]
+          "reply_excludes": ["member of staff", "closed your earlier request", "i've booked"]
         }
       },
       {
@@ -99,10 +77,7 @@
           "same_run": true,
           "runs_for_patient": 1,
           "appointments_created": 0,
-          "reply_excludes": [
-            "member of staff",
-            "closed your earlier request"
-          ]
+          "reply_excludes": ["member of staff", "closed your earlier request"]
         }
       },
       {
@@ -113,10 +88,7 @@
           "same_run": true,
           "runs_for_patient": 1,
           "appointments_created": 0,
-          "reply_excludes": [
-            "member of staff",
-            "closed your earlier request"
-          ]
+          "reply_excludes": ["member of staff", "closed your earlier request"]
         }
       },
       {
@@ -127,10 +99,7 @@
           "same_run": true,
           "runs_for_patient": 1,
           "appointments_created": 0,
-          "reply_excludes": [
-            "member of staff",
-            "closed your earlier request"
-          ]
+          "reply_excludes": ["member of staff", "closed your earlier request"]
         }
       },
       {
@@ -141,25 +110,16 @@
           "same_run": true,
           "runs_for_patient": 1,
           "appointments_created": 0,
-          "reply_excludes": [
-            "member of staff",
-            "staff will assist",
-            "closed your earlier request"
-          ]
+          "reply_excludes": ["member of staff", "staff will assist", "closed your earlier request"]
         }
       },
       {
         "action": "confirm",
-        "expect": {
-          "status": "completed",
-          "appointments_created": 1,
-          "reply_contains": [
-            "AC-"
-          ]
-        }
+        "expect": {"status": "completed", "appointments_created": 1, "reply_contains": ["AC-"]}
       }
     ]
   },
+
   {
     "name": "orthopedics-then-a-slot-question",
     "pins": "The (a) failure in the state it was found in: a slot question asked during an Orthopedics proposal destroyed the booking. Also the do-not-break check that 'severe' routes rather than tripping the safety screen.",
@@ -172,9 +132,7 @@
           "proposed_action": "book",
           "runs_for_patient": 1,
           "escalations": 0,
-          "reply_contains": [
-            "Orthopedics"
-          ]
+          "reply_contains": ["Orthopedics"]
         }
       },
       {
@@ -185,21 +143,16 @@
           "same_run": true,
           "runs_for_patient": 1,
           "appointments_created": 0,
-          "reply_excludes": [
-            "member of staff",
-            "closed your earlier request"
-          ]
+          "reply_excludes": ["member of staff", "closed your earlier request"]
         }
       },
       {
         "action": "confirm",
-        "expect": {
-          "status": "completed",
-          "appointments_created": 1
-        }
+        "expect": {"status": "completed", "appointments_created": 1}
       }
     ]
   },
+
   {
     "name": "reschedule-to-next-week-then-double-confirm",
     "pins": "Round 5 item 2 (c) plus the round-3 double-Confirm. The reschedule verb must reach the reschedule plan against the existing appointment, never routing and never a staff review; and the second click must be a no-op, which only the audit count can see.",
@@ -209,24 +162,13 @@
         "message": "please reschedule my appointment to next week",
         "expect": {
           "status": "pending_confirmation",
-          "plan": [
-            "reschedule",
-            "follow_up"
-          ],
+          "plan": ["reschedule", "follow_up"],
           "proposed_action": "reschedule",
           "runs_for_patient": 1,
           "appointments_created": 0,
-          "appointment_status": {
-            "1": "confirmed"
-          },
-          "reply_contains": [
-            "AC-000001"
-          ],
-          "reply_excludes": [
-            "General Medicine",
-            "member of staff",
-            "which department"
-          ]
+          "appointment_status": {"1": "confirmed"},
+          "reply_contains": ["AC-000001"],
+          "reply_excludes": ["General Medicine", "member of staff", "which department"]
         }
       },
       {
@@ -234,34 +176,24 @@
         "expect": {
           "status": "completed",
           "proposed_action": null,
-          "appointment_status": {
-            "1": "confirmed"
-          },
+          "appointment_status": {"1": "confirmed"},
           "appointments_created": 0,
-          "audit_actions": {
-            "appointment_rescheduled": 1
-          }
+          "audit_actions": {"appointment_rescheduled": 1}
         }
       },
       {
         "action": "confirm",
         "expect": {
-          "appointment_status": {
-            "1": "confirmed"
-          },
+          "appointment_status": {"1": "confirmed"},
           "appointments_created": 0,
-          "audit_actions": {
-            "appointment_rescheduled": 1,
-            "patient_action_stale": 1
-          },
-          "reply_contains": [
-            "nothing waiting for your confirmation"
-          ],
+          "audit_actions": {"appointment_rescheduled": 1, "patient_action_stale": 1},
+          "reply_contains": ["nothing waiting for your confirmation"],
           "reply_author": "template"
         }
       }
     ]
   },
+
   {
     "name": "reschedule-phrased-loosely",
     "pins": "The other live wording of the same verb. Same destination: the reschedule plan, not routing.",
@@ -271,30 +203,19 @@
         "message": "lets reschedule my appointment",
         "expect": {
           "status": "pending_confirmation",
-          "plan": [
-            "reschedule",
-            "follow_up"
-          ],
+          "plan": ["reschedule", "follow_up"],
           "proposed_action": "reschedule",
           "appointments_created": 0,
-          "reply_excludes": [
-            "which department",
-            "member of staff"
-          ]
+          "reply_excludes": ["which department", "member of staff"]
         }
       },
       {
         "message": "yes",
-        "expect": {
-          "status": "completed",
-          "appointments_created": 0,
-          "reply_contains": [
-            "AC-000001"
-          ]
-        }
+        "expect": {"status": "completed", "appointments_created": 0, "reply_contains": ["AC-000001"]}
       }
     ]
   },
+
   {
     "name": "cancel-my-upcoming-appointment",
     "pins": "The cancel verb, in the transcript's wording. One appointment on the books, so it auto-targets rather than asking which.",
@@ -304,36 +225,25 @@
         "message": "i want to cancel my upcoming appointment",
         "expect": {
           "status": "pending_confirmation",
-          "plan": [
-            "cancel"
-          ],
+          "plan": ["cancel"],
           "proposed_action": "cancel",
-          "appointment_status": {
-            "1": "confirmed"
-          },
-          "reply_contains": [
-            "AC-000001"
-          ]
+          "appointment_status": {"1": "confirmed"},
+          "reply_contains": ["AC-000001"]
         }
       },
       {
         "message": "yes",
         "expect": {
           "status": "completed",
-          "appointment_status": {
-            "1": "cancelled"
-          },
+          "appointment_status": {"1": "cancelled"},
           "appointments_created": 0,
-          "reply_contains": [
-            "AC-000001"
-          ],
-          "reply_excludes": [
-            "reminder the day before"
-          ]
+          "reply_contains": ["AC-000001"],
+          "reply_excludes": ["reminder the day before"]
         }
       }
     ]
   },
+
   {
     "name": "two-appointments-then-a-bare-two",
     "pins": "Round 4 item 1. \"2\" answering a numbered list is an answer, not a withdrawal and not off-topic. The last turn's appointment_status is the only check that separates a correct selection from a lucky one.",
@@ -341,32 +251,20 @@
     "turns": [
       {
         "message": "I need a dermatology appointment next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
       },
       {
         "message": "yes",
-        "expect": {
-          "status": "completed",
-          "appointments_created": 1
-        }
+        "expect": {"status": "completed", "appointments_created": 1}
       },
       {
         "message": "I want to cancel my appointment",
         "expect": {
           "status": "in_progress",
           "proposed_action": null,
-          "reply_contains": [
-            "1. Cardiology",
-            "2. Dermatology"
-          ],
+          "reply_contains": ["1. Cardiology", "2. Dermatology"],
           "reply_author": "template",
-          "appointment_status": {
-            "1": "confirmed",
-            "2": "confirmed"
-          }
+          "appointment_status": {"1": "confirmed", "2": "confirmed"}
         }
       },
       {
@@ -375,31 +273,22 @@
           "status": "pending_confirmation",
           "proposed_action": "cancel",
           "same_run": true,
-          "appointment_status": {
-            "1": "confirmed",
-            "2": "confirmed"
-          },
-          "reply_contains": [
-            "Dermatology"
-          ],
-          "reply_excludes": [
-            "closed that request"
-          ]
+          "appointment_status": {"1": "confirmed", "2": "confirmed"},
+          "reply_contains": ["Dermatology"],
+          "reply_excludes": ["closed that request"]
         }
       },
       {
         "message": "yes",
         "expect": {
           "status": "completed",
-          "appointment_status": {
-            "1": "confirmed",
-            "2": "cancelled"
-          },
+          "appointment_status": {"1": "confirmed", "2": "cancelled"},
           "appointments_created": 1
         }
       }
     ]
   },
+
   {
     "name": "listing-questions",
     "pins": "Round 4 item 3. Every listing phrasing from the transcripts, answered from the rows before planning. `runs_for_patient: 0` is the assertion that nothing was started; `reply_author: template` is the one that says the query path ran rather than the model happening to be right.",
@@ -410,71 +299,37 @@
         "expect": {
           "runs_for_patient": 0,
           "reply_author": "template",
-          "reply_contains": [
-            "AC-000001",
-            "Cardiology"
-          ],
-          "reply_excludes": [
-            "could you tell me a little more",
-            "09:00"
-          ]
+          "reply_contains": ["AC-000001", "Cardiology"],
+          "reply_excludes": ["could you tell me a little more", "09:00"]
         }
       },
       {
         "message": "show my upcoming appointments?",
-        "expect": {
-          "runs_for_patient": 0,
-          "reply_author": "template",
-          "reply_contains": [
-            "AC-000001"
-          ]
-        }
+        "expect": {"runs_for_patient": 0, "reply_author": "template", "reply_contains": ["AC-000001"]}
       },
       {
         "message": "what appointments I have coming up?",
-        "expect": {
-          "runs_for_patient": 0,
-          "reply_author": "template",
-          "reply_contains": [
-            "AC-000001"
-          ]
-        }
+        "expect": {"runs_for_patient": 0, "reply_author": "template", "reply_contains": ["AC-000001"]}
       },
       {
         "message": "can you tell me my appointments",
-        "expect": {
-          "runs_for_patient": 0,
-          "reply_author": "template",
-          "reply_contains": [
-            "AC-000001"
-          ]
-        }
+        "expect": {"runs_for_patient": 0, "reply_author": "template", "reply_contains": ["AC-000001"]}
       },
       {
         "message": "any reminders for me?",
-        "expect": {
-          "runs_for_patient": 0,
-          "reply_author": "template",
-          "reply_contains": [
-            "reminder"
-          ]
-        }
+        "expect": {"runs_for_patient": 0, "reply_author": "template", "reply_contains": ["reminder"]}
       },
       {
         "message": "what documents I have on file?",
         "expect": {
           "reply_author": "template",
-          "reply_contains": [
-            "Documents on file"
-          ],
-          "reply_excludes": [
-            "could you tell me a little more",
-            "no department has been decided"
-          ]
+          "reply_contains": ["Documents on file"],
+          "reply_excludes": ["could you tell me a little more", "no department has been decided"]
         }
       }
     ]
   },
+
   {
     "name": "documents-for-a-named-visit",
     "pins": "Round 4 item 4. The department comes from the message; ENT has nothing mandatory, so the optional line must stand on its own rather than becoming 'nothing is needed'.",
@@ -483,18 +338,13 @@
       {
         "message": "what documents do I need to bring for my ENT visit?",
         "expect": {
-          "reply_contains": [
-            "ENT"
-          ],
-          "reply_excludes": [
-            "no additional documents",
-            "nothing is needed",
-            "no department has been decided"
-          ]
+          "reply_contains": ["ENT"],
+          "reply_excludes": ["no additional documents", "nothing is needed", "no department has been decided"]
         }
       }
     ]
   },
+
   {
     "name": "off-topic-stays-refused",
     "pins": "Both guards, in both directions. Genuinely off-topic messages must stay byte-identical refusals with no run; an off-topic message during a run must leave the run untouched.",
@@ -505,9 +355,7 @@
         "expect": {
           "runs_for_patient": 0,
           "reply_author": "guard",
-          "reply_contains": [
-            "I can help with hospital administration"
-          ]
+          "reply_contains": ["I can help with hospital administration"]
         }
       },
       {
@@ -515,17 +363,12 @@
         "expect": {
           "runs_for_patient": 0,
           "reply_author": "guard",
-          "reply_contains": [
-            "I can help with hospital administration"
-          ]
+          "reply_contains": ["I can help with hospital administration"]
         }
       },
       {
         "message": "I need a cardiology appointment next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "runs_for_patient": 1
-        }
+        "expect": {"status": "pending_confirmation", "runs_for_patient": 1}
       },
       {
         "message": "what's the weather like today?",
@@ -540,6 +383,7 @@
       }
     ]
   },
+
   {
     "name": "a-different-department-supersedes",
     "pins": "The pinned counterexample to round 5 item 2. A different resolvable department is a new subject and still supersedes — the refinement rule must not swallow it.",
@@ -547,10 +391,7 @@
     "turns": [
       {
         "message": "I need a cardiology appointment next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "runs_for_patient": 1
-        }
+        "expect": {"status": "pending_confirmation", "runs_for_patient": 1}
       },
       {
         "message": "book me a dermatology appointment instead",
@@ -558,13 +399,12 @@
           "same_run": false,
           "runs_for_patient": 2,
           "appointments_created": 0,
-          "reply_contains": [
-            "closed your earlier request"
-          ]
+          "reply_contains": ["closed your earlier request"]
         }
       }
     ]
   },
+
   {
     "name": "a-review-survives-assent-and-yields-to-a-verb",
     "pins": "Both halves of the pending_review rule in one conversation. Agreement must not destroy the queue item; a different appointment verb must.",
@@ -587,9 +427,7 @@
           "same_run": true,
           "runs_for_patient": 1,
           "open_escalations": 1,
-          "reply_contains": [
-            "with our staff for review"
-          ]
+          "reply_contains": ["with our staff for review"]
         }
       },
       {
@@ -600,13 +438,12 @@
           "runs_for_patient": 2,
           "open_escalations": 0,
           "appointments_created": 0,
-          "reply_contains": [
-            "closed your earlier request"
-          ]
+          "reply_contains": ["closed your earlier request"]
         }
       }
     ]
   },
+
   {
     "name": "withdrawal-closes-the-run",
     "pins": "\"forget it\" carries a withdrawal cue and must still close the run — the cue guard added in round 4 narrows what may withdraw, and this is the case it must not have broken.",
@@ -614,10 +451,7 @@
     "turns": [
       {
         "message": "I need a dermatology appointment next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "appointments_created": 0
-        }
+        "expect": {"status": "pending_confirmation", "appointments_created": 0}
       },
       {
         "message": "forget it",
@@ -630,6 +464,7 @@
       }
     ]
   },
+
   {
     "name": "decline-returns-to-selection",
     "pins": "The decline flow, verified working this transcript. A declined proposal must clear and leave the run selectable rather than confirmable.",
@@ -637,10 +472,7 @@
     "turns": [
       {
         "message": "I need a cardiology appointment next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
       },
       {
         "message": "no",
@@ -653,6 +485,7 @@
       }
     ]
   },
+
   {
     "name": "paraphrase-never-commits",
     "pins": "Three near-answers that are not the token. The offer moves or stays, but nothing is ever booked by prose.",
@@ -660,10 +493,7 @@
     "turns": [
       {
         "message": "I need a neurology appointment next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
       },
       {
         "message": "lets go with 4pm slot",
@@ -692,6 +522,7 @@
       }
     ]
   },
+
   {
     "name": "non-answers-are-bounded",
     "pins": "The stall ladder. Four non-answers must never commit and never auto-decline; the run stays where it is and the wording spend is what gets capped.",
@@ -699,44 +530,23 @@
     "turns": [
       {
         "message": "I need a cardiology appointment next week",
-        "expect": {
-          "status": "pending_confirmation"
-        }
+        "expect": {"status": "pending_confirmation"}
       },
-      {
-        "message": "hmm, maybe",
-        "expect": {
-          "status": "pending_confirmation",
-          "appointments_created": 0
-        }
-      },
-      {
-        "message": "not sure yet",
-        "expect": {
-          "status": "pending_confirmation",
-          "appointments_created": 0
-        }
-      },
-      {
-        "message": "hmm, I think so",
-        "expect": {
-          "status": "pending_confirmation",
-          "appointments_created": 0
-        }
-      },
+      {"message": "hmm, maybe", "expect": {"status": "pending_confirmation", "appointments_created": 0}},
+      {"message": "not sure yet", "expect": {"status": "pending_confirmation", "appointments_created": 0}},
+      {"message": "hmm, I think so", "expect": {"status": "pending_confirmation", "appointments_created": 0}},
       {
         "message": "hmm, maybe",
         "expect": {
           "status": "pending_confirmation",
           "appointments_created": 0,
           "same_run": true,
-          "reply_contains": [
-            "Confirm"
-          ]
+          "reply_contains": ["Confirm"]
         }
       }
     ]
   },
+
   {
     "name": "two-intents-in-one-message",
     "pins": "The superset rule. One message naming a booking and a document must produce one plan holding both steps, not two runs.",
@@ -745,18 +555,14 @@
       {
         "message": "I need a cardiology appointment next week. I also want to attach my previous ECG report.",
         "expect": {
-          "plan": [
-            "route",
-            "book",
-            "documents",
-            "follow_up"
-          ],
+          "plan": ["route", "book", "documents", "follow_up"],
           "runs_for_patient": 1,
           "appointments_created": 0
         }
       }
     ]
   },
+
   {
     "name": "emergency-repeats-attach-to-one-escalation",
     "pins": "Five frightened messages are one queue item, and a withdrawal in the middle of them must not sweep the safety escalation away.",
@@ -773,37 +579,23 @@
       },
       {
         "message": "chest pain again, it is getting worse",
-        "expect": {
-          "status": "escalated",
-          "runs_for_patient": 1,
-          "open_escalations": 1
-        }
+        "expect": {"status": "escalated", "runs_for_patient": 1, "open_escalations": 1}
       },
       {
         "message": "I still have chest pain",
-        "expect": {
-          "status": "escalated",
-          "runs_for_patient": 1,
-          "open_escalations": 1
-        }
+        "expect": {"status": "escalated", "runs_for_patient": 1, "open_escalations": 1}
       },
       {
         "message": "actually forget it, never mind",
-        "expect": {
-          "runs_for_patient": 1,
-          "open_escalations": 1
-        }
+        "expect": {"runs_for_patient": 1, "open_escalations": 1}
       },
       {
         "message": "the chest pain is back",
-        "expect": {
-          "status": "escalated",
-          "runs_for_patient": 1,
-          "open_escalations": 1
-        }
+        "expect": {"status": "escalated", "runs_for_patient": 1, "open_escalations": 1}
       }
     ]
   },
+
   {
     "name": "emergency-on-an-opening-message",
     "pins": "The deterministic phrase list, first and always.",
@@ -811,14 +603,11 @@
     "turns": [
       {
         "message": "I have chest pain and my left arm hurts",
-        "expect": {
-          "status": "escalated",
-          "escalation_kind": "safety",
-          "appointments_created": 0
-        }
+        "expect": {"status": "escalated", "escalation_kind": "safety", "appointments_created": 0}
       }
     ]
   },
+
   {
     "name": "self-harm-caught-by-the-phrase-list",
     "pins": "The case only the deterministic layer can catch — no body part, no severity co-occurrence for the LLM pass to find.",
@@ -826,13 +615,11 @@
     "turns": [
       {
         "message": "I feel suicidal and I don't want to be here any more",
-        "expect": {
-          "status": "escalated",
-          "escalation_kind": "safety"
-        }
+        "expect": {"status": "escalated", "escalation_kind": "safety"}
       }
     ]
   },
+
   {
     "name": "subtle-emergency-caught-by-the-second-layer",
     "pins": "The case only the LLM pass can catch — it carries no listed phrase. Falsifying the two layers separately is the whole point of keeping both cases.",
@@ -840,13 +627,11 @@
     "turns": [
       {
         "message": "my breathing has been getting worse since yesterday",
-        "expect": {
-          "status": "escalated",
-          "escalation_kind": "safety"
-        }
+        "expect": {"status": "escalated", "escalation_kind": "safety"}
       }
     ]
   },
+
   {
     "name": "a-clinical-question-is-refused-administratively",
     "pins": "No dosage answer, ever, from any layer.",
@@ -856,15 +641,12 @@
         "message": "what dose of my tablets should I take before the appointment?",
         "expect": {
           "status": "escalated",
-          "reply_excludes": [
-            "mg",
-            "take one",
-            "twice a day"
-          ]
+          "reply_excludes": ["mg", "take one", "twice a day"]
         }
       }
     ]
   },
+
   {
     "name": "clarify-into-another-department",
     "pins": "Round 6 item 2. A declined General Medicine proposal, then a clarification naming a different desk. The model calls that a *continuation* with no steps of its own, so the subject check on the supersede path never sees it — before the fix the run kept General Medicine and re-proposed its slots, and every reworded clarification did the same thing, because each one was another continuation. `same_run: false` is the whole assertion: the eye request must not be answered by the run that routed elsewhere.",
@@ -872,27 +654,19 @@
     "turns": [
       {
         "message": "I need a general medicine appointment",
-        "expect": {
-          "status": "pending_confirmation"
-        }
+        "expect": {"status": "pending_confirmation"}
       },
       {
         "message": "no",
-        "expect": {
-          "status": "in_progress"
-        }
+        "expect": {"status": "in_progress"}
       },
       {
         "message": "let me clarify - appointment for vision issues",
-        "expect": {
-          "same_run": false,
-          "reply_excludes": [
-            "General Medicine"
-          ]
-        }
+        "expect": {"same_run": false, "reply_excludes": ["General Medicine"]}
       }
     ]
   },
+
   {
     "name": "a-timing-refinement-keeps-its-run",
     "pins": "The negative control for the rule above, and what keeps it narrow. 'Some time next week' names no department, so it is exactly what it was classified as — a continuation of the request the patient is still making. A rule that superseded here would have turned every refinement into a restart.",
@@ -900,24 +674,19 @@
     "turns": [
       {
         "message": "I need a general medicine appointment",
-        "expect": {
-          "status": "pending_confirmation"
-        }
+        "expect": {"status": "pending_confirmation"}
       },
       {
         "message": "no",
-        "expect": {
-          "status": "in_progress"
-        }
+        "expect": {"status": "in_progress"}
       },
       {
         "message": "some time next week please",
-        "expect": {
-          "same_run": true
-        }
+        "expect": {"same_run": true}
       }
     ]
   },
+
   {
     "name": "documents-question-phrased-as-submitting",
     "pins": "Round 6 item 4. 'Do I need to submit any documentations for this visit?' came back as the appointments list. Documents already outranked appointments; the precedence did no work because `\\bdocuments?\\b` stops at 'documents', so 'documentations' matched nothing and the only subject word left standing was 'visit'.",
@@ -927,16 +696,13 @@
         "message": "do I need to submit any documentations for this visit?",
         "expect": {
           "reply_author": "template",
-          "reply_contains": [
-            "Documents on file"
-          ],
-          "reply_excludes": [
-            "Your upcoming appointment"
-          ]
+          "reply_contains": ["Documents on file"],
+          "reply_excludes": ["Your upcoming appointment"]
         }
       }
     ]
   },
+
   {
     "name": "a-selection-lands-at-in-progress",
     "pins": "Round 6 item 1, and the worst of the session. A run at in_progress that had shown times could not hear an answer to them: the model called the reply a new request, the mapping correctly refused to supersede a run with itself, and the refusal answers with more times. Seven consecutive messages to one run each drew the identical availability list. Graded on the state machine, not the wording � a selection must leave the run holding a slot and waiting, on the run it started on.",
@@ -944,16 +710,11 @@
     "turns": [
       {
         "message": "I need a cardiology appointment next week",
-        "expect": {
-          "status": "pending_confirmation"
-        }
+        "expect": {"status": "pending_confirmation"}
       },
       {
         "action": "decline",
-        "expect": {
-          "status": "in_progress",
-          "proposed_action": null
-        }
+        "expect": {"status": "in_progress", "proposed_action": null}
       },
       {
         "message": "option 2",
@@ -962,13 +723,12 @@
           "status": "pending_confirmation",
           "proposed_action": "book",
           "appointments_created": 0,
-          "reply_excludes": [
-            "Other times that are free"
-          ]
+          "reply_excludes": ["Other times that are free"]
         }
       }
     ]
   },
+
   {
     "name": "a-booking-selection-is-not-a-new-request",
     "pins": "Round 6 item 4. 'Lets book the 10am slot' was classified conflicting with steps [route, cancel] � a cancel plan for a message that says book, residue from two earlier cancel attempts in the history � and the supersede path built the replacement run from those steps unchecked. The run routed to General Medicine with low confidence and died in a staff queue. The message names a time the run had just offered, so it is a selection and never reaches classification at all.",
@@ -976,15 +736,11 @@
     "turns": [
       {
         "message": "I need a dermatology appointment next week",
-        "expect": {
-          "status": "pending_confirmation"
-        }
+        "expect": {"status": "pending_confirmation"}
       },
       {
         "action": "decline",
-        "expect": {
-          "status": "in_progress"
-        }
+        "expect": {"status": "in_progress"}
       },
       {
         "message": "lets book the 1st slot",
@@ -993,14 +749,12 @@
           "status": "pending_confirmation",
           "proposed_action": "book",
           "runs_for_patient": 1,
-          "reply_excludes": [
-            "closed your earlier request",
-            "member of staff"
-          ]
+          "reply_excludes": ["closed your earlier request", "member of staff"]
         }
       }
     ]
   },
+
   {
     "name": "cancelling-is-not-routed-to-a-department",
     "pins": "Round 6 item 2. 'I want to cancel my appointment' was planned as [route, cancel] twice in one session; routing found no department words in a sentence that contains none, dropped to low confidence, and both runs stopped in front of staff for a patient who had a working cancel path. The department is a fact about the appointment being cancelled, never a question about the request, so validate_plan strips the routing step a model names anyway.",
@@ -1010,30 +764,23 @@
         "message": "I want to cancel my appointment",
         "expect": {
           "status": "pending_confirmation",
-          "plan": [
-            "cancel"
-          ],
+          "plan": ["cancel"],
           "proposed_action": "cancel",
           "open_escalations": 0,
-          "reply_contains": [
-            "AC-"
-          ]
+          "reply_contains": ["AC-"]
         }
       },
       {
         "action": "confirm",
         "expect": {
           "status": "completed",
-          "appointment_status": {
-            "1": "cancelled"
-          },
-          "audit_actions": {
-            "appointment_cancelled": 1
-          }
+          "appointment_status": {"1": "cancelled"},
+          "audit_actions": {"appointment_cancelled": 1}
         }
       }
     ]
   },
+
   {
     "name": "a-scare-does-not-consume-a-queued-request",
     "pins": "Round 6 item 5. An unrelated safety trigger arriving over a run that was waiting for staff escalated *that* run � and escalated is terminal, so the queued ambiguous-routing request died without a human ever deciding it, while the surviving queue item's reason still described a department choice. The scare is not that request, so it gets a run of its own and the queue keeps both.",
@@ -1041,10 +788,7 @@
     "turns": [
       {
         "message": "book an appointment, my kid has ear pain",
-        "expect": {
-          "status": "pending_review",
-          "escalation_kind": "low_confidence_routing"
-        }
+        "expect": {"status": "pending_review", "escalation_kind": "low_confidence_routing"}
       },
       {
         "message": "I have chest pain and my left arm hurts",
@@ -1058,6 +802,7 @@
       }
     ]
   },
+
   {
     "name": "the-named-appointment-is-the-one-proposed",
     "pins": "Round 7 item 1, the only defect of the round with a wrong write behind it. With two appointments on file, 'reschedule the appointment on Monday' reached propose_reschedule as the *other* one's id; ownership, liveness, department and slot all checked out, because none of them asks whether the id is the one the patient named. The wrong appointment moved and the patient was told the right one had. Code now resolves the target from the words and overrides the model's argument.",
@@ -1065,46 +810,32 @@
     "turns": [
       {
         "message": "I need a dermatology appointment for a skin rash next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
       },
       {
         "action": "confirm",
-        "expect": {
-          "status": "completed",
-          "appointments_created": 1
-        }
+        "expect": {"status": "completed", "appointments_created": 1}
       },
       {
         "message": "I want to cancel my dermatology appointment",
         "expect": {
           "status": "pending_confirmation",
           "proposed_action": "cancel",
-          "reply_contains": [
-            "Dermatology"
-          ],
-          "reply_excludes": [
-            "AC-000001"
-          ]
+          "reply_contains": ["Dermatology"],
+          "reply_excludes": ["AC-000001"]
         }
       },
       {
         "action": "confirm",
         "expect": {
           "status": "completed",
-          "appointment_status": {
-            "1": "confirmed",
-            "2": "cancelled"
-          },
-          "audit_actions": {
-            "appointment_cancelled": 1
-          }
+          "appointment_status": {"1": "confirmed", "2": "cancelled"},
+          "audit_actions": {"appointment_cancelled": 1}
         }
       }
     ]
   },
+
   {
     "name": "a-shown-time-is-answerable-while-a-slot-is-held",
     "pins": "Round 7 item 3. With a three-slot list on screen, 'option 3' was classified conflicting, refused a supersede and drew a fresh morning list; the next message naming a time came back from the confirmation reader as a *decline*, because that closed enum has no selection in it. The reader now runs ahead of the exact tokens, and the tokens are untouched underneath.",
@@ -1112,10 +843,7 @@
     "turns": [
       {
         "message": "I need a cardiology appointment next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
       },
       {
         "message": "option 3",
@@ -1124,23 +852,17 @@
           "status": "pending_confirmation",
           "proposed_action": "book",
           "non_answer_count": 0,
-          "reply_contains": [
-            "holding"
-          ],
-          "reply_excludes": [
-            "nothing has been booked"
-          ]
+          "reply_contains": ["holding"],
+          "reply_excludes": ["nothing has been booked"]
         }
       },
       {
         "message": "yes",
-        "expect": {
-          "status": "completed",
-          "appointments_created": 1
-        }
+        "expect": {"status": "completed", "appointments_created": 1}
       }
     ]
   },
+
   {
     "name": "a-timing-question-while-holding-gets-times",
     "pins": "Round 7 item 4. 'do you have any appointments ... thursday or friday preferably in the afternoon?' at pending_confirmation produced prose with no search behind it, which the grounding guard rightly suppressed, so what reached the patient was the bare re-ask with a stall counted against them. The identical sentence one turn later, at in_progress, got a real Thursday list.",
@@ -1148,10 +870,7 @@
     "turns": [
       {
         "message": "I need a cardiology appointment next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
       },
       {
         "message": "do you have any appointments at the end of the same week like thursday or friday preferably in the afternoon?",
@@ -1160,13 +879,12 @@
           "status": "pending_confirmation",
           "proposed_action": "book",
           "non_answer_count": 0,
-          "reply_contains": [
-            "Other times that are free"
-          ]
+          "reply_contains": ["Other times that are free"]
         }
       }
     ]
   },
+
   {
     "name": "two-verbs-in-one-message-are-acknowledged",
     "pins": "Round 7 item 6. 'okay lets cancel that appointment and book a new one for skin rash' booked, did not cancel, and said nothing about the half it dropped. One request confirms one thing is a rule with a cost, and the cost has to be visible.",
@@ -1174,14 +892,11 @@
     "turns": [
       {
         "message": "okay lets cancel that appointment and book a new one for skin rash",
-        "expect": {
-          "reply_contains": [
-            "One change at a time"
-          ]
-        }
+        "expect": {"reply_contains": ["One change at a time"]}
       }
     ]
   },
+
   {
     "name": "a-position-with-an-instruction-is-still-a-choice",
     "pins": "Round 8 item 1. The run numbers the patient's appointments and records the ids so that a number means something — and nothing read the answer. Live, '2' went to the Coordinator, came back a new cancellation request, was refused a supersede, and the run failed. This is the harder shape of the same message: a choice with the errand attached, where the leading numeral is the answer and the date at the back is what to do next.",
@@ -1189,27 +904,18 @@
     "turns": [
       {
         "message": "I need a dermatology appointment for a rash next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
       },
       {
         "action": "confirm",
-        "expect": {
-          "status": "completed",
-          "appointments_created": 1
-        }
+        "expect": {"status": "completed", "appointments_created": 1}
       },
       {
         "message": "please reschedule my appointment",
         "expect": {
           "status": "in_progress",
           "proposed_action": null,
-          "reply_contains": [
-            "1. Cardiology",
-            "2. Dermatology"
-          ],
+          "reply_contains": ["1. Cardiology", "2. Dermatology"],
           "reply_author": "template"
         }
       },
@@ -1219,17 +925,13 @@
           "same_run": true,
           "status": "pending_confirmation",
           "proposed_action": "reschedule",
-          "reply_contains": [
-            "Cardiology"
-          ],
-          "reply_excludes": [
-            "couldn't complete",
-            "closed that request"
-          ]
+          "reply_contains": ["Cardiology"],
+          "reply_excludes": ["couldn't complete", "closed that request"]
         }
       }
     ]
   },
+
   {
     "name": "a-shown-time-moves-a-held-reschedule",
     "pins": "Round 8 item 2. Three alternatives rendered under a held reschedule, the patient answered '3', and the selection reader — which had matched it — was suppressed, to stop it converting the reschedule into a booking. The turn fell to the classifier, which called it a withdrawal, and two turns later the run was superseded into a routed staff review. The slot moves now; the verb does not.",
@@ -1237,10 +939,7 @@
     "turns": [
       {
         "message": "lets reschedule my appointment to next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "reschedule"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "reschedule"}
       },
       {
         "message": "can you show me other times for this appointment next week?",
@@ -1248,9 +947,7 @@
           "same_run": true,
           "status": "pending_confirmation",
           "proposed_action": "reschedule",
-          "reply_contains": [
-            "Other times that are free"
-          ]
+          "reply_contains": ["Other times that are free"]
         }
       },
       {
@@ -1259,29 +956,21 @@
           "same_run": true,
           "status": "pending_confirmation",
           "proposed_action": "reschedule",
-          "reply_contains": [
-            "move it"
-          ],
-          "reply_excludes": [
-            "book it",
-            "withdraw"
-          ]
+          "reply_contains": ["move it"],
+          "reply_excludes": ["book it", "withdraw"]
         }
       },
       {
         "action": "confirm",
         "expect": {
           "status": "completed",
-          "audit_actions": {
-            "appointment_rescheduled": 1
-          },
-          "appointment_status": {
-            "1": "confirmed"
-          }
+          "audit_actions": {"appointment_rescheduled": 1},
+          "appointment_status": {"1": "confirmed"}
         }
       }
     ]
   },
+
   {
     "name": "a-clashing-time-says-why-it-is-missing",
     "pins": "Round 8 item 4. 'how about 11am on july 29?' was answered with 9:00, 10:00 and 2:00. The 11:00 was withheld correctly — the patient had an Orthopedics appointment at 11:00 that day and the commit would have refused it — and nothing said so, so a specific question got a list that reads as though it had not been asked.",
@@ -1289,34 +978,22 @@
     "turns": [
       {
         "message": "I need a cardiology appointment next monday at 9am",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
       },
       {
         "action": "confirm",
-        "expect": {
-          "status": "completed",
-          "appointments_created": 1
-        }
+        "expect": {"status": "completed", "appointments_created": 1}
       },
       {
         "message": "I also need a dermatology appointment next monday",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
       },
       {
         "message": "how about 9am next monday?",
         "expect": {
           "same_run": true,
           "status": "pending_confirmation",
-          "reply_contains": [
-            "clashes with your Cardiology appointment",
-            "Other times that are free"
-          ]
+          "reply_contains": ["clashes with your Cardiology appointment", "Other times that are free"]
         }
       }
     ]
@@ -1329,29 +1006,19 @@
       {
         "message": "okay lets cancel that appointment and book a new one for cardiology",
         "expect": {
-          "reply_contains": [
-            "One change at a time"
-          ],
+          "reply_contains": ["One change at a time"],
           "appointments_created": 0
         }
       },
       {
         "message": "yes",
-        "expect": {
-          "status": "completed",
-          "same_run": true
-        }
+        "expect": {"status": "completed", "same_run": true}
       },
       {
         "message": "now do the other thing I asked",
         "expect": {
-          "reply_contains": [
-            "Cardiology"
-          ],
-          "reply_excludes": [
-            "i can help with hospital administration",
-            "member of staff"
-          ],
+          "reply_contains": ["Cardiology"],
+          "reply_excludes": ["i can help with hospital administration", "member of staff"],
           "runs_for_patient": 1
         }
       },
@@ -1359,12 +1026,7 @@
         "message": "yes",
         "expect": {
           "status": "pending_confirmation",
-          "plan": [
-            "route",
-            "book",
-            "documents",
-            "follow_up"
-          ],
+          "plan": ["route", "book", "documents", "follow_up"],
           "proposed_action": "book",
           "runs_for_patient": 2,
           "appointments_created": 0
@@ -1374,15 +1036,12 @@
   },
   {
     "name": "an-affirmative-is-never-read-as-a-decline",
-    "pins": "Round 10 item 1. At pending_confirmation holding a 2:00 PM slot, 'yes lets confirm it' came back from the model as verdict=decline with the affirmative sentence quoted in its own reason field, and code applied it unread: the proposal was cleared and the patient was told nothing had been booked. A decline clears a held time, so it needs a decline cue — and a word of agreement vetoes one whatever sits beside it. Note that under the mock this conversation proves little: the understudy reads that sentence as a non-answer, so the guard is never reached. It is a live probe, and the guard itself is pinned with a scripted provider in tests/unit/test_confirmation_flow.py.",
+    "pins": "Round 10 item 1. At pending_confirmation holding a 2:00 PM slot, 'yes lets confirm it' came back from the model as verdict=decline with the affirmative sentence quoted in its own reason field, and code applied it unread: the proposal was cleared and the patient was told nothing had been booked. A decline clears a held time, so it needs a decline cue — and a word of agreement vetoes one whatever sits beside it. Note what this proves under the mock: nothing. The understudy reads that sentence as a non-answer, so the guard is never reached — this is a live probe, and the guard itself is pinned with a scripted provider in tests/unit/test_confirmation_flow.py.",
     "patient": "asha.patient@example.invalid",
     "turns": [
       {
         "message": "I need a cardiology appointment next week",
-        "expect": {
-          "status": "pending_confirmation",
-          "proposed_action": "book"
-        }
+        "expect": {"status": "pending_confirmation", "proposed_action": "book"}
       },
       {
         "message": "yes please, sounds good!",
@@ -1391,10 +1050,7 @@
           "proposed_action": "book",
           "same_run": true,
           "appointments_created": 0,
-          "reply_excludes": [
-            "nothing has been booked",
-            "closed your earlier request"
-          ]
+          "reply_excludes": ["nothing has been booked", "closed your earlier request"]
         }
       },
       {
