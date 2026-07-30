@@ -165,6 +165,13 @@ AWAITING_REVIEW_REPLY = (
     "haven't started it again. They'll come back on it shortly. If you'd like "
     "something different instead, tell me and I'll take it from there."
 )
+#: Said when the patient asks to cancel the thing being offered to them, and the
+#: thing being offered does not exist yet. Both facts, because either one alone
+#: reads as an evasion: nothing was booked, *and* the request is closed.
+NOTHING_BOOKED_TO_CANCEL_REPLY = (
+    "Nothing was booked, so there's nothing to cancel — I've closed that request. "
+    "Just say the word if you'd like to start again."
+)
 NOTHING_TO_CONFIRM_REPLY = (
     "There's nothing waiting for your confirmation just now. Tell me what you'd "
     "like to do and I'll pick it up from there."
@@ -520,6 +527,193 @@ def _settle_selection(
         run_id=run.id,
         status=run.status.value,
         message_class=MessageClass.CONTINUATION,
+        **base,
+    )
+
+
+#: Which plan verb a held proposal is a proposal *for*. The proposal is typed
+#: state and the plan is a list of step names; comparing the two needs one map
+#: and not two vocabularies.
+_VERB_FOR_PROPOSAL = {
+    ProposedAction.BOOK: PlanStep.BOOK,
+    ProposedAction.RESCHEDULE: PlanStep.RESCHEDULE,
+    ProposedAction.CANCEL: PlanStep.CANCEL,
+}
+
+
+async def _settle_verb_switch(
+    session: Session,
+    *,
+    run: WorkflowRun,
+    belt: Toolbelt,
+    writer: TraceWriter,
+    callbacks: TurnCallbacks,
+    user: User,
+    profile: PatientProfile,
+    message: str,
+    conversation_id: str,
+    provider: str | None,
+    settings,
+    base: dict,
+) -> TurnResult | None:
+    """"Actually just cancel it instead" — a verb, about the thing being held.
+
+    ``None`` unless the message names a *different* appointment verb from the one
+    the proposal is for, which leaves every other sentence exactly where it was.
+
+    **The live failure.** Holding a reschedule proposal for an Ophthalmology
+    appointment, "actually just cancel it instead" came back from the model as a
+    ``decline``. Round 10's cue guard let it through, because round 10's own work
+    order had put "cancel" in the decline vocabulary — so the proposal was
+    cleared, the patient was told nothing had been booked, and the appointment
+    they had just asked to cancel was still on the books. Two turns later
+    "actually just cancel **this appointment** instead" superseded perfectly. The
+    only difference was a pronoun, and the referent of that pronoun was
+    something this system had itself just named.
+
+    So the pronoun is readable here and nowhere else: ``run.proposed_action``
+    says which verb is held and ``run.proposed_appointment_id`` says which row,
+    so "it" has exactly one meaning and code knows it. The switch then rides the
+    ordinary supersede path — the run is replaced by one for the stated verb,
+    with the target carried across as ``chosen_appointment_id`` so the new run
+    does not ask "which one?" about an appointment the patient has just pointed
+    at.
+
+    **A held booking is the other case, and it is not a switch.** There is no
+    appointment to cancel, so "cancel it" can only mean the offer: the run
+    closes, and the reply says both halves of that. A *reschedule* against a held
+    booking is left alone entirely — "move it to Friday" is a request for a
+    different time, which the timing machinery already owns, and closing a run
+    over it would be the expensive misreading.
+    """
+    held = run.proposed_action
+    if held is None:
+        return None
+
+    # **Pronoun only.** A message that names an appointment noun has supplied its
+    # own referent, and it may not be the one being held: "cancel my dermatology
+    # appointment", arriving over a reschedule of the cardiology one, points
+    # somewhere else entirely, and carrying the held id across would move the
+    # wrong row while the receipt described the right one — the exact failure
+    # ``resolve_target`` exists to prevent. Those go the ordinary supersede road,
+    # where the patient's cues are read against the rows. What is left here is
+    # the sentence where *this system* supplied the referent.
+    if names_change_verb(message) is not None:
+        return None
+
+    verb = names_change_verb(message, held=True)
+    if verb is None or verb is _VERB_FOR_PROPOSAL[held]:
+        # No verb, or the one already being proposed: "reschedule it" while a
+        # reschedule is held has switched nothing.
+        return None
+
+    target = run.proposed_appointment_id
+    if target is None:
+        if verb is not PlanStep.CANCEL:
+            return None
+        writer.guard_verdict(
+            "verb_switch",
+            passed=True,
+            detail={
+                "verb": verb.value,
+                "held": held.value,
+                "applied": "close",
+                "problem": "nothing is booked, so there is nothing to cancel",
+            },
+        )
+        transition(
+            session,
+            run,
+            to=WorkflowStatus.CANCELLED,
+            trigger="offer_cancelled_by_patient",
+            writer=writer,
+            reason=CancellationReason.WITHDRAWN,
+            actor=user,
+        )
+        close_escalations_for_run(
+            session,
+            workflow_run_id=run.id,
+            note="The patient cancelled the offer before anything was booked.",
+            actor=user,
+        )
+        run.clear_proposal()
+        return TurnResult(
+            reply=NOTHING_BOOKED_TO_CANCEL_REPLY,
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            message_class=MessageClass.WITHDRAWAL,
+            **base,
+        )
+
+    writer.guard_verdict(
+        "verb_switch",
+        passed=True,
+        detail={
+            "verb": verb.value,
+            "held": held.value,
+            "appointment_id": int(target),
+            "applied": "supersede",
+        },
+    )
+    transition(
+        session,
+        run,
+        to=WorkflowStatus.CANCELLED,
+        trigger="superseded_by_new_request",
+        writer=writer,
+        reason=CancellationReason.SUPERSEDED,
+        actor=user,
+    )
+    close_escalations_for_run(
+        session,
+        workflow_run_id=run.id,
+        note="Superseded by a later request.",
+        actor=user,
+    )
+    run.clear_proposal()
+
+    replacement = create_run(
+        session,
+        patient_id=profile.id,
+        status=WorkflowStatus.IN_PROGRESS,
+        trigger="verb_switched_by_patient",
+        writer=writer,
+        request_text=message,
+        plan=[step.value for step in validate_plan([verb.value])],
+        session_id=conversation_id,
+        actor=user,
+    )
+    # The referent, carried rather than re-derived. Without it the new run reads
+    # a pronoun with two live appointments in front of it and asks which one —
+    # about the appointment the patient has just pointed at, which is the
+    # question this whole path exists to have answered already.
+    replacement.state = {**(replacement.state or {}), "chosen_appointment_id": int(target)}
+    session.flush()
+
+    belt.run = replacement
+    result = await _execute_plan(
+        session,
+        run=replacement,
+        belt=belt,
+        writer=writer,
+        callbacks=callbacks,
+        user=user,
+        message=message,
+        fallback_reply="",
+        provider=provider,
+        settings=settings,
+        base=base,
+    )
+    return TurnResult(
+        reply=result.reply,
+        author=result.author,
+        run_id=result.run_id,
+        status=result.status,
+        message_class=MessageClass.CONFLICTING,
+        plan=result.plan,
+        steps_run=result.steps_run,
+        budget_exhausted=result.budget_exhausted,
         **base,
     )
 
@@ -2092,6 +2286,29 @@ async def _turn(
         )
         if selected is not None:
             return selected
+
+    # --- 1a2. a different verb, about the thing being held ------------------
+    # After the selection reader, because naming a *time* is a choice among the
+    # offer and this is a change of what the offer is for. Before the exact
+    # tokens, which it cannot disturb: "cancel" on its own names no pronoun and
+    # no appointment noun, so a bare decline token still declines.
+    if run is not None:
+        switched = await _settle_verb_switch(
+            session,
+            run=run,
+            belt=belt,
+            writer=writer,
+            callbacks=callbacks,
+            user=user,
+            profile=profile,
+            message=message,
+            conversation_id=conversation_id,
+            provider=provider,
+            settings=settings,
+            base=base,
+        )
+        if switched is not None:
+            return switched
 
     # --- 1b. a pending confirmation is read in code, before any model call ---
     if run is not None and run.status is WorkflowStatus.PENDING_CONFIRMATION:

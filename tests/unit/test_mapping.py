@@ -39,12 +39,14 @@ from app.models import (
 )
 from app.trace import TraceWriter
 from app.tools.dates import WEEKDAYS, resolve_date
+from app.workflow.confirmation import ConfirmationAnswer, read_confirmation
 from app.workflow.mapping import (
     CLASSIFICATION_ORDER,
     Consequence,
     apply_consequence,
     mentions_domain_subject,
     names_appointment_verbs,
+    names_change_verb,
     names_timing,
     primary_intent,
     refers_back,
@@ -1111,6 +1113,58 @@ class TestTheDeclineVocabulary:
         "actually no wait yes" is not a refusal code may act on."""
         assert says_decline("actually no wait yes") is True
         assert says_affirmative("actually no wait yes") is True
+
+    def test_cancel_is_not_a_decline_cue(self):
+        """Round 11 item 3, and round 10's own mistake.
+
+        "Cancel" was in this list, which let a ``decline`` verdict be applied to
+        "actually just cancel it instead" — a sentence naming a *verb*. The
+        proposal was cleared, the patient was told nothing had been booked, and
+        the appointment they had asked to cancel was still booked. It is the
+        third meaning of the word this codebase has separated, and the exact
+        token reader still owns the second one.
+        """
+        assert says_decline("actually just cancel it instead") is False
+        assert says_decline("cancel this appointment instead") is False
+        # And the reader that *does* answer a bare "cancel" is untouched.
+        assert read_confirmation("cancel") is ConfirmationAnswer.DECLINE
+
+
+class TestThePronounWithOneReferent:
+    """``names_change_verb(held=True)`` — round 11 item 3's reading rule.
+
+    "Cancel it" is unreadable in general and unambiguous where a proposal names
+    the appointment: the referent is a column, not a guess. The two directions
+    are pinned separately because the whole item is that one phrasing worked and
+    another did not.
+    """
+
+    def test_a_pronoun_is_read_only_where_something_is_held(self):
+        assert names_change_verb("actually just cancel it instead") is None
+        assert (
+            names_change_verb("actually just cancel it instead", held=True)
+            is PlanStep.CANCEL
+        )
+
+    def test_the_noun_phrasing_never_needed_the_flag(self):
+        """The phrasing that already worked, and must keep working identically."""
+        for held in (False, True):
+            assert (
+                names_change_verb("cancel this appointment instead", held=held)
+                is PlanStep.CANCEL
+            )
+
+    def test_a_withdrawal_still_wins_over_the_pronoun(self):
+        """The rule that has outranked the appointment verbs since round 6.
+        "Cancel that request" closes a run; reading it as an appointment
+        cancellation leaves the appointment standing."""
+        assert names_change_verb("cancel that request", held=True) is None
+
+    def test_a_bare_verb_is_still_not_a_change(self):
+        """No noun and no pronoun. This is the word that answers a proposal, and
+        the exact-token reader is the only thing that may read it."""
+        assert names_change_verb("cancel", held=True) is None
+        assert names_change_verb("no", held=True) is None
 
 
 class TestARunWaitingForAChoiceKeepsTheAnswer:

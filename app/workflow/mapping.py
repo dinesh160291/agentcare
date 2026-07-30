@@ -387,6 +387,17 @@ def says_only_withdrawal(text: str) -> bool:
 #: Word-boundary matched, never containment: "no" lives inside "now" and
 #: "know", and this list is exactly the kind of short vocabulary that put "erm"
 #: inside *derm*atology.
+#:
+#: **"Cancel" is not here, and it was.** Round 10 put it in the list, which was
+#: a mistake with a price: holding a reschedule proposal, "actually just cancel
+#: it instead" met the new cue guard, passed it on the strength of that word, and
+#: the model's ``decline`` verdict was applied. The proposal died, the patient was
+#: told nothing had been booked, and the Ophthalmology appointment they had asked
+#: to cancel was still booked. It is the third meaning of the word this codebase
+#: has had to separate — the verb that acts on an appointment, the exact token
+#: that answers a proposal, and the phrase that closes a run — and "cancel it",
+#: pointed at a held appointment, is the first of those. See
+#: :func:`names_change_verb`.
 _DECLINE_CUES = (
     r"no",
     r"nope",
@@ -400,7 +411,6 @@ _DECLINE_CUES = (
     r"different (?:time|day|slot)",
     r"another (?:time|day|slot)",
     r"something else",
-    r"cancel",
 )
 
 _DECLINE_PATTERN = re.compile(
@@ -608,8 +618,14 @@ _APPOINTMENT_NOUN = re.compile(
     r"\b(?:appointments?|bookings?|visits?)\b", re.IGNORECASE
 )
 
+#: The noun a patient uses when the system has just named the appointment for
+#: them. "Cancel it", "cancel this instead", "move that to Friday" — a pronoun
+#: standing exactly where the noun would go, and readable *only* where the
+#: referent is already settled: see the ``held`` argument below.
+_HELD_PRONOUN = re.compile(r"\b(?:it|this|that|the one)\b", re.IGNORECASE)
 
-def names_change_verb(text: str) -> PlanStep | None:
+
+def names_change_verb(text: str, *, held: bool = False) -> PlanStep | None:
     """The appointment verb this message plainly states, if it states one.
 
     A fact about the message, in the same family as
@@ -621,11 +637,27 @@ def names_change_verb(text: str) -> PlanStep | None:
     "cancel my appointment" are different acts and reading the first as the
     second leaves an appointment standing while the reply says it was dealt
     with.
+
+    ``held`` says the caller knows which appointment the message is about — a
+    proposal names it — and it is the *only* thing that makes a pronoun readable
+    here. Live, holding a reschedule for an Ophthalmology appointment: "actually
+    just cancel it instead" named the verb as plainly as any sentence in the
+    transcript and was refused by the noun rule, because "it" is not an
+    appointment noun. Two turns later "actually just cancel **this
+    appointment** instead" superseded perfectly. Same request, same state, two
+    outcomes, and the difference was a word the system had itself supplied the
+    referent for.
+
+    Without ``held`` the pronoun stays unreadable, and that is not caution for
+    its own sake: "cancel it" with nothing held could point at anything the
+    conversation has mentioned, and choosing a referent is language.
     """
     message = text or ""
     if says_withdrawal(message):
         return None
-    if not _APPOINTMENT_NOUN.search(message):
+    if not _APPOINTMENT_NOUN.search(message) and not (
+        held and _HELD_PRONOUN.search(message)
+    ):
         return None
     for step, pattern in _CHANGE_VERBS:
         if re.search(pattern, message, re.IGNORECASE):

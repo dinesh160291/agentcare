@@ -30,6 +30,7 @@ from app.models import (
     Appointment,
     AppointmentStatus,
     AuditEvent,
+    ProposedAction,
     TraceAuthor,
     TraceEvent,
     TraceEventType,
@@ -39,6 +40,7 @@ from app.models import (
 )
 from app.orchestrator import (
     DECLINED_REPLY,
+    NOTHING_BOOKED_TO_CANCEL_REPLY,
     NOTHING_TO_CONFIRM_REPLY,
     apply_patient_action,
     run_workflow,
@@ -123,6 +125,14 @@ def _guard(session, turn_id, name):
             if (event.payload or {}).get("guard") == name:
                 return event.payload
     raise AssertionError(f"no {name!r} guard verdict in turn {turn_id}")
+
+
+def _guard_or_none(session, turn_id, name):
+    """The same, for the tests whose claim is that a guard did *not* run."""
+    try:
+        return _guard(session, turn_id, name)
+    except AssertionError:
+        return None
 
 
 class TestTheConfirmButton:
@@ -459,6 +469,221 @@ class TestADeclineNeedsADeclineCue:
 
         assert recorded["accepted"] is True
         assert recorded["detail"]["decline_cue"] is True
+
+
+RESCHEDULING = "please reschedule my appointment to next week"
+
+
+class TestCancelIsAVerbNotADecline:
+    """Round 11 item 3 — the same request, two phrasings, two outcomes.
+
+    Holding a reschedule proposal for an Ophthalmology appointment, "actually
+    just cancel it instead" came back from the model as ``decline`` and was
+    applied, because round 10's own work order had put "cancel" in the decline
+    vocabulary. The proposal died, the patient was told nothing had been booked,
+    and the appointment they had asked to cancel was still on the books. Two
+    turns later "actually just cancel **this appointment** instead" superseded
+    perfectly.
+
+    The pronoun is the whole difference, and its referent was a column on the
+    run this system had just written. So it is read here, and only here.
+    """
+
+    def _held_reschedule(self, patient, session_id: str):
+        first = turn(patient, RESCHEDULING, session_id)
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, first.run_id)
+            assert run.proposed_action is ProposedAction.RESCHEDULE
+            target = run.proposed_appointment_id
+        finally:
+            session.close()
+        assert target is not None
+        return first, target
+
+    @pytest.mark.parametrize(
+        "phrasing",
+        [
+            "actually just cancel it instead",
+            "actually just cancel this appointment instead",
+        ],
+    )
+    def test_either_phrasing_switches_to_a_cancellation(self, patient, phrasing):
+        """Both, and the same outcome, by two different roads.
+
+        The noun form has always gone through the model's supersede path, where
+        ``resolve_target`` reads the patient's own cues against the rows — and it
+        keeps going that way, because a message that names a noun may be pointing
+        at a different appointment than the one being held. Only the pronoun form
+        is read here. What this pins is that the *outcome* no longer depends on
+        which of the two the patient typed, which is the whole item.
+        """
+        session_id = f"s-switch-{abs(hash(phrasing))}"
+        first, target = self._held_reschedule(patient, session_id)
+
+        result = turn(patient, phrasing, session_id)
+
+        assert result.run_id != first.run_id
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            old = session.get(WorkflowRun, first.run_id)
+            new = session.get(WorkflowRun, result.run_id)
+            assert old.status is WorkflowStatus.CANCELLED
+            assert new.proposed_action is ProposedAction.CANCEL
+            assert new.proposed_appointment_id == target
+        finally:
+            session.close()
+
+    def test_the_exact_yes_then_cancels_that_appointment(self, patient):
+        """The cost of the live failure, stated as the thing that now happens:
+        the appointment the patient asked to cancel is cancelled."""
+        _, target = self._held_reschedule(patient, "s-switch-yes")
+        turn(patient, "actually just cancel it instead", "s-switch-yes")
+
+        turn(patient, "yes", "s-switch-yes")
+
+        session = fresh()
+        try:
+            appointment = session.get(Appointment, target)
+            assert appointment.status is AppointmentStatus.CANCELLED
+        finally:
+            session.close()
+
+    def test_the_new_run_never_asks_which_appointment(self, patient):
+        """The referent is carried, not re-derived.
+
+        Two live appointments, so a cancel run reading "it" from scratch would
+        find no cue and ask which one — about the appointment the patient has
+        just pointed at. The second one is in a different department on purpose:
+        that is what lets the reschedule reach a proposal at all, and it is the
+        only shape in which this claim is testable.
+        """
+        turn(patient, "I need a dermatology appointment next week", "s-switch-two")
+        assert turn(patient, "yes", "s-switch-two").status == (
+            WorkflowStatus.COMPLETED.value
+        )
+
+        first = turn(
+            patient, "please reschedule my dermatology appointment", "s-switch-two"
+        )
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            target = session.get(WorkflowRun, first.run_id).proposed_appointment_id
+        finally:
+            session.close()
+        assert target is not None
+
+        result = turn(patient, "actually just cancel it instead", "s-switch-two")
+
+        session = fresh()
+        try:
+            new = session.get(WorkflowRun, result.run_id)
+            assert new.state["chosen_appointment_id"] == target
+            assert new.proposed_appointment_id == target
+        finally:
+            session.close()
+
+    def test_the_switch_is_traced(self, patient):
+        self._held_reschedule(patient, "s-switch-trace")
+        result = turn(patient, "actually just cancel it instead", "s-switch-trace")
+
+        session = fresh()
+        try:
+            verdict = _guard(session, result.turn_id, "verb_switch")
+        finally:
+            session.close()
+
+        assert verdict["detail"]["verb"] == "cancel"
+        assert verdict["detail"]["held"] == "reschedule"
+        assert verdict["detail"]["applied"] == "supersede"
+
+
+class TestCancellingAnOfferThatDoesNotExistYet:
+    """A held *booking* names no appointment, so "cancel it" can only mean the
+    offer. The run closes and the reply says both halves — nothing was booked,
+    and the request is closed."""
+
+    def test_the_run_closes_and_says_why(self, patient):
+        first = turn(patient, BOOKING, "s-switch-book")
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+        result = turn(patient, "cancel it", "s-switch-book")
+
+        assert result.reply == NOTHING_BOOKED_TO_CANCEL_REPLY
+        assert result.author is TraceAuthor.TEMPLATE
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, first.run_id)
+            assert run.status is WorkflowStatus.CANCELLED
+            assert run.proposed_slot_id is None
+        finally:
+            session.close()
+
+    def test_nothing_else_is_touched(self, patient):
+        """"Nothing else" is the load-bearing half. The patient's existing
+        appointment is not what "it" referred to, and a cancellation that
+        reached it would be the worst outcome this path could have."""
+        session = fresh()
+        try:
+            before = [
+                (row.id, row.status)
+                for row in session.query(Appointment).order_by(Appointment.id).all()
+            ]
+        finally:
+            session.close()
+
+        turn(patient, BOOKING, "s-switch-book-2")
+        turn(patient, "cancel it", "s-switch-book-2")
+
+        session = fresh()
+        try:
+            after = [
+                (row.id, row.status)
+                for row in session.query(Appointment).order_by(Appointment.id).all()
+            ]
+        finally:
+            session.close()
+
+        assert after == before
+
+    def test_a_second_appointment_is_not_the_offer(self, patient):
+        """A noun is its own referent, and it may not be this one.
+
+        "Cancel my other appointment", sent over a booking offer, is a request
+        about a row that exists — not a request to drop the offer. Closing the run
+        there would throw away the booking the patient is in the middle of, so the
+        reader stands aside for any message that names an appointment noun.
+        """
+        turn(patient, BOOKING, "s-switch-other")
+
+        result = turn(
+            patient, "also please cancel my other appointment", "s-switch-other"
+        )
+
+        assert result.reply != NOTHING_BOOKED_TO_CANCEL_REPLY
+        session = fresh()
+        try:
+            assert _guard_or_none(session, result.turn_id, "verb_switch") is None
+        finally:
+            session.close()
+
+    def test_a_time_change_at_a_booking_offer_is_not_a_cancellation(self, patient):
+        """The expensive misreading, refused. "Move it to Friday" against an
+        offer is a request for a different time — the timing machinery owns that
+        sentence, and closing the run over it would throw away the request."""
+        first = turn(patient, BOOKING, "s-switch-move")
+
+        turn(patient, "can you move it to friday", "s-switch-move")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, first.run_id)
+            assert run.status is not WorkflowStatus.CANCELLED
+        finally:
+            session.close()
 
 
 class TestStallContainment:
