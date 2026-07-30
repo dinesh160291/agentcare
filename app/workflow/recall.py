@@ -43,7 +43,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
-from app.models import PlanStep, TraceEvent, WorkflowRun, WorkflowStatus
+from app.models import Appointment, PlanStep, TraceEvent, WorkflowRun, WorkflowStatus
 from app.tools import resolve_department
 from app.workflow.mapping import primary_intent
 
@@ -111,17 +111,64 @@ class Remembered:
         return template.format(label=self.label)
 
 
-def _department_named(session: Session, text: str) -> str:
+def _department_named(session: Session, text: str, *, besides: int | None = None) -> str:
     """The department the patient's own words resolve to, or "".
 
     ``resolve_department`` and nothing else, so the Department table decides
     what a subject is here exactly as it does in routing. There is no second
     keyword list to drift from the first.
+
+    ``besides`` is the department the *kept* half of the request already used, and
+    it is what makes a two-verb sentence readable. "Book me a cardiology
+    appointment and cancel my dermatology one" names two desks, so the resolver
+    correctly reports ambiguity and nothing was stored — the offer said "booking
+    an appointment", and the "yes" that accepted it routed the whole two-verb
+    sentence, which resolves to nothing but ambiguity again and queued for a
+    human at low confidence.
+
+    Subtracting is not guessing. The cancel run *acted on* Dermatology, so that
+    candidate is accounted for; if exactly one is left, the sentence named it and
+    the dropped half is about it. Two left and this still stores nothing, because
+    a three-department message genuinely does not say.
     """
     named = resolve_department(session, text or "")
     if named.get("status") == "resolved":
         return str(named["department"]["name"])
+    if named.get("status") != "ambiguous" or besides is None:
+        return ""
+    remaining = [
+        candidate
+        for candidate in named.get("candidates") or []
+        if int(candidate["id"]) != int(besides)
+    ]
+    if len(remaining) == 1:
+        return str(remaining[0]["name"])
     return ""
+
+
+def _run_department_id(session: Session, run: WorkflowRun) -> int | None:
+    """Which desk the run that *did* happen was about.
+
+    Read in the same order :meth:`~app.agents.toolbelt.Toolbelt._target_appointment`
+    reads it, and for the same reason: a booking run keeps its department in
+    state, while a reschedule or cancel run never routed and its department is a
+    fact about the appointment being changed. Ownership is re-checked because an
+    id on a run is still an id.
+    """
+    state = run.state or {}
+    if state.get("department_id"):
+        return int(state["department_id"])
+    for candidate in (
+        run.proposed_appointment_id,
+        state.get("chosen_appointment_id"),
+        state.get("appointment_id"),
+    ):
+        if not candidate:
+            continue
+        appointment = session.get(Appointment, int(candidate))
+        if appointment is not None and appointment.patient_id == run.patient_id:
+            return appointment.department_id
+    return None
 
 
 def _session_turns(session: Session, *, session_id: str) -> list[tuple[str, set[int]]]:
@@ -166,7 +213,9 @@ def remember_dropped_verb(
     if verb is None:
         return
 
-    department = _department_named(session, message)
+    department = _department_named(
+        session, message, besides=_run_department_id(session, run)
+    )
     state = dict(run.state or {})
     state["dropped_request"] = {
         "verb": verb.value,

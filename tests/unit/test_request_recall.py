@@ -273,6 +273,90 @@ class TestAClosedRunIsRememberedToo:
         assert result.run_id is None
 
 
+#: The live shape of a two-verb message: each half names a desk of its own, so
+#: the resolver reports ambiguity rather than a department. Departments swapped
+#: from the live pair, because the kept half has to settle against an appointment
+#: the patient actually has and the seeded one is Cardiology.
+TWO_DEPARTMENTS = "book me a dermatology appointment and cancel my cardiology one"
+
+
+class TestTheRememberedDepartment:
+    """Round 11 item 6 — the offer names the desk, or it names nothing useful.
+
+    ``TWO_VERBS`` above says "cancel that appointment", which names no department
+    at all, so the message resolves to exactly one and the memory stored it. The
+    live sentence names two, which resolves to *ambiguous* — and nothing was
+    stored, so the offer said "booking an appointment", and the "yes" that
+    accepted it routed the whole two-verb text: ambiguous again, low confidence,
+    queued for a human. The friendly phrasing had hidden the whole defect.
+
+    The subtraction is not a guess. The cancel run *acted on* Cardiology, so that
+    candidate is accounted for; whatever is left is what the dropped half was
+    about.
+    """
+
+    def _split(self, patient, session_id: str):
+        first = turn(patient, TWO_DEPARTMENTS, session_id)
+        assert "One change at a time" in first.reply
+        done = turn(patient, "yes", session_id)
+        assert done.status == WorkflowStatus.COMPLETED.value
+        return done
+
+    def test_the_offer_names_the_other_desk(self, patient):
+        self._split(patient, "s-recall-dept-1")
+
+        result = turn(patient, ASK_AGAIN, "s-recall-dept-1")
+
+        assert "booking a Dermatology appointment" in result.reply
+
+    def test_the_yes_routes_on_the_department_alone(self, patient):
+        """What the generic offer cost: the restarted run's request text was the
+        two-verb sentence, which resolves to nothing but ambiguity — so routing
+        dropped to low confidence and the request went to a staff queue instead
+        of to the patient."""
+        self._split(patient, "s-recall-dept-2")
+        turn(patient, ASK_AGAIN, "s-recall-dept-2")
+
+        result = turn(patient, "yes", "s-recall-dept-2")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert (run.state or {}).get("department_name") == "Dermatology"
+            assert run.request_text == "Dermatology"
+        finally:
+            session.close()
+
+    def test_a_message_naming_one_desk_is_unchanged(self, patient):
+        """The negative control on the other side: subtraction only ever runs on
+        an ambiguous resolution, so a sentence the resolver settles keeps the
+        answer it always had."""
+        turn(patient, TWO_VERBS, "s-recall-dept-3")
+        turn(patient, "yes", "s-recall-dept-3")
+
+        result = turn(patient, ASK_AGAIN, "s-recall-dept-3")
+
+        assert "booking a Cardiology appointment" in result.reply
+
+    def test_three_desks_still_store_nothing(self, patient):
+        """Two candidates left after the subtraction is still a message that does
+        not say. The generic offer is the honest answer there, and keeping it is
+        what stops this becoming a tiebreak."""
+        first = turn(
+            patient,
+            "book me a dermatology appointment or maybe an eye test and cancel "
+            "my cardiology one",
+            "s-recall-dept-4",
+        )
+        assert "One change at a time" in first.reply
+        turn(patient, "yes", "s-recall-dept-4")
+
+        result = turn(patient, ASK_AGAIN, "s-recall-dept-4")
+
+        assert "booking an appointment" in result.reply
+
+
 class TestWhatTheMemoryMustNotChange:
     """The negative controls. Each one is a reply that has to stay exactly what
     it was, and together they are what keep the memory from becoming a

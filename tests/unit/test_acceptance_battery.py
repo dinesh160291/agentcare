@@ -350,12 +350,25 @@ class TestBAClashIsNeverOfferedAndNeverCommitted:
 
 
 class TestCTheOtherThingIAsked:
-    """Round 10 item 3. Two verbs, one done, and the other one remembered."""
+    """Round 10 item 3, on round 11 item 6's phrasing. Two verbs, two desks.
+
+    The friendly phrasing this used to carry — "cancel that appointment and book
+    a new one for cardiology" — names one department, so the resolver settled it
+    and the offer named it. That hid the real shape of the live message, where
+    each half names a desk of its own: the resolution is *ambiguous*, nothing was
+    stored, the offer said "booking an appointment", and the "yes" then routed the
+    whole two-verb sentence — ambiguous again, low confidence, queued for a human.
+
+    The departments are swapped from the live pair so that the kept half can
+    settle against the seeded appointment, which is Cardiology. The rule under
+    test is unchanged: the kept run's own desk is subtracted, and what is left is
+    the one the dropped half was about.
+    """
 
     def test_the_whole_sequence(self, patient):
         split = turn(
             patient,
-            "okay lets cancel that appointment and book a new one for cardiology",
+            "book me a dermatology appointment and cancel my cardiology one",
             "bat-c",
         )
         assert "One change at a time" in split.reply
@@ -365,13 +378,15 @@ class TestCTheOtherThingIAsked:
         assert _run(done.run_id).plan == ["cancel"]
 
         offered = turn(patient, "now do the other thing I asked", "bat-c")
-        assert "booking a Cardiology appointment" in offered.reply
+        assert "booking a Dermatology appointment" in offered.reply
         assert offered.run_id is None, "an offer starts nothing"
 
         started = turn(patient, "yes", "bat-c")
         assert started.plan == ["route", "book", "documents", "follow_up"]
         assert started.status == WorkflowStatus.PENDING_CONFIRMATION.value
-        assert (_run(started.run_id).state or {}).get("department_name") == "Cardiology"
+        assert (_run(started.run_id).state or {}).get("department_name") == (
+            "Dermatology"
+        )
 
 
 # --- D -------------------------------------------------------------------
