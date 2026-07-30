@@ -21,6 +21,8 @@ run can never be complementary.
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from app.errors import ClassRejected, ValidationFailed
@@ -36,7 +38,7 @@ from app.models import (
     WorkflowStatus,
 )
 from app.trace import TraceWriter
-from app.tools.dates import WEEKDAYS
+from app.tools.dates import WEEKDAYS, resolve_date
 from app.workflow.mapping import (
     CLASSIFICATION_ORDER,
     Consequence,
@@ -1413,6 +1415,22 @@ class TestReadingATimingPhrase:
         phrase ``resolve_date`` can turn into a window."""
         for weekday in WEEKDAYS:
             assert names_timing(f"how about {weekday}?"), weekday
+
+    def test_every_form_resolve_date_reads_is_read_here_too(self):
+        """The claim above, checked in the direction that had drifted.
+
+        Looping the bare keys is what let it drift: round 9 taught
+        ``resolve_date`` the plurals and possessives patients write, and this
+        list wrapped the singular keys in ``\\b`` — so "any slots on
+        **Tuesdays**?" resolved to a real window and was not recognised as a
+        timing question at all. Found by the acceptance battery, and the third
+        instance of one shape: a second regex over a shared vocabulary.
+        """
+        for weekday in WEEKDAYS:
+            for form in (weekday, f"{weekday}s", f"{weekday}'s"):
+                phrase = f"any slots on {form}?"
+                assert resolve_date(phrase, today=date(2026, 8, 3))["resolved"], phrase
+                assert names_timing(phrase), phrase
 
 
 class TestSayingWhenCodeDisagreed:

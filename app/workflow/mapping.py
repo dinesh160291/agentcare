@@ -45,7 +45,7 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
-from app.tools.dates import MONTHS, PARTS_OF_DAY, WEEKDAYS
+from app.tools.dates import MONTHS, PARTS_OF_DAY, WEEKDAY_PATTERN, WEEKDAYS
 from app.tools.departments import resolve_department
 from app.tools.tasks import close_escalations_for_run
 from app.trace import TraceWriter
@@ -667,8 +667,19 @@ def names_timing(text: str) -> bool:
     False positives cost a slot list where a re-ask would have gone, which is
     the cheap direction — the opposite trade from the safety screen, and the
     same one :func:`mentions_domain_subject` makes.
+
+    ``WEEKDAY_PATTERN`` is consulted as well as the word list, and that is the
+    fix for a drift rather than a widening. The list is built from
+    ``resolve_date``'s own tables *so that* anything read as a timing phrase is a
+    phrase that module can resolve — but it wraps the bare keys in ``\\b``, and
+    round 9 taught ``resolve_date`` the plurals and possessives patients actually
+    write. So "any slots on **Tuesdays**?" resolved perfectly and was not
+    recognised as a timing question at all: the third regex over one vocabulary,
+    drifting exactly as the second one did. Sharing the pattern is what the
+    export was for.
     """
-    return bool(_TIMING_PATTERN.search(text or ""))
+    message = text or ""
+    return bool(_TIMING_PATTERN.search(message) or WEEKDAY_PATTERN.search(message))
 
 
 #: "Book me something", "schedule a new one", "set up an appointment". Kept out
