@@ -48,6 +48,10 @@ list was drawn, the number came back, and the turn went to the Coordinator,
 which called it a new request. Both readers answer the same question from
 different evidence, so they live together; which one applies is decided by
 whether a list is outstanding.
+
+:func:`narrow_by_department` is the third, and it exists because the list's own
+closing sentence offers the patient two ways to answer and only one of them
+could be heard.
 """
 
 from __future__ import annotations
@@ -62,7 +66,7 @@ from sqlalchemy.orm import Session
 from app import clock
 from app.tools.dates import MONTHS, WEEKDAYS
 from app.tools.departments import resolve_department
-from app.workflow.mapping import says_withdrawal
+from app.workflow.mapping import names_appointment_verbs, says_withdrawal
 from app.workflow.selection import position_named
 
 _MONTH_NAMES = "|".join(MONTHS)
@@ -260,4 +264,69 @@ def read_choice(text: str, *, listed: Sequence[int]) -> int | None:
     return int(rows[position - 1])
 
 
-__all__ = ["TargetVerdict", "read_choice", "resolve_target"]
+def narrow_by_department(
+    session: Session,
+    text: str,
+    *,
+    listed: Sequence[int],
+    appointments: Sequence[dict[str, Any]],
+) -> list[int]:
+    """Which of the numbered rows a department word in this message points at.
+
+    ``[]`` when the message names no department, or names one that matches none
+    of them — both of which leave the turn exactly as it was.
+
+    **The template asks for this answer.** ``render_appointment_choice`` closes
+    with "Tell me the number, or name the department", and only the number had
+    a reader. Live, with two Dermatology appointments listed, the patient
+    answered "Dermatology": :func:`read_choice` found no position, the
+    Coordinator called the message a *new* request, and the run was superseded —
+    the template's own suggested answer swapped the request out from under the
+    patient. A question that suggests an answer has to be able to hear it.
+
+    One match is a decision and the caller acts on it. Two or more is half an
+    answer: the patient has narrowed the list and the run asks again over
+    exactly those rows, which is a shorter question than the one before it and
+    never a supersede. That is the same shape :func:`resolve_target` uses and
+    for the same reason — ambiguity refuses rather than picks.
+
+    Matching is over the *listed* rows only. A department the patient has an
+    appointment in that this run did not offer as a choice is not an answer to
+    the question that was asked, and reading it as one would act on a row the
+    numbering never mentioned.
+
+    **A department inside a request is not an answer to a question.** "Book me
+    a cardiology appointment", sent to a cancel run that had asked which of two
+    appointments to cancel, names a department the patient does hold — and
+    reading that as the answer would propose cancelling it. So a message
+    carrying any appointment verb is left entirely alone: it is a new request,
+    or a restatement, and both already have paths. The word this reader exists
+    for is the bare department name the template asked for, and a bare
+    department name carries no verb.
+    """
+    rows = list(listed or [])
+    if not rows:
+        return []
+
+    message = text or ""
+    # "Forget it" names no department, and it is checked here for the reason it
+    # is checked first in every reader in this module: a withdrawal that reaches
+    # a matching rule is a patient asking to be let go and being answered with a
+    # proposal.
+    if says_withdrawal(message) or names_appointment_verbs(message):
+        return []
+
+    department = resolve_department(session, message)
+    if department.get("status") != "resolved":
+        return []
+    department_id = department["department"]["id"]
+
+    by_id = {int(row["appointment_id"]): row for row in appointments or []}
+    return [
+        appointment_id
+        for appointment_id in rows
+        if by_id.get(appointment_id, {}).get("department_id") == department_id
+    ]
+
+
+__all__ = ["TargetVerdict", "narrow_by_department", "read_choice", "resolve_target"]

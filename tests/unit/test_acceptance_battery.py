@@ -39,6 +39,7 @@ from app.tools.dates import resolve_date
 from app.models import (
     Appointment,
     AppointmentStatus,
+    Department,
     Escalation,
     EscalationKind,
     ProposedAction,
@@ -760,3 +761,114 @@ class TestGReadingTheAnswer:
             assert result.reply == AWAITING_REVIEW_REPLY, message
             assert "propose_appointment" not in _tools(result.turn_id), message
             assert "submit_routing" not in _tools(result.turn_id), message
+
+
+# --- H -------------------------------------------------------------------
+
+
+class TestHTheChoiceListCascade:
+    """Run #15 of the 2026-07-30 session — the hardest conversation so far.
+
+    One question, four consecutive failures, each downstream of the last: a
+    department answer superseded the run, a correct position answer was handed
+    back to a model that asked the question again, a "1" meant for a list of
+    *times* was captured by the spent list of appointments, and the model then
+    burned its budget parsing "Dermatology", "3" and "1" as dates until the run
+    was tombstoned.
+
+    Run as one sequence rather than four cases on purpose: every step's input is
+    the previous step's output, so a fix that works only in isolation shows up
+    here as the next turn landing somewhere else.
+
+    No stub. Every message in this sequence is read deterministically or not at
+    all, which is the whole claim — a turn that needs no model must not spend
+    one, and each assertion below names the tool that must be **absent**.
+    """
+
+    def _two_dermatology(self, patient) -> list[int]:
+        """Two Dermatology appointments, booked the way a patient gets them.
+
+        Same department twice is what makes a department answer ambiguous —
+        ``uq_department_synonym_term`` is global, so one term belongs to one
+        desk and two rows in *different* departments could always be told apart.
+        """
+        for session_id, reason in (
+            ("bat-h-setup-1", "I need a dermatology appointment for a rash"),
+            ("bat-h-setup-2", "I need a dermatology appointment for a mole check"),
+        ):
+            proposed = turn(patient, reason, session_id)
+            assert proposed.status == WorkflowStatus.PENDING_CONFIRMATION.value, reason
+            turn(patient, "yes", session_id)
+
+        session = fresh()
+        try:
+            derm = [
+                appointment.id
+                for appointment in session.query(Appointment)
+                .join(Department, Department.id == Appointment.department_id)
+                .filter(
+                    Appointment.patient_id == 1,
+                    Appointment.status == AppointmentStatus.CONFIRMED,
+                    Department.name == "Dermatology",
+                )
+                .order_by(Appointment.id)
+                .all()
+            ]
+        finally:
+            session.close()
+        assert len(derm) == 2, "the sequence needs two same-department rows"
+        return derm
+
+    def test_the_whole_cascade(self, patient):
+        derm = self._two_dermatology(patient)
+
+        # 1. The list is drawn over everything the patient has.
+        asked = turn(patient, "please reschedule my appointment", "bat-h1")
+        assert "1." in asked.reply and "3." in asked.reply
+        run_id = asked.run_id
+
+        # 2. "Dermatology" is the answer the template asked for. It narrows the
+        #    question; it does not replace the request.
+        narrowed = turn(patient, "Dermatology", "bat-h1")
+        assert narrowed.run_id == run_id, "the run was superseded by its own answer"
+        assert narrowed.status == WorkflowStatus.IN_PROGRESS.value
+        assert "2 Dermatology appointments" in narrowed.reply
+        assert "name the department" not in narrowed.reply
+        assert "classify_message" not in _tools(narrowed.turn_id)
+        assert list((_run(run_id).state or {}).get("listed_appointment_ids")) == derm
+
+        # 3. A position, and then times — with no model turn in between.
+        held = turn(patient, "1", "bat-h1")
+        assert held.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert held.author is TraceAuthor.TEMPLATE
+        for absent in ("classify_message", "find_slots_for_reschedule", "propose_reschedule"):
+            assert absent not in _tools(held.turn_id), absent
+        run = _run(run_id)
+        assert run.proposed_action is ProposedAction.RESCHEDULE
+        assert run.proposed_appointment_id == derm[0]
+        first_slot = run.proposed_slot_id
+        shortlist = list((run.state or {}).get("shortlist_slot_ids") or [])
+        assert len(shortlist) >= 2, "the reply offered nothing to answer"
+        assert not (run.state or {}).get("listed_appointment_ids"), (
+            "the answered list was left standing, and the next number will bind to it"
+        )
+
+        # 4. The same "1" again — now the times are what is on screen.
+        moved = turn(patient, "1", "bat-h1")
+        assert moved.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        run = _run(run_id)
+        assert run.proposed_action is ProposedAction.RESCHEDULE, "the verb flipped"
+        assert run.proposed_appointment_id == derm[0], "a spent list picked the row"
+        assert run.proposed_slot_id == shortlist[0]
+        assert run.proposed_slot_id != first_slot
+
+        # 5. And it commits, to the appointment the patient named all along.
+        receipt = press(patient, "confirm", "bat-h1")
+        assert receipt.status == WorkflowStatus.COMPLETED.value
+        session = fresh()
+        try:
+            appointment = session.get(Appointment, derm[0])
+            assert appointment.slot_id == shortlist[0]
+            assert appointment.status is AppointmentStatus.CONFIRMED
+        finally:
+            session.close()

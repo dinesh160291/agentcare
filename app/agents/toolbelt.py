@@ -590,10 +590,15 @@ class Toolbelt:
             # The window was real and there is nothing in it. Search again
             # without it, so the sentence naming the empty window has something
             # true to offer underneath.
+            target = self._target_appointment()
             widest = find_available_slots(
                 self.session,
                 department_id=department_id,
                 free_for_patient=self.patient_id,
+                # Same exclusion as the search that came back empty. A widening
+                # that quietly re-imposes a filter the narrow search dropped is
+                # two searches answering one question differently.
+                exclude_appointment_id=target.id if target is not None else None,
             )
             others = [
                 slot
@@ -833,6 +838,62 @@ class Toolbelt:
         )
         return None
 
+    def propose_reschedule_for(self, appointment_id: int) -> dict:
+        """Search, and hold a time, for the appointment the patient just picked.
+
+        The reschedule twin of :meth:`propose_cancellation_for`, and it closes
+        the gap between the two halves of one question. A cancel run reads the
+        answer to "which one?" and proposes in the same turn; a reschedule run
+        read the answer and then handed the turn to a specialist to work out
+        what to do with it. Live, that specialist answered "could you please
+        confirm which appointment you'd like to reschedule?" — the question the
+        patient had just answered — and the turn after it the model spent its
+        budget calling ``resolve_date`` on "Dermatology", on "3" and on "1".
+
+        Nothing here is new machinery. The search is
+        :meth:`_list_other_slots`, so the patient's own timing words are read by
+        ``resolve_date`` exactly as everywhere else and the whole of
+        :meth:`_answer_with_slots`' bookkeeping happens; the hold is
+        :meth:`_propose_change`, so ownership, liveness, department and the
+        patient's own diary are all checked by the same code the model's
+        ``propose_reschedule`` goes through. It proposes and cannot commit.
+
+        A refusal is returned rather than worked around: the caller falls back
+        to dispatching the specialist, which is where a message this could not
+        turn into a search belongs.
+        """
+        found = self._list_other_slots()
+        slots = found.get("slots") or []
+        if not slots:
+            return {"accepted": False, "problem": found.get("problem") or "No free times."}
+
+        # The earliest, which is what the Appointment agent proposes too — but
+        # never the hour the appointment already occupies. The search includes
+        # that hour on purpose (round 11: excluding the appointment being moved
+        # is what lets a patient ask for the other doctor at the same time), and
+        # offering it *unasked* renders as "I can move it to the same day at
+        # 2:00 PM" about an appointment already at 2:00 PM. It stays in the list
+        # of alternatives, where asking for it is the patient's own idea.
+        appointment = self.session.get(Appointment, appointment_id)
+        current = (
+            appointment.slot.start_time
+            if appointment is not None and appointment.slot is not None
+            else None
+        )
+        pick = next(
+            (
+                slot
+                for slot in slots
+                if current is None or datetime.fromisoformat(slot["start"]) != current
+            ),
+            slots[0],
+        )
+        return self._propose_change(
+            ProposedAction.RESCHEDULE,
+            appointment_id=appointment_id,
+            slot_id=int(pick["slot_id"]),
+        )
+
     def propose_cancellation_for(self, appointment_id: int) -> dict:
         """Propose cancelling the appointment the patient picked from the list.
 
@@ -906,6 +967,14 @@ class Toolbelt:
         if start is None and held is not None:
             start = held.start_time.date()
 
+        # The appointment being moved is not a reason to withhold a time from
+        # its own search. ``find_slots_for_reschedule`` has known that since
+        # round 11 — counting it hid the hour it currently occupies, so a
+        # patient asking for the other doctor at the same time was told nothing
+        # was free then — and this is the second route to the same answer, which
+        # owes everything the first one produced. ``None`` for a booking run,
+        # where ``_target_appointment`` has nothing settled to return.
+        target = self._target_appointment()
         found = find_available_slots(
             self.session,
             department_id=department_id,
@@ -913,6 +982,7 @@ class Toolbelt:
             end=end,
             part_of_day=window.get("part_of_day") or None,
             free_for_patient=self.patient_id,
+            exclude_appointment_id=target.id if target is not None else None,
         )
         # A constraint the patient stated must never be dropped in silence. It
         # can fail in two different ways and they are not interchangeable: the

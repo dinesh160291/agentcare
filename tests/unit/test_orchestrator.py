@@ -1139,8 +1139,17 @@ class TestACorrectedRetryIsStillAllowed:
         "The earliest the better" names no verb code can act on, so there is
         nothing for the recovery to read and the honest answer is the failure
         notice — with the queue item ``FAILED_REPLY`` promises behind it.
+
+        A **declined booking** run rather than the cancel run its siblings use,
+        because round 11b added the second half of the last resort: nothing
+        readable *and* nothing to re-ask. A run still holding a numbered list
+        has something to say for itself and now says it, so this control has to
+        be a run that genuinely does not — no list drawn, no appointment
+        picked, and no proposal outstanding.
         """
-        _waiting_cancel_run(patient, "s-widen-2")
+        turn(patient, BOOKING, "s-widen-2")
+        declined = turn(patient, "no", "s-widen-2")
+        assert declined.status == WorkflowStatus.IN_PROGRESS.value
         result = turn(patient, "the earliest the better", "s-widen-2")
 
         assert result.reply == FAILED_REPLY
@@ -4743,18 +4752,36 @@ class TestTheAnswerToWhichAppointment:
             session.close()
 
     def test_a_chosen_reschedule_searches_for_that_appointment(self, patient):
-        """The verb decides what the answer *does*. A cancel proposes; a
-        reschedule carries on into its own plan, where the slot search is — with
-        the target settled, so the search is for the right department."""
+        """The verb decides what the answer *does*, and both verbs now answer in
+        code. A cancel proposes; a reschedule searches the chosen appointment's
+        own department and holds a time in it.
+
+        Asserted on the department of the slot that was held rather than on the
+        tool that found it: a specialist call was the old evidence that the
+        search happened, and it is exactly what item 1(b) removes. Live, that
+        model turn asked "could you please confirm which appointment you'd like
+        to reschedule?" one message after the patient answered."""
         run_id, listed = self._asked(patient, "s-choice-7", verb="reschedule")
 
         result = turn(patient, "1", "s-choice-7")
 
-        assert "find_slots_for_reschedule" in _tools_called(result.turn_id)
+        called = _tools_called(result.turn_id)
+        assert "find_slots_for_reschedule" not in called
+        assert "propose_reschedule" not in called
+        assert "classify_message" not in called
         action, appointment_id, status = self._proposal(run_id)
         assert action is ProposedAction.RESCHEDULE
         assert appointment_id == listed[0]
         assert status is WorkflowStatus.PENDING_CONFIRMATION
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            chosen = session.get(Appointment, listed[0])
+            held = session.get(AppointmentSlot, run.proposed_slot_id)
+            assert held.doctor.department_id == chosen.department_id
+        finally:
+            session.close()
 
     def test_the_choice_is_not_asked_again_once_it_is_answered(self, patient):
         """A patient who has answered must not be re-asked; re-drawing the list
@@ -5143,6 +5170,21 @@ class ClashProposingLlm(MockLlm):
 
     It proposes the clash exactly once. A stub that kept proposing it would be
     testing the rejected-repeat budget instead, which is a different open item.
+
+    It also *decides which appointment* rather than asking, which the mock
+    would not: two live appointments and the mock says "you must name exactly
+    which one", so the run draws its numbered list and — since round 11b — the
+    answer to that list is searched and proposed in code, where the clashing
+    time is withheld by the search and this guard is never reached. Deciding is
+    what the live model did, and it is the only shape that puts a *model's*
+    proposal in front of the guard under test.
+
+    And it *recovers*, taking a time out of the search after the refusal, which
+    is the retry ladder every proposal tool depends on. That matters to the
+    assertions rather than to the stub: a turn that ends with no proposal at
+    all satisfies "the clashing slot was never held" and "the patient was never
+    shown that time" for free. The guard has to be what removed the clash, not
+    the turn giving up.
     """
 
     model: str = "clash-proposing-stub"
@@ -5150,12 +5192,17 @@ class ClashProposingLlm(MockLlm):
     moving_appointment_id: int = 0
 
     def _change_appointment(self, llm_request, done, task, step):  # noqa: ANN001
-        if (
-            step == "reschedule"
-            and "find_slots_for_reschedule" in done
-            and task.get("committed") != step
-            and latest_tool_result(llm_request, "propose_reschedule") is None
-        ):
+        if step != "reschedule" or task.get("committed") == step:
+            return super()._change_appointment(llm_request, done, task, step)
+
+        if "find_slots_for_reschedule" not in done:
+            return function_call_response(
+                "find_slots_for_reschedule",
+                {"appointment_id": self.moving_appointment_id},
+            )
+
+        tried = latest_tool_result(llm_request, "propose_reschedule")
+        if tried is None:
             return function_call_response(
                 "propose_reschedule",
                 {
@@ -5163,6 +5210,17 @@ class ClashProposingLlm(MockLlm):
                     "slot_id": self.clashing_slot_id,
                 },
             )
+        if not tried.payload.get("accepted"):
+            found = latest_tool_result(llm_request, "find_slots_for_reschedule")
+            offered = (found.payload.get("slots") if found else None) or []
+            if offered:
+                return function_call_response(
+                    "propose_reschedule",
+                    {
+                        "appointment_id": self.moving_appointment_id,
+                        "slot_id": offered[0]["slot_id"],
+                    },
+                )
         return super()._change_appointment(llm_request, done, task, step)
 
 
@@ -5239,30 +5297,27 @@ class TestARescheduleCannotLandOnTheirOwnAppointment:
         )
 
     def _ask(self, patient, when, session_id: str):
-        """The live shape, both turns of it.
+        """One turn that names the appointment and no destination.
 
-        Naming the destination date is naming the *other* appointment's date,
-        so turn 1 is refused as ambiguous — a date cue matching one appointment
-        and a department cue matching the other — and the numbered list is
-        drawn. That is what run #7 did, and the patient answered "2". Turn 2
-        carries no window, which is why the live search came back with all 138
-        slots and the model reached past them into the withheld list.
+        The department cue points at exactly one of the two appointments, so
+        ``resolve_target`` settles it without a numbered list and the
+        Appointment specialist runs — which is what this class needs, because
+        the stub above is a *model* proposing a withheld time and the guard
+        under test is the one that refuses it.
 
-        Without this second turn the run never proposes anything at all, and
-        every assertion below passes against a refusal one guard too early.
+        Naming the destination date instead is what the live run did, and it
+        is deliberately not what this does any more: a date cue matching one
+        appointment and a department cue matching the other is ambiguous, the
+        numbered list is drawn, and since round 11b the answer to that list is
+        searched and proposed *in code* — where the clashing time is withheld
+        by the search and never reaches this guard at all. That is defence in
+        depth working, and it is also a path with no model proposal on it, so
+        every assertion here would pass one layer too early.
+
+        No window, which is why the live search came back with all 138 slots
+        and the model reached past them into the withheld list.
         """
-        first = turn(
-            patient,
-            f"move my cardiology appointment to {when:%B} {when.day}",
-            session_id,
-        )
-        assert "which one" in first.reply.lower() or "more than one" in first.reply
-        choice = next(
-            line.strip()[0]
-            for line in first.reply.splitlines()
-            if line.strip()[:1].isdigit() and "Cardiology" in line
-        )
-        return turn(patient, choice, session_id)
+        return turn(patient, "please move my cardiology appointment", session_id)
 
     def test_the_clashing_slot_is_never_held(self, patient, two_appointments):
         clashing_slot_id, when = two_appointments
@@ -5635,21 +5690,43 @@ class DriftingChoiceLlm(MockLlm):
     It drifts only on the proposal. The search still runs for the right
     appointment, which is what makes the override's result a *correct* proposal
     rather than a refusal about departments.
+
+    Where it gets the wrong id from changed in round 11b. The answered list is
+    spent, so the typed task no longer carries one — and a stub keyed on that
+    field would have gone quietly inert, which is the failure mode a
+    falsification stub can least afford. It reads the patient's appointments
+    itself instead and proposes one the narrowed task did not name, which is
+    what "ignores the task" means once the task has been narrowed.
     """
 
     model: str = "drifting-choice-stub"
 
-    def _appointment(self, llm_request, done, task):  # noqa: ANN001
+    def _drift_to(self, llm_request, done, task):  # noqa: ANN001
         listed = task.get("listed_appointment_ids") or []
+        if listed:
+            return listed[-1]
+        rows = latest_tool_result(llm_request, "list_my_appointments")
+        if rows is None:
+            return None
+        mine = [
+            row["appointment_id"] for row in rows.payload.get("appointments") or []
+        ]
+        narrowed = [row["appointment_id"] for row in task.get("appointments") or []]
+        return next((one for one in mine if one not in narrowed), None)
+
+    def _appointment(self, llm_request, done, task):  # noqa: ANN001
+        if not task.get("listed_appointment_ids") and "list_my_appointments" not in done:
+            return function_call_response("list_my_appointments", {})
+        other = self._drift_to(llm_request, done, task)
         response = super()._appointment(llm_request, done, task)
-        if not listed:
+        if other is None:
             return response
         for call in response.content.parts if response.content else []:
             if call.function_call and call.function_call.name in (
                 "propose_reschedule",
                 "propose_cancellation",
             ):
-                call.function_call.args["appointment_id"] = listed[-1]
+                call.function_call.args["appointment_id"] = other
         return response
 
 
@@ -5660,6 +5737,14 @@ class TestThePatientsAnswerOutranksTheModelsArgument:
     typed task carries that row alone — but a task field is advisory, and the
     listed-ids check under ``_propose_change`` cannot catch a model that
     proposes the *other* listed appointment, because that one was listed too.
+
+    Round 11b moved where a model gets to propose at all: the answering turn is
+    code's, so this stub is never consulted on the happy path and both tests
+    below pass without it drifting anywhere. That is not the stub going
+    decorative — it is the negative control for item 1(b). Take the code-driven
+    branch out of ``_settle_choice`` and the specialist runs again, the drift
+    lands, and each test reddens on its own claim: the wrong appointment held,
+    and a trace that names the wrong row as settled.
     """
 
     @pytest.fixture(autouse=True)
@@ -5668,35 +5753,43 @@ class TestThePatientsAnswerOutranksTheModelsArgument:
             "app.agents.base.get_provider", lambda name=None: DriftingChoiceLlm()
         )
 
-    def test_the_chosen_appointment_is_the_one_proposed(self, patient):
-        turn(patient, "I need a dermatology appointment for a rash", "s-drift-1")
-        turn(patient, "yes", "s-drift-1")
-        result = turn(patient, "please reschedule my appointment", "s-drift-1")
+    def _answered(self, patient, session_id: str) -> tuple[int, list[int]]:
+        turn(patient, "I need a dermatology appointment for a rash", session_id)
+        turn(patient, "yes", session_id)
+        started = turn(patient, "please reschedule my appointment", session_id)
 
         session = fresh()
         try:
             listed = list(
-                session.get(WorkflowRun, result.run_id).state["listed_appointment_ids"]
+                session.get(WorkflowRun, started.run_id).state["listed_appointment_ids"]
             )
         finally:
             session.close()
         assert len(listed) == 2
+        return started.run_id, listed
+
+    def test_the_chosen_appointment_is_the_one_proposed(self, patient):
+        run_id, listed = self._answered(patient, "s-drift-1")
 
         turn(patient, "1", "s-drift-1")
 
         session = fresh()
         try:
-            run = session.get(WorkflowRun, result.run_id)
+            run = session.get(WorkflowRun, run_id)
             assert run.proposed_appointment_id == listed[0]
             assert run.proposed_appointment_id != listed[-1]
         finally:
             session.close()
 
-    def test_the_override_is_traced(self, patient):
-        """A correction nobody can see is a correction nobody can audit."""
-        turn(patient, "I need a dermatology appointment for a rash", "s-drift-2")
-        turn(patient, "yes", "s-drift-2")
-        turn(patient, "please reschedule my appointment", "s-drift-2")
+    def test_which_appointment_was_settled_is_traced(self, patient):
+        """A decision nobody can see is a decision nobody can audit.
+
+        The row says *which* appointment and *why* — ``reason: "chosen"``,
+        meaning the patient's own answer settled it rather than a cue or a
+        model's argument. That claim holds whichever component ends up calling
+        ``_propose_change``, which is what makes it the right thing to assert
+        now that the caller has changed."""
+        run_id, listed = self._answered(patient, "s-drift-2")
 
         result = turn(patient, "1", "s-drift-2")
 
@@ -5713,9 +5806,9 @@ class TestThePatientsAnswerOutranksTheModelsArgument:
             ]
         finally:
             session.close()
-        assert targets, "the override left no trace"
-        assert targets[-1]["accepted"] is False
+        assert targets, "the target decision left no trace"
         assert targets[-1]["detail"]["reason"] == "chosen"
+        assert targets[-1]["detail"]["resolved"] == listed[0]
 
 
 class TaskTrustingLlm(MockLlm):
@@ -5764,9 +5857,10 @@ class SilentSpecialistLlm(MockLlm):
 class TestTheChoiceIsMadeOnce:
     """What the answer buys, past the proposal it produces.
 
-    Two things follow, and neither shows in the happy path: the specialist is
-    handed the chosen row *alone*, and a turn that proposes nothing anyway must
-    not re-draw the list the patient has already answered.
+    Two things follow, and neither shows in the happy path: the answer decides
+    which appointment is acted on whatever a model would have preferred, and a
+    turn that proposes nothing anyway must not re-draw the list the patient has
+    already answered.
 
     The second was briefly deleted for being unfalsifiable, and it was — while
     asking "which one?" still spent the run's only re-plan, the answering turn
@@ -5774,6 +5868,13 @@ class TestTheChoiceIsMadeOnce:
     it was passing against a **failure notice** rather than against a re-drawn
     list. Both the guard and its test came back with the budget fix that made
     the turn survivable. A guard is only as testable as the path it sits on.
+
+    Round 11b moved where these hold. The answer now drives the search from
+    code, so no specialist is dispatched between "which one?" and "here are the
+    times" — which is why both stubs below are models that would have got it
+    wrong and are never asked. Sabotage the code-driven branch and each one
+    reddens its own test: the task-trusting model searches the rejected row's
+    department, and the silent one proposes nothing at all.
     """
 
     def _answered(self, patient, session_id: str) -> tuple[int, list[int]]:
@@ -5790,20 +5891,22 @@ class TestTheChoiceIsMadeOnce:
         assert len(listed) == 2
         return result.run_id, listed
 
-    def test_the_specialist_searches_for_the_chosen_appointment(
-        self, patient, monkeypatch
-    ):
-        """With the rejected appointment still in the task, a model that trusts
-        its task searches the wrong department — and the target override then
-        has to refuse the slot it comes back with, leaving the patient with
-        nothing at all."""
+    def test_the_chosen_appointment_is_the_one_proposed(self, patient, monkeypatch):
+        """A model that trusts its task would search the rejected row's
+        department, and the target override would then have to refuse the slot
+        it came back with, leaving the patient with nothing at all.
+
+        It is never asked. The search for a chosen reschedule is code's, so the
+        chosen row is the only one that can be proposed — and the tool call
+        that would have gone wrong is absent from the turn entirely."""
         monkeypatch.setattr(
             "app.agents.base.get_provider", lambda name=None: TaskTrustingLlm()
         )
         run_id, listed = self._answered(patient, "s-once-1")
 
-        turn(patient, "1", "s-once-1")
+        result = turn(patient, "1", "s-once-1")
 
+        assert "find_slots_for_reschedule" not in _tools_called(result.turn_id)
         session = fresh()
         try:
             run = session.get(WorkflowRun, run_id)
@@ -5833,7 +5936,13 @@ class TestTheChoiceIsMadeOnce:
         reply to a correct answer was "I couldn't complete this request".
 
         A step that ends by asking the patient is waiting on them, exactly as a
-        proposal waits on a "yes". The turn ends either way; nothing loops."""
+        proposal waits on a "yes". The turn ends either way; nothing loops.
+
+        The answering turn no longer depends on the specialist getting it
+        right — the search is code's — so the fumble that cost the run its last
+        retry does not happen at all: this stub proposes nothing and the run
+        still ends up holding a time, on a re-plan budget that was never
+        touched."""
         monkeypatch.setattr(
             "app.agents.base.get_provider", lambda name=None: SilentSpecialistLlm()
         )
@@ -5850,9 +5959,287 @@ class TestTheChoiceIsMadeOnce:
         session = fresh()
         try:
             run = session.get(WorkflowRun, run_id)
-            # The fumble does spend it, and the run survives to be asked again.
-            assert run.replan_count == 1
-            assert run.status is WorkflowStatus.IN_PROGRESS
+            assert run.replan_count == 0
+            assert run.status is WorkflowStatus.PENDING_CONFIRMATION
         finally:
             session.close()
         assert result.reply != FAILED_REPLY
+
+
+class TestTheChoiceListIsOneShot:
+    """Round 11b item 1 — run #15, the four-step cascade, replayed whole.
+
+    One question, four ways of getting it wrong, each one downstream of the
+    last:
+
+    1. The list closes with "Tell me the number, **or name the department**".
+       The patient held two Dermatology appointments and answered
+       "Dermatology". No position was found, the Coordinator called the message
+       ``conflicting``, and the run was **superseded** — the template's own
+       suggested answer threw the request away.
+    2. On the re-drawn list "3" was read correctly, and the turn then went to a
+       model that asked "could you please confirm which appointment you'd like
+       to reschedule?" — the question just answered.
+    3. A list of *times* was drawn next. "1" was captured by
+       ``listed_appointment_ids``, still holding ``[4, 3, 5]`` from step 2, and
+       read as appointment 4. The slot shortlist beside it was fresh and never
+       consulted.
+    4. The model then called ``resolve_date`` on "Dermatology", on "3" and on
+       "1" until the budget went, and ``_fail_run`` tombstoned the run.
+
+    Every fix is deterministic and each has its own falsification: stop
+    clearing the list and step 3 misbinds again; drop the department reader and
+    step 1 supersedes again; hand the answer back to the specialist and step 2
+    returns; take the budget floor away and step 4 ends the run.
+    """
+
+    @pytest.fixture
+    def two_dermatology(self, seeded_db, patient):
+        """Two Dermatology appointments at different times, beside the seeded
+        Cardiology one — so a department answer narrows the list to two rows
+        without settling it.
+
+        A department is what makes this ambiguous rather than a second cue,
+        because ``uq_department_synonym_term`` is global: one term lives in one
+        department, so two rows in *the same* department is the only way to
+        build a department answer that cannot decide.
+        """
+        rows = (
+            seeded_db.query(AppointmentSlot)
+            .join(Doctor, Doctor.id == AppointmentSlot.doctor_id)
+            .join(Department, Department.id == Doctor.department_id)
+            .filter(
+                Department.name == "Dermatology",
+                AppointmentSlot.status == SlotStatus.AVAILABLE,
+                AppointmentSlot.start_time > clock.now(),
+            )
+            .order_by(AppointmentSlot.start_time)
+            .all()
+        )
+        picked: list = []
+        seen: set = set()
+        for slot in rows:
+            if slot.start_time in seen:
+                continue
+            seen.add(slot.start_time)
+            picked.append(slot)
+            if len(picked) == 2:
+                break
+        assert len(picked) == 2, "the seed has no two Dermatology times"
+
+        created = []
+        for index, slot in enumerate(picked):
+            slot.status = SlotStatus.BOOKED
+            row = Appointment(
+                patient_id=1,
+                doctor_id=slot.doctor_id,
+                slot_id=slot.id,
+                department_id=slot.doctor.department_id,
+                status=AppointmentStatus.CONFIRMED,
+                reference_code=f"AC-0000{80 + index}",
+                reason="skin check",
+            )
+            seeded_db.add(row)
+            created.append(row)
+        seeded_db.commit()
+        return [row.id for row in created]
+
+    def _listed(self, run_id: int) -> list[int]:
+        session = fresh()
+        try:
+            return list(
+                (session.get(WorkflowRun, run_id).state or {}).get(
+                    "listed_appointment_ids"
+                )
+                or []
+            )
+        finally:
+            session.close()
+
+    def _asked(self, patient, session_id: str):
+        result = turn(patient, "please reschedule my appointment", session_id)
+        assert len(self._listed(result.run_id)) == 3, "the run did not ask which one"
+        return result.run_id
+
+    def test_a_department_answer_narrows_instead_of_superseding(
+        self, patient, two_dermatology
+    ):
+        """Step 1. The run survives, the question shrinks, and the classifier is
+        never consulted — the supersede came from a class, and there is no class
+        because there is no model turn."""
+        run_id = self._asked(patient, "s-cascade-1")
+
+        result = turn(patient, "Dermatology", "s-cascade-1")
+
+        assert result.run_id == run_id, "the run was replaced by its own answer"
+        assert result.status == WorkflowStatus.IN_PROGRESS.value
+        assert "classify_message" not in _tools_called(result.turn_id)
+        assert "2 Dermatology appointments" in result.reply
+        assert self._listed(run_id) == two_dermatology
+
+    def test_a_narrowed_reask_stops_inviting_the_answer_it_just_got(
+        self, patient, two_dermatology
+    ):
+        """Every row now shares a department, so repeating "or name the
+        department" would ask for an answer that has already failed to settle
+        anything — which is how a re-ask becomes a loop."""
+        self._asked(patient, "s-cascade-2")
+
+        result = turn(patient, "Dermatology", "s-cascade-2")
+
+        assert "name the department" not in result.reply
+
+    def test_a_department_naming_one_row_picks_it(self, patient):
+        """The other half of the same reader, and the one the live session never
+        reached. One match is a decision; ``_asked`` here lists a Dermatology
+        appointment and a Cardiology one."""
+        turn(patient, "I need a dermatology appointment for a rash", "s-cascade-3")
+        turn(patient, "yes", "s-cascade-3")
+        started = turn(patient, "please cancel my appointment", "s-cascade-3")
+        listed = self._listed(started.run_id)
+        assert len(listed) == 2
+
+        turn(patient, "the cardiology one", "s-cascade-3")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, started.run_id)
+            chosen = session.get(Appointment, run.proposed_appointment_id)
+            assert run.proposed_action is ProposedAction.CANCEL
+            assert chosen.department.name == "Cardiology"
+        finally:
+            session.close()
+
+    def test_the_answer_is_searched_and_held_without_a_model_turn(
+        self, patient, two_dermatology
+    ):
+        """Step 2. No specialist between "which one?" and "here are the times",
+        so there is nothing there to ask the question again."""
+        run_id = self._asked(patient, "s-cascade-4")
+        turn(patient, "Dermatology", "s-cascade-4")
+
+        result = turn(patient, "1", "s-cascade-4")
+
+        called = _tools_called(result.turn_id)
+        assert "classify_message" not in called
+        assert "find_slots_for_reschedule" not in called
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+        session = fresh()
+        try:
+            outbound = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.OUTBOUND
+            ]
+            assert [event.author for event in outbound] == [TraceAuthor.TEMPLATE]
+            run = session.get(WorkflowRun, run_id)
+            assert run.proposed_action is ProposedAction.RESCHEDULE
+            assert run.proposed_appointment_id == two_dermatology[0]
+            # Not the hour it already has. The search *includes* that hour on
+            # purpose — round 11, so a patient can ask for the other doctor at
+            # the same time — and offering it unasked renders as "I can move it
+            # to the same day at 2:00 PM" about an appointment already at 2:00.
+            moving = session.get(Appointment, two_dermatology[0])
+            held = session.get(AppointmentSlot, run.proposed_slot_id)
+            assert held.start_time != moving.slot.start_time
+        finally:
+            session.close()
+        assert "Other times I could move it to:" in result.reply
+
+    def test_the_spent_list_no_longer_captures_the_next_number(
+        self, patient, two_dermatology
+    ):
+        """Step 3, which is the whole of item 1(a). "1" now means row one of the
+        times on screen, because the appointment list that would have claimed it
+        was spent the moment it was answered.
+
+        Pinned on the *slot* and on the verb together: binding to the stale list
+        would have moved a different appointment, and a re-hold that went
+        through the booking path would have flipped the verb."""
+        run_id = self._asked(patient, "s-cascade-5")
+        turn(patient, "Dermatology", "s-cascade-5")
+        offer = turn(patient, "1", "s-cascade-5")
+        assert self._listed(run_id) == [], "the answered list was left standing"
+
+        session = fresh()
+        try:
+            shortlist = list(session.get(WorkflowRun, run_id).state["shortlist_slot_ids"])
+            first_held = session.get(WorkflowRun, run_id).proposed_slot_id
+        finally:
+            session.close()
+        assert shortlist, "no times were rendered to answer"
+
+        result = turn(patient, "1", "s-cascade-5")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, run_id)
+            assert run.proposed_action is ProposedAction.RESCHEDULE
+            assert run.proposed_appointment_id == two_dermatology[0]
+            assert run.proposed_slot_id == shortlist[0]
+            assert run.proposed_slot_id != first_held
+        finally:
+            session.close()
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+
+class TestABlownBudgetDoesNotEndAnAnsweredRun:
+    """Round 11b item 1(d) — the budget floor, extended to list answers.
+
+    Round 11 protected the turn whose *message* said plainly what it wanted.
+    This is the turn where the *run* does: a numbered list on screen, or an
+    appointment the patient has already picked, is a conversation one message
+    from continuing. Live it was ended instead — "I'm sorry, I couldn't
+    complete this request", plus a ``system_failure`` queue item, for a run
+    whose only problem was that one turn spent its budget.
+
+    Driven by :class:`WideningSearchLlm`, which corrects its argument every
+    call: an identical loop is stopped by round 11's repeat bound long before
+    the budget, so a *widening* one is the only shape that still reaches it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _widen(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: WideningSearchLlm()
+        )
+
+    def test_the_list_comes_back_instead_of_the_failure_notice(self, patient):
+        started = _waiting_cancel_run(patient, "s-floor-1")
+
+        result = turn(patient, "the earliest the better", "s-floor-1")
+
+        assert result.reply != FAILED_REPLY
+        assert "which one to cancel" in result.reply
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, started.run_id)
+            assert run.status is WorkflowStatus.IN_PROGRESS
+            assert (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.SYSTEM_FAILURE)
+                .count()
+                == 0
+            ), "a run nobody failed must not open a failure queue item"
+            assert _guard(session, result.turn_id, "budget_reask")["passed"] is True
+            assert _validations(session, result.turn_id, "tool_iteration_budget"), (
+                "the budget must actually have blown for this to mean anything"
+            )
+        finally:
+            session.close()
+
+    def test_a_run_with_nothing_outstanding_still_fails(self, patient):
+        """The negative control, and the reason ``_fail_run`` stays. A declined
+        booking run holds no list, has picked no appointment and has nothing
+        proposed, so there is nothing to re-ask with and the failure notice is
+        the honest answer."""
+        turn(patient, BOOKING, "s-floor-2")
+        declined = turn(patient, "no", "s-floor-2")
+        assert declined.status == WorkflowStatus.IN_PROGRESS.value
+
+        result = turn(patient, "the earliest the better", "s-floor-2")
+
+        assert result.reply == FAILED_REPLY

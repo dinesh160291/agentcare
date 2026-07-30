@@ -119,13 +119,14 @@ from app.workflow.replies import (
     render_appointment_choice,
     window_heading,
     window_note,
+    render_change_options,
     render_change_proposal,
     render_proposal,
     render_reask,
     render_receipt,
 )
 from app.workflow.state_machine import create_run, is_legal, transition
-from app.workflow.targets import read_choice
+from app.workflow.targets import narrow_by_department, read_choice
 
 # Code-authored replies. They are templates on purpose: a guard's output and a
 # failure notice are the system's most deterministic moments, and they must
@@ -758,6 +759,32 @@ def _choice_reask(session: Session, run: WorkflowRun) -> str:
     return render_appointment_choice(session, run, _live_appointments(run), verb=verb)
 
 
+def _budget_reask(session: Session, run: WorkflowRun) -> str:
+    """What this run still has to say for itself when a budget blows.
+
+    "" when it has nothing outstanding, which is what leaves ``_fail_run`` as
+    the last resort it is meant to be.
+
+    Two things count as outstanding, and both are questions the *run* is
+    holding rather than answers the *message* carried — which is what makes
+    this the twin of ``_settle_unclassified_turn`` and not a copy of it. A
+    numbered list the patient has not answered comes back, re-drawn and
+    re-recorded so the next number means something. An appointment they have
+    already picked, with nothing committed against it yet, gets the re-ask that
+    states where the run stands.
+
+    Nothing is transitioned and nothing is escalated on this path. The run is
+    not broken; one turn spent its budget, and the conversation is one message
+    from carrying on.
+    """
+    if listed_appointment_ids(run):
+        return _choice_reask(session, run)
+    state = run.state or {}
+    if state.get("chosen_appointment_id") and not state.get("committed_action"):
+        return render_reask(session, run)
+    return ""
+
+
 async def _settle_choice(
     session: Session,
     *,
@@ -798,13 +825,50 @@ async def _settle_choice(
     if verb is None or not listed:
         return None
 
+    live = _live_appointments(run)
     appointment_id = read_choice(message, listed=listed)
+    # The list's own closing sentence says "Tell me the number, **or name the
+    # department**", and only the number had a reader. Live, with two
+    # Dermatology appointments numbered on screen, "Dermatology" found no
+    # position, went to the Coordinator, came back `conflicting`, and superseded
+    # the run — the template's suggested answer destroyed the request it was
+    # asked about. A question that offers two ways to answer owns both of them.
+    narrowed: list[int] = []
+    if appointment_id is None:
+        narrowed = narrow_by_department(
+            session, message, listed=listed, appointments=live
+        )
+        if len(narrowed) == 1:
+            appointment_id = narrowed[0]
+
     writer.guard_verdict(
         "appointment_selection",
         passed=appointment_id is not None,
-        detail={"appointment_id": appointment_id, "listed": listed, "verb": verb},
+        detail={
+            "appointment_id": appointment_id,
+            "listed": listed,
+            "verb": verb,
+            "narrowed": narrowed,
+        },
     )
     if appointment_id is None:
+        if len(narrowed) > 1:
+            # Half an answer is still an answer. The patient has ruled rows out;
+            # asking again over the ones that are left is a shorter question
+            # than the one before it, and `render_appointment_choice` re-records
+            # `listed_appointment_ids` as it draws, so the next number means
+            # what it appears to mean.
+            rows = [row for row in live if int(row["appointment_id"]) in narrowed]
+            return TurnResult(
+                reply=render_appointment_choice(
+                    session, run, rows, verb=verb, narrowed=True
+                ),
+                author=TraceAuthor.TEMPLATE,
+                run_id=run.id,
+                status=run.status.value,
+                message_class=MessageClass.CONTINUATION,
+                **base,
+            )
         # Out of range, or not a position at all. The model gets it, exactly as
         # it did before this existed.
         return None
@@ -816,10 +880,19 @@ async def _settle_choice(
         first and then handed the turn back to the model would append the
         message twice — once here and once when ``FEED_RUN`` appends it — and
         the duplicate is read later by routing and by slot matching.
+
+        **The list is spent the moment it is answered.** It was left standing,
+        and a number in a later turn then bound to it rather than to whatever
+        was actually on screen: live, after this reader resolved "3" against
+        ``[4, 3, 5]``, the run went on to render a list of *times*, the patient
+        answered "1", and that 1 was read as appointment 4. The slot reader's
+        own shortlist was fresh and correct and never got the chance. One list
+        is outstanding at a time, and answering it is what ends it.
         """
         run.request_text = f"{run.request_text}\n{message}".strip()
         state = dict(run.state or {})
         state["chosen_appointment_id"] = appointment_id
+        state["listed_appointment_ids"] = []
         run.state = state
         session.flush()
 
@@ -840,6 +913,37 @@ async def _settle_choice(
         )
 
     record()
+
+    # A reschedule's answer drives its own next step, exactly as the cancel
+    # branch above does. It used to hand the turn to the Appointment specialist,
+    # which had the answer in its typed task and asked the question again
+    # anyway: "could you please confirm which appointment you'd like to
+    # reschedule?", live, one message after the patient said "3". The turn after
+    # that, with three sentences of numbers behind it, the model called
+    # ``resolve_date`` on "Dermatology", on "3" and on "1" until the budget
+    # went and the run was tombstoned.
+    #
+    # Nothing about the search or the hold is new — see
+    # :meth:`Toolbelt.propose_reschedule_for`. What changes is that no model
+    # turn sits between "which one?" and "here are the times", so there is
+    # nothing there to get it wrong.
+    proposed = belt.propose_reschedule_for(appointment_id)
+    if proposed.get("accepted"):
+        change = render_change_proposal(session, run)
+        others = render_change_options(session, run, belt.proposals.offered_slots)
+        return TurnResult(
+            reply=f"{change}\n\n{others}" if others else change,
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            message_class=MessageClass.CONTINUATION,
+            **base,
+        )
+
+    # Nothing free, or the hold was refused. The refusal is already traced, and
+    # the specialist is where a message code could not turn into a search
+    # belongs — it still runs with the target settled, so it is answering a
+    # narrower question than the one it used to be handed.
     result = await _execute_plan(
         session,
         run=run,
@@ -3459,7 +3563,43 @@ def _fail_run(
     time because one turn misbehaved would cost the patient the booking they
     had already made a decision about. What the turn owes is the notice and the
     queue item, and both are written either way.
+
+    **And a run with a question outstanding is not a run to end.** Round 11
+    protected the turn where the *message* said plainly what it wanted; this is
+    the turn where the *run* does. A numbered list on screen, or an appointment
+    the patient has already picked, is a conversation one message from
+    continuing — and live it was ended instead, with "I'm sorry, I couldn't
+    complete this request" and a ``system_failure`` queue item, because a model
+    spent its budget calling ``resolve_date`` on the patient's answers. The
+    last resort stays the last resort: nothing readable **and** nothing to
+    re-ask.
     """
+    reask = _budget_reask(session, run)
+    if reask:
+        writer.guard_verdict(
+            "budget_reask",
+            passed=True,
+            detail={"reason": reason, "status": run.status.value, "run_id": run.id},
+        )
+        write_audit(
+            session,
+            action="turn_budget_exhausted",
+            entity_type="workflow_run",
+            entity_id=run.id,
+            actor=user,
+            metadata={"reason": reason, "applied": "reask"},
+        )
+        return TurnResult(
+            reply=reask,
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            plan=plan,
+            steps_run=steps_run,
+            budget_exhausted=True,
+            **base,
+        )
+
     if is_legal(run.status, WorkflowStatus.FAILED):
         transition(
             session,

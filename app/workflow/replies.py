@@ -502,7 +502,12 @@ def was_listed(run: WorkflowRun, appointment_id: int) -> bool:
 
 
 def render_appointment_choice(
-    session: Session, run: WorkflowRun, appointments: Sequence[dict[str, Any]], *, verb: str
+    session: Session,
+    run: WorkflowRun,
+    appointments: Sequence[dict[str, Any]],
+    *,
+    verb: str,
+    narrowed: bool = False,
 ) -> str:
     """Ask which appointment, numbering them — and record what was numbered.
 
@@ -519,6 +524,12 @@ def render_appointment_choice(
 
     Returns "" for fewer than two candidates — with one appointment there is
     nothing to choose between, and asking would be a worse answer than acting.
+
+    ``narrowed`` is the second time of asking, after a department answer picked
+    out some of the rows but not one of them. The rows then all share a
+    department, so the opening sentence says which and the closing one drops
+    the invitation to name it — repeating an answer that has already been given
+    and did not settle the question is how a re-ask becomes a loop.
     """
     rows = list(appointments or [])
     if len(rows) < 2:
@@ -540,6 +551,13 @@ def render_appointment_choice(
     run.state = state
 
     action = "cancel" if verb == "cancel" else "move"
+    if narrowed:
+        return (
+            f"You have {len(rows)} {rows[0].get('department_name')} appointments, "
+            f"so tell me which one to {action}:\n"
+            + "\n".join(lines)
+            + "\n\nTell me the number. Nothing has changed yet."
+        )
     return (
         f"You have more than one upcoming appointment, so I want to be sure "
         f"which one to {action}:\n"
@@ -612,6 +630,38 @@ def render_change_proposal(session: Session, run: WorkflowRun) -> str:
         f"Your {who} is currently {current_day} at {current_time}. "
         f"I can move it to {moved}. "
         'Say "yes" and I\'ll make the change — nothing moves until you do.'
+    )
+
+
+def render_change_options(
+    session: Session, run: WorkflowRun, slots: Sequence[dict]
+) -> str:
+    """The other times a held reschedule could move to, numbered and recorded.
+
+    :func:`render_change_proposal` names one new time and nothing else, which
+    is right for the sentence it has to get right — two times of the same shape
+    is what a paraphrase loses — and leaves the patient with one offer to take
+    or refuse. When code has just run the search itself it already has the rest
+    of them, and a list nobody can answer is the failure this whole area keeps
+    producing: so rendering and recording are one step here too.
+
+    Not :func:`render_alternatives`, which closes with
+    :func:`render_reask`. The proposal sentence above this one already says
+    what a "yes" would do, and asking twice in one reply reads as two
+    questions about two different things.
+
+    Returns "" when there is nothing else to show, so the caller can
+    concatenate unconditionally.
+    """
+    shortlist = _shortlist(slots, held=run.proposed_slot_id, first=False)
+    options = render_options(shortlist, proposed_slot_id=None)
+    if not options:
+        return ""
+    record_offered(run, shortlist)
+    record_shortlist(run, shortlist)
+    return (
+        f"Other times I could move it to:\n{options}\n\n"
+        "Tell me a number if you'd rather have one of those."
     )
 
 
@@ -849,6 +899,7 @@ __all__ = [
     "shortlist_slot_ids",
     "render_alternatives",
     "render_appointment_choice",
+    "render_change_options",
     "render_change_proposal",
     "render_options",
     "render_outstanding",
