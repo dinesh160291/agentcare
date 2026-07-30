@@ -257,11 +257,15 @@ class TestEscalationDedup:
 
 
 class TestTheScreenFiresWhateverTheState:
-    def test_an_emergency_mid_confirmation_escalates_the_live_run(self, patient):
+    def test_an_emergency_mid_confirmation_escalates(self, patient):
+        """The screen's own rule, and it is about the *screen* rather than about
+        which row the escalation lands on. Round 11b moved the row — a live run
+        is spared and the scare gets its own — and left this untouched: the
+        trigger fires from every state, and the turn ends escalated."""
         first = turn(patient, BOOKING, "s-safety-11")
         result = turn(patient, EMERGENCY, "s-safety-11")
 
-        assert result.run_id == first.run_id
+        assert result.run_id != first.run_id
         assert result.status == WorkflowStatus.ESCALATED.value
 
     def test_the_pending_booking_is_not_committed(self, patient):
@@ -409,6 +413,21 @@ class TestAnEscalatedBookingIsSignposted:
 
         assert reply == CLINICAL_REPLY
 
+    def test_asking_to_be_seen_is_signposted(self):
+        """Round 11b item 2b. The gate used to demand ``{BOOK}`` — a booking
+        verb *and* an appointment noun — and a symptom-forward sentence has
+        neither: live, "stomach upset with acidity, need to see someone"
+        escalated with no path back at all. Asking to be seen is asking for an
+        appointment in the words patients actually use."""
+        from app.safety import reply_for
+
+        for sentence in (
+            "stomach upset with acidity, need to see someone",
+            "my knee is sore, can I get checked",
+            "I'd like to see a doctor about this",
+        ):
+            assert BOOKING_HINT in reply_for(self._clinical(), sentence), sentence
+
     def test_an_emergency_is_never_invited_to_book(self):
         """The direction that matters most, and the one the work order did not
         have to specify. The emergency reply says this needs urgent help
@@ -508,21 +527,27 @@ class TestTheScreensTerminalToolIsTheOneItActuallyHas:
 
 
 class TestAScareDoesNotConsumeARequestAwaitingStaff:
-    """Round 6, item 5 — the one state where attaching is the wrong move.
+    """Round 6 item 5, widened by round 11b item 2 — a live run is never the
+    one to escalate.
 
-    Attaching a safety trigger to the active run is right while the *system*
-    holds that run: the scare interrupted that conversation, and one queue item
-    for one frightened patient is the whole point of the dedup rule.
+    It shipped scoped to ``pending_review``, because that is where it was
+    found: run 8 of the round-6 session, "book an appointment, my kid has ear
+    pain", routed ambiguously and queued for review, then an unrelated scare
+    two messages later took it ``pending_review -> escalated`` and the request
+    died without any staff decision on it. The reasoning for stopping there was
+    that at ``in_progress`` nothing is waiting on a person, so folding the
+    scare into the conversation it interrupted reads correctly.
 
-    It is wrong the moment a *human* holds it. Live, run 8: "book an
-    appointment, my kid has ear pain" routed ambiguously and queued for review,
-    and two messages later an unrelated scare arrived. The active run was the
-    queued one, so it went ``pending_review -> escalated`` — which is terminal —
-    and the ear-pain request died there. No staff decision was ever made on it,
-    nothing told the patient, and the queue item that remained described a
-    department choice rather than the scare.
+    It does not. Live again, one round later: "I get bad migraines every
+    morning", said during an ``in_progress`` General Medicine checkup request,
+    consumed it the same way — four messages of work gone, and nothing in the
+    reply so much as mentioned it. ``escalated`` is terminal wherever it is
+    reached from, and a scare is a *different subject* by definition, which is
+    why it fired.
 
-    The scare is not that request, so it does not get that request's row.
+    So every live run is spared, and the reply names what is still open. The
+    dedup bound is untouched: repeats attach to this session's escalated run,
+    which is never the active one.
     """
 
     AMBIGUOUS = "book an appointment, my kid has ear pain"
@@ -632,16 +657,71 @@ class TestAScareDoesNotConsumeARequestAwaitingStaff:
         assert verdicts[0]["passed"] is False
         assert verdicts[0]["detail"]["status"] == WorkflowStatus.PENDING_REVIEW.value
 
-    def test_a_run_the_system_still_holds_is_escalated_as_before(self, patient):
-        """The negative control, and the reason this is keyed to one state.
-        Nothing is waiting on a person at ``pending_confirmation``, so folding
-        the scare into the conversation it interrupted stays the right reading —
-        and the pinned rule that a safety trigger fires whatever the state must
-        not have quietly become "whatever the state, except two"."""
+    def test_a_held_proposal_is_spared_too(self, patient):
+        """Round 11b: the state the carve-out used to exclude.
+
+        A held slot is a decision the patient already made. Ending the run that
+        holds it because they also mentioned a symptom throws that decision
+        away — and the reply, which says the message went to staff, reads like
+        the end of the conversation."""
         first = turn(patient, BOOKING, "s-safety-queued-7")
         assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
 
         result = turn(patient, EMERGENCY, "s-safety-queued-7")
 
-        assert result.run_id == first.run_id
+        assert result.run_id != first.run_id
         assert result.status == WorkflowStatus.ESCALATED.value
+        session = fresh()
+        try:
+            spared = session.get(WorkflowRun, first.run_id)
+            assert spared.status is WorkflowStatus.PENDING_CONFIRMATION
+            assert spared.proposed_slot_id is not None
+        finally:
+            session.close()
+
+    def test_the_screen_still_fires_whatever_the_state(self, patient):
+        """The negative control, restated where it still bites. Sparing the run
+        is about *which row the escalation is keyed to* — the trigger itself
+        fires exactly as it always did, from every state, and the queue item is
+        opened either way. This must not have quietly become "the screen fires,
+        except mid-run"."""
+        turn(patient, BOOKING, "s-safety-queued-8")
+
+        result = turn(patient, EMERGENCY, "s-safety-queued-8")
+
+        assert result.status == WorkflowStatus.ESCALATED.value
+        assert result.author is TraceAuthor.GUARD
+        session = fresh()
+        try:
+            rows = (
+                session.query(Escalation)
+                .filter(Escalation.workflow_run_id == result.run_id)
+                .all()
+            )
+            assert [row.kind for row in rows] == [EscalationKind.SAFETY]
+        finally:
+            session.close()
+
+    def test_an_emergency_reply_never_gains_a_tail(self, patient):
+        """The still-open note is a nudge back to a booking, and an emergency
+        reply says this needs urgent help *rather than* one. Asserted as byte
+        equality, because "contains the template" is what lets a sentence creep
+        onto the end of it."""
+        turn(patient, BOOKING, "s-safety-queued-9")
+
+        result = turn(patient, EMERGENCY, "s-safety-queued-9")
+
+        assert result.reply == EMERGENCY_REPLY
+
+    def test_a_clinical_scare_says_what_is_still_open(self, patient):
+        """The half that makes sparing visible. The patient is told their
+        request survived, and told what it was — a run nobody mentions is a run
+        they have to guess is there."""
+        first = turn(patient, BOOKING, "s-safety-queued-10")
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+        result = turn(patient, "what dose of my tablets should I take?", "s-safety-queued-10")
+
+        assert result.status == WorkflowStatus.ESCALATED.value
+        assert result.reply.startswith(CLINICAL_REPLY)
+        assert "Cardiology request is still open" in result.reply

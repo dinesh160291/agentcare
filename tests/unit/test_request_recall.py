@@ -251,19 +251,28 @@ class TestAClosedRunIsRememberedToo:
         is exactly the moment not to be helpful: the same reasoning that exempts
         safety escalations from the tidy-up rule.
 
-        A born-escalated safety run would have made this test pass for the wrong
-        reason — its plan is empty, so nothing could have been recalled from it
-        whatever the status rule said. Checked by sabotage, which is how the
-        first version of this test was caught.
+        A born-escalated safety run would make this pass for the wrong reason —
+        its plan is empty, so nothing could have been recalled from it whatever
+        the status rule said. Checked by sabotage, which is how the first
+        version of this test was caught.
+
+        **The state is now constructed rather than reached.** It used to arrive
+        through a clinical question sent mid-run, which took the booking run
+        itself to ``escalated``; round 11b stopped that — a live run is spared
+        and the scare gets its own — and with it went the last door from a
+        *planned* run into this state. The rule outlives the door: recall asks
+        "may this run be offered back?" and the status is its input, so a run
+        carrying a plan, a department and an ``escalated`` status is exactly
+        what has to be refused, however it came to exist.
         """
         first = turn(patient, "I need a dermatology appointment for a rash", "s-recall-w3")
-        turn(patient, "what dose of paracetamol should I take?", "s-recall-w3")
 
         session = fresh()
         try:
             run = session.get(WorkflowRun, first.run_id)
-            assert run.status is WorkflowStatus.ESCALATED
             assert run.plan and (run.state or {}).get("department_name")
+            run.status = WorkflowStatus.ESCALATED
+            session.commit()
         finally:
             session.close()
 
