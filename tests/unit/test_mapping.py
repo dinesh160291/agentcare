@@ -45,6 +45,7 @@ from app.workflow.mapping import (
     names_appointment_verbs,
     names_timing,
     primary_intent,
+    refers_back,
     says_affirmative,
     says_decline,
     says_withdrawal,
@@ -1033,6 +1034,37 @@ class TestWithdrawalNeedsTheWordsForIt:
         assert says_withdrawal("the second one") is False
         assert says_withdrawal("") is False
         assert says_withdrawal(None) is False
+
+
+class TestPointingBackwards:
+    """Round 10 item 3's gate. Everything the request memory may be consulted
+    for, and — more importantly — everything it may not.
+
+    The false-positive direction is bounded by construction: only a message that
+    has already failed the scope gate ever reaches this, so a wrong match costs
+    an offer the patient can decline. What it must never do is catch an ordinary
+    off-topic message, because then one closed booking would turn every "what is
+    the capital of India" into an offer to restart it.
+    """
+
+    def test_the_live_sentences_point_backwards(self):
+        assert refers_back("now do the other thing I asked") is True
+        assert refers_back("wait no, I still want it") is True
+        assert refers_back("the other booking request") is True
+        assert refers_back("you forgot the second one") is True
+
+    def test_an_off_topic_message_points_at_nothing(self):
+        assert refers_back("who won the fifa final") is False
+        assert refers_back("how is nvidia stock doing") is False
+        assert refers_back("what is the capital city of India?") is False
+        assert refers_back("") is False
+        assert refers_back(None) is False
+
+    def test_a_request_that_names_its_own_subject_does_not_need_this(self):
+        """Not a bug either way — these are planned, so they never reach the
+        gate — but the vocabulary should not be claiming them."""
+        assert refers_back("book me a cardiology appointment") is False
+        assert refers_back("cancel my appointment") is False
 
 
 class TestTheDeclineVocabulary:

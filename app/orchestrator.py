@@ -78,10 +78,18 @@ from app.workflow.mapping import (
     names_followup_subject,
     names_timing,
     primary_intent,
+    refers_back,
     says_affirmative,
     says_decline,
     says_only_withdrawal,
     validate_class,
+)
+from app.workflow.recall import (
+    clear_offer,
+    mark_offer,
+    pending_offer,
+    recall_request,
+    remember_dropped_verb,
 )
 from app.workflow.selection import Offer, read_selection
 from app.workflow.queries import QueryKind, answer_query, detect_query
@@ -1233,6 +1241,156 @@ def _escalate_unplannable(
     )
 
 
+def _offer_remembered(
+    session: Session,
+    *,
+    writer: TraceWriter,
+    user: User,
+    patient_id: int,
+    message: str,
+    conversation_id: str,
+    base: dict,
+) -> TurnResult | None:
+    """A refusal that names the request it could pick up instead.
+
+    ``None`` when there is nothing to name, which leaves the generic reply
+    exactly as it was — the negative control, and the thing that keeps this
+    falsifiable.
+
+    Two conditions, and both are about the *message* rather than about the
+    memory. It must point backwards (:func:`refers_back`), because a memory
+    consulted on every refusal would answer "who won the fifa final" with an
+    offer to restart a booking. And it must have reached a refusal at all: a
+    message the Coordinator planned for is planned for, and code supplying
+    something else here would be the planning bin all over again.
+
+    Nothing is started. The offer is recorded on the run it refers to, and the
+    only thing that can act on it is the patient's own exact word on the very
+    next turn.
+    """
+    if not refers_back(message):
+        return None
+
+    remembered = recall_request(
+        session,
+        patient_id=patient_id,
+        session_id=conversation_id,
+        turn_id=writer.turn_id,
+    )
+    writer.guard_verdict(
+        "request_recalled",
+        passed=remembered is not None,
+        detail=(
+            {
+                "kind": remembered.kind,
+                "verb": remembered.verb.value,
+                "run_id": remembered.run_id,
+            }
+            if remembered is not None
+            else {"problem": "no unfinished request in this conversation"}
+        ),
+    )
+    if remembered is None:
+        return None
+
+    mark_offer(session, remembered, turn_id=writer.turn_id)
+    write_audit(
+        session,
+        action="request_recall_offered",
+        entity_type="workflow_run",
+        entity_id=remembered.run_id,
+        actor=user,
+        metadata={"kind": remembered.kind, "verb": remembered.verb.value},
+    )
+    return TurnResult(
+        reply=remembered.reply, author=TraceAuthor.TEMPLATE, **base
+    )
+
+
+async def _restart_remembered(
+    session: Session,
+    *,
+    writer: TraceWriter,
+    callbacks: TurnCallbacks,
+    belt: Toolbelt,
+    user: User,
+    patient_id: int,
+    message: str,
+    conversation_id: str,
+    provider: str | None,
+    settings,
+    base: dict,
+) -> TurnResult | None:
+    """The "yes" that starts a request the patient was offered.
+
+    ``None`` unless the previous turn made an offer, so a bare "ok" with nothing
+    pending falls through to the ordinary clarify — the memory must never turn a
+    stray token into a run.
+
+    The plan is the verb's own closure through ``validate_plan``, exactly as
+    :func:`_plan_floor` and :func:`_corrected_change_plan` build theirs: this
+    cannot express anything a Coordinator could not, and every guard downstream
+    runs unchanged. The request text is the **remembered subject** rather than
+    the word "yes" — the department the patient's own sentence resolved to, which
+    is what makes the restarted run route with the confidence that sentence
+    earned instead of handing routing a pronoun.
+    """
+    remembered = pending_offer(
+        session,
+        patient_id=patient_id,
+        session_id=conversation_id,
+        turn_id=writer.turn_id,
+    )
+    if remembered is None:
+        return None
+
+    plan = validate_plan([remembered.verb.value])
+    writer.guard_verdict(
+        "request_restarted",
+        passed=True,
+        detail={
+            "kind": remembered.kind,
+            "verb": remembered.verb.value,
+            "from_run_id": remembered.run_id,
+            "plan": [step.value for step in plan],
+        },
+    )
+    clear_offer(session, remembered)
+    run = create_run(
+        session,
+        patient_id=patient_id,
+        status=WorkflowStatus.IN_PROGRESS,
+        trigger="remembered_request_restarted",
+        writer=writer,
+        request_text=remembered.subject or message,
+        plan=[step.value for step in plan],
+        session_id=conversation_id,
+        actor=user,
+    )
+    write_audit(
+        session,
+        action="request_recall_accepted",
+        entity_type="workflow_run",
+        entity_id=run.id,
+        actor=user,
+        metadata={"kind": remembered.kind, "verb": remembered.verb.value},
+    )
+    belt.run = run
+    return await _execute_plan(
+        session,
+        run=run,
+        belt=belt,
+        writer=writer,
+        callbacks=callbacks,
+        user=user,
+        message=remembered.subject or message,
+        fallback_reply="",
+        provider=provider,
+        settings=settings,
+        base=base,
+    )
+
+
 def _budget_failure(
     session: Session,
     *,
@@ -1411,7 +1569,8 @@ def _one_verb_note(session: Session, result: TurnResult, *, message: str) -> str
     """
     if result.run_id is None:
         return ""
-    if len(names_appointment_verbs(message)) < 2:
+    verbs = names_appointment_verbs(message)
+    if len(verbs) < 2:
         return ""
     run = session.get(WorkflowRun, result.run_id)
     if run is None:  # pragma: no cover - a run named by a result always exists
@@ -1422,6 +1581,19 @@ def _one_verb_note(session: Session, result: TurnResult, *, message: str) -> str
     )
     if doing is None:
         return ""
+    # And the half that is not being done is written down. This line promises
+    # the patient they may "ask me about the other one right after", and until
+    # now nothing recorded what the other one was — so "now do the other thing I
+    # asked" named no subject, met the generic refusal, and the rephrase gave
+    # routing "booking request" to resolve, which is not a department. A promise
+    # is kept by the thing that made it.
+    remember_dropped_verb(
+        session,
+        run,
+        dropped=verbs - {PlanStep(doing)},
+        message=message,
+        turn_id=result.turn_id,
+    )
     return ONE_VERB_AT_A_TIME.format(verb=VERB_WORDS[doing])
 
 
@@ -1656,6 +1828,33 @@ async def _turn(
                 **base,
             )
 
+    # --- 0c. an exact yes to an offer the last turn made -------------------
+    # A fresh turn, so nothing else in this system is waiting for a "yes": the
+    # confirmation reader needs a proposal and there is no run at all. What there
+    # may be is a request this system offered to pick up one message ago, and the
+    # patient's own exact word is the only thing that may start it.
+    #
+    # Placed here rather than at the scope gate because a bare "yes" reaches
+    # neither branch of that gate usefully — it names no subject, so it is
+    # refused as off-topic, which is the right answer when nothing was offered
+    # and the wrong one when something was.
+    if run is None and read_confirmation(message) is ConfirmationAnswer.CONFIRM:
+        restarted = await _restart_remembered(
+            session,
+            writer=writer,
+            callbacks=callbacks,
+            belt=belt,
+            user=user,
+            patient_id=profile.id,
+            message=message,
+            conversation_id=conversation_id,
+            provider=provider,
+            settings=settings,
+            base=base,
+        )
+        if restarted is not None:
+            return restarted
+
     # --- 1. a choice among times already shown, read in code ---------------
     # The state one step earlier had no reader at all: a run holding nothing but
     # a list of times it had shown could not hear an answer to that list, so
@@ -1802,7 +2001,26 @@ async def _turn(
         plan = _plan_floor(
             session, message=message, belt=belt, writer=writer, user=user
         )
-    if plan == [PlanStep.FOLLOW_UP] and not _earns_follow_up(message):
+    unearned_follow_up = plan == [PlanStep.FOLLOW_UP] and not _earns_follow_up(message)
+
+    # Before any of the three refusals below, and only for a message that points
+    # backwards: the patient may be asking for something they have already asked
+    # for once. This changes what the refusal *offers* and nothing else — no run
+    # is created here, and the offer is answerable only by an exact word.
+    if plan is None or unearned_follow_up:
+        offered = _offer_remembered(
+            session,
+            writer=writer,
+            user=user,
+            patient_id=profile.id,
+            message=message,
+            conversation_id=conversation_id,
+            base=base,
+        )
+        if offered is not None:
+            return offered
+
+    if unearned_follow_up:
         # A plan of follow-up alone asserts nothing about the message, because
         # the follow-up agent can run on any patient at any time. Every other
         # step names something the request had to be about; this one does not,

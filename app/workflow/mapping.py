@@ -505,6 +505,50 @@ def mentions_domain_subject(text: str) -> bool:
     return bool(_DOMAIN_PATTERN.search(text or ""))
 
 
+#: A message that points at something earlier in the conversation instead of
+#: naming a subject of its own. The gate on the request memory, and the whole
+#: reason that memory cannot make the system's off-topic answer worse.
+#:
+#: The live pair it exists for: "now do the other thing I asked", after the
+#: one-verb line promised the patient could ask; and "wait no, I still want it",
+#: after a withdrawal. Neither names an appointment, a document or a department,
+#: so both met the generic refusal — and both are unmistakably *about* something
+#: this system was just told.
+#:
+#: Why a cue list rather than the subtractive test used for date phrases: there
+#: is nothing to subtract. A back-reference is defined by what it *lacks*, so the
+#: only positive signal is the pointing itself. The direction that matters is the
+#: false positive, and it is bounded by construction — every one of these
+#: messages has already failed the scope gate, so the worst a wrong match can do
+#: is offer the patient a request they may decline. What it must never do is
+#: catch an ordinary off-topic message, which is why nothing here is a bare word:
+#: "who won the fifa final" and "nvidia stock" point at nothing.
+_BACK_REFERENCE_CUES: tuple[str, ...] = (
+    r"\bthe other (?:thing|one|request|booking|appointment|bit|half)\b",
+    r"\bother thing i (?:asked|wanted|mentioned|said|needed)\b",
+    r"\bthe (?:second|first) (?:thing|one|request)\b",
+    r"\bthe rest of (?:it|that)\b",
+    r"\bstill want\b",
+    r"\bi want it\b",
+    r"\b(?:as|like|what) i (?:asked|said|wanted|mentioned)\b",
+    r"\byou (?:forgot|missed|skipped)\b",
+    r"\bdo (?:that|it) too\b",
+    r"\bcarry on with (?:it|that)\b",
+)
+
+_BACK_REFERENCE_PATTERN = re.compile("|".join(_BACK_REFERENCE_CUES), re.IGNORECASE)
+
+
+def refers_back(text: str) -> bool:
+    """Whether this message points at something earlier rather than naming one.
+
+    A fact about the message, in the family of :func:`mentions_domain_subject`
+    and :func:`names_timing`, and used the same way: it may only widen what a
+    *refusal* offers, and it decides nothing about what happens.
+    """
+    return bool(_BACK_REFERENCE_PATTERN.search(text or ""))
+
+
 #: What a follow-up question is about, beyond the subjects every other part of
 #: the system shares. Kept separate from ``_DOMAIN_SUBJECTS`` rather than folded
 #: into it: that tuple feeds the scope-gate veto, whose behaviour on "nvidia
@@ -1023,6 +1067,7 @@ __all__ = [
     "names_change_verb",
     "names_timing",
     "primary_intent",
+    "refers_back",
     "says_affirmative",
     "says_decline",
     "says_only_withdrawal",
