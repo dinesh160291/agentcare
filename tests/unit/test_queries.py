@@ -216,6 +216,52 @@ class TestRenderingDocuments:
         )
         assert "Documents page" in answer
 
+    def test_a_department_they_have_no_visit_in_is_said_out_loud(self, seeded_db):
+        """Round 11b item 4d. Asha holds one Cardiology appointment and asks
+        about an Ophthalmology one. Answering with Ophthalmology's requirements
+        would describe a visit that does not exist; the generic clarify — which
+        is what happened live — tells her neither half. Both facts, in the
+        order she needs them."""
+        answer = answer_query(
+            seeded_db,
+            patient_id=ASHA_PROFILE_ID,
+            kind=QueryKind.DOCUMENTS,
+            message="what documents do I need for my ophthalmology visit?",
+        )
+
+        assert "You don't have an Ophthalmology appointment on file." in answer
+        assert "Your upcoming appointment" in answer
+        assert "Cardiology" in answer
+        assert "Required before your Ophthalmology visit" not in answer
+
+    def test_a_department_they_do_have_is_answered_as_before(self, seeded_db):
+        """The control. A named department the patient actually holds is the
+        round-10 path and is untouched."""
+        answer = answer_query(
+            seeded_db,
+            patient_id=ASHA_PROFILE_ID,
+            kind=QueryKind.DOCUMENTS,
+            message="what documents do I need for my cardiology visit?",
+        )
+
+        assert "don't have" not in answer
+        assert "Cardiology" in answer
+
+    def test_a_patient_with_nothing_booked_still_gets_the_requirements(self, seeded_db):
+        """The other control, and the one that keeps the new sentence narrow. A
+        mismatch needs something to mismatch against: Rohan has no appointments
+        at all, so "what do I need for an ENT visit?" is asked *before* booking
+        and the requirements are the answer to it."""
+        answer = answer_query(
+            seeded_db,
+            patient_id=ROHAN_PROFILE_ID,
+            kind=QueryKind.DOCUMENTS,
+            message="what documents do I need for my ENT visit?",
+        )
+
+        assert "don't have" not in answer
+        assert "Optional but helpful for ENT" in answer
+
 
 class TestDocumentWordsOutrankAppointmentWords:
     """One sentence naming both subjects must be read as the more specific one.

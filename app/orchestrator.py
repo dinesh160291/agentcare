@@ -80,6 +80,7 @@ from app.workflow.mapping import (
     primary_intent,
     refers_back,
     says_affirmative,
+    says_keep_it,
     says_decline,
     says_only_withdrawal,
     shows_no_difference,
@@ -143,6 +144,13 @@ FAILED_REPLY = (
 WITHDRAWN_REPLY = "No problem — I've closed that request. Just ask if you need it again."
 DECLINED_REPLY = (
     "That's fine, nothing has been booked. Tell me what time would suit you better."
+)
+#: The same moment, for the verb where the other sentence is nonsense. A patient
+#: declining a *cancellation* is not choosing a time, and "tell me what time
+#: would suit you better" invites them to answer a question nobody asked — after
+#: a sentence that does not say whether their appointment survived. It did.
+DECLINED_CANCEL_REPLY = (
+    "Okay — nothing has been cancelled; your appointment stands."
 )
 NO_PLAN_REPLY = (
     "I want to make sure I get this right — could you tell me a little more about "
@@ -356,7 +364,14 @@ def _decline_proposal(
     One function for all three ways of declining — an exact token, a button, or
     the model's read of "not that one" — because a proposal left confirmable
     after a decline is the same bug however the decline arrived.
+
+    The sentence has two shapes because the question did. Turning down a *time*
+    leaves a booking to finish, so asking for another one is the next step;
+    turning down a *cancellation* leaves nothing to choose, and the patient's
+    actual question is whether their appointment survived. Read before
+    ``clear_proposal``, which is what makes the verb knowable at all.
     """
+    cancelling = run.proposed_action is ProposedAction.CANCEL
     run.clear_proposal()
     transition(
         session,
@@ -367,7 +382,7 @@ def _decline_proposal(
         actor=user,
     )
     return TurnResult(
-        reply=DECLINED_REPLY,
+        reply=DECLINED_CANCEL_REPLY if cancelling else DECLINED_REPLY,
         author=TraceAuthor.TEMPLATE,
         run_id=run.id,
         status=run.status.value,
@@ -1215,6 +1230,7 @@ def _answer_while_holding(
     run: WorkflowRun,
     belt: Toolbelt,
     outcome,
+    message: str,
     base: dict,
 ) -> TurnResult | None:
     """The answer half of answer-and-stay, wherever the question was asked.
@@ -1250,7 +1266,15 @@ def _answer_while_holding(
             **base,
         )
 
-    if belt.proposals.answered_with_slots:
+    if belt.proposals.answered_with_slots and not says_affirmative(message):
+        # **A word of agreement is never a request for more times.** Live, "yes
+        # yes go ahead please!!" was classified a slot question, the window
+        # layer ran, and the patient who had just said yes three times was
+        # handed a fresh list to choose from. The same veto that stops an
+        # affirmative being applied as a decline stops it being answered with
+        # alternatives — one cue, both directions, and it costs a patient who
+        # genuinely wanted times one extra message.
+        #
         # A time the patient asked for that the search withheld because they
         # are already busy at it. Without the sentence the list reads as an
         # answer to a question nobody asked: "how about 11am?" came back as 9,
@@ -2477,6 +2501,24 @@ async def _turn(
 
     # --- 1b. a pending confirmation is read in code, before any model call ---
     if run is not None and run.status is WorkflowStatus.PENDING_CONFIRMATION:
+        # "Never mind" said to a *cancellation* offer means "don't cancel it",
+        # and it used to reach the withdrawal path: the run closed and the
+        # patient was told "I've closed that request", which does not say
+        # whether the appointment is still there. It was. Read here, where the
+        # proposal makes the referent of "it" a column rather than a guess, and
+        # ahead of the exact tokens — none of which this can disturb, since
+        # "no" and "yes" carry no keep-it cue.
+        if run.proposed_action is ProposedAction.CANCEL and says_keep_it(message):
+            writer.guard_verdict(
+                "keep_it_cue",
+                passed=True,
+                detail={"appointment_id": run.proposed_appointment_id},
+            )
+            return _decline_proposal(
+                session, run=run, writer=writer, user=user,
+                trigger="patient_declined", base=base,
+            )
+
         answer = read_confirmation(message)
         writer.guard_verdict(
             "confirmation_reader",
@@ -2958,7 +3000,7 @@ async def _continue_run(
     if outcome.consequence is Consequence.REFINE:
         belt.answer_with_other_slots(message)
         answered = _answer_while_holding(
-            session, run=run, belt=belt, outcome=outcome, base=base
+            session, run=run, belt=belt, outcome=outcome, message=message, base=base
         )
         if answered is not None:
             return answered
@@ -2989,7 +3031,7 @@ async def _continue_run(
     # the model takes part in.
     if awaiting_confirmation and run.status is WorkflowStatus.PENDING_CONFIRMATION:
         answered = _answer_while_holding(
-            session, run=run, belt=belt, outcome=outcome, base=base
+            session, run=run, belt=belt, outcome=outcome, message=message, base=base
         )
         if answered is not None:
             return answered
@@ -3010,7 +3052,7 @@ async def _continue_run(
         # state it was asked. Only the confirmation state had this path before,
         # so the same question at `in_progress` got prose and no times.
         answered = _answer_while_holding(
-            session, run=run, belt=belt, outcome=outcome, base=base
+            session, run=run, belt=belt, outcome=outcome, message=message, base=base
         )
         if answered is not None:
             return answered

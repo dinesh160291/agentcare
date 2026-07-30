@@ -205,7 +205,7 @@ def _reminders(session: Session, patient_id: int) -> str:
 
 def _department_for_documents(
     session: Session, *, patient_id: int, message: str
-) -> tuple[int, str] | None:
+) -> tuple[int, str, str] | None:
     """Which department a documents question is about.
 
     In order: the department the patient named, then the one their upcoming
@@ -218,17 +218,26 @@ def _department_for_documents(
 
     ``resolve_department`` decides what the message named, so the Department
     table is the authority and there is no keyword list to slip past.
+
+    The third element is *which* source answered. It matters because a
+    department the patient named is a claim about a visit they may not have,
+    and one read off their own appointment cannot be.
     """
     named = resolve_department(session, message or "")
     if named.get("status") == "resolved":
-        return named["department"]["id"], named["department"]["name"]
+        return named["department"]["id"], named["department"]["name"], "named"
 
     upcoming = list_patient_appointments(session, patient_id=patient_id, live_only=True)
     if len(upcoming) == 1:
         appointment = session.get(Appointment, upcoming[0]["appointment_id"])
         if appointment is not None and appointment.department is not None:
-            return appointment.department_id, appointment.department.name
+            return appointment.department_id, appointment.department.name, "appointment"
     return None
+
+
+def _article(word: str) -> str:
+    """"a" or "an", so a templated sentence reads like one somebody wrote."""
+    return "an" if (word or "")[:1].lower() in "aeiou" else "a"
 
 
 def _documents(session: Session, patient_id: int, message: str) -> str:
@@ -256,7 +265,33 @@ def _documents(session: Session, patient_id: int, message: str) -> str:
         session, patient_id=patient_id, message=message
     )
     if where is not None:
-        department_id, department_name = where
+        department_id, department_name, source = where
+        # The patient named a department, holds appointments, and none of them
+        # is in it. That is a mismatch, and the live answer to it was the
+        # generic clarify — which tells them neither half. Both facts, in the
+        # order they need them: there is no such visit, and here is what there
+        # is.
+        #
+        # A mismatch needs something to mismatch against, so this is gated on
+        # them *having* appointments. A patient with none who asks "what do I
+        # need to bring for an ENT visit?" is asking before booking, and the
+        # requirements are the answer to that — see
+        # ``TestRenderingDocuments::test_the_department_comes_from_the_message``.
+        mine = list_patient_appointments(
+            session, patient_id=patient_id, live_only=True
+        )
+        if (
+            source == "named"
+            and mine
+            and not any(row.get("department_id") == department_id for row in mine)
+        ):
+            parts.append(
+                f"You don't have {_article(department_name)} {department_name} "
+                "appointment on file."
+            )
+            parts.append(_appointments(session, patient_id))
+            return "\n\n".join(parts)
+
         diff = diff_required_documents(
             session, patient_id=patient_id, department_id=department_id
         )

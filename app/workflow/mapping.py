@@ -459,6 +459,45 @@ def says_decline(text: str) -> bool:
     return bool(_DECLINE_PATTERN.search(text or ""))
 
 
+#: "Never mind", "keep it", "leave it" — said to a *cancellation* offer.
+#:
+#: The fourth reading of a word this codebase keeps having to separate. At a
+#: held cancel proposal these mean "don't cancel it", which is a refusal of the
+#: offer and not a withdrawal of the request — and the two are told apart by
+#: what they leave behind. Live, "never mind" met the withdrawal path and the
+#: patient was told "I've closed that request", which does not say whether the
+#: appointment survived. It did; nothing in the sentence said so.
+#:
+#: Read only where the caller knows a cancellation is being held, for the reason
+#: :func:`names_change_verb` reads a pronoun only when the referent is a column:
+#: "leave it" points at something, and only the proposal makes that something
+#: knowable.
+_KEEP_IT_CUES = (
+    r"never ?mind",
+    r"keep it",
+    r"keep the appointment",
+    r"leave it",
+    r"don[’']?t cancel",
+    r"do not cancel",
+    r"cancel nothing",
+)
+
+_KEEP_IT_PATTERN = re.compile(
+    r"\b(?:" + "|".join(_KEEP_IT_CUES) + r")\b", re.IGNORECASE
+)
+
+
+def says_keep_it(text: str) -> bool:
+    """Whether this message asks for a held cancellation to be dropped.
+
+    The caller must already know a cancellation is on the table — see
+    :data:`_KEEP_IT_CUES`. What it does is a *decline*, which clears the
+    proposal and leaves the appointment exactly where it was, so the expensive
+    direction is closed: nothing here can cancel anything.
+    """
+    return bool(_KEEP_IT_PATTERN.search(text or ""))
+
+
 def says_affirmative(text: str) -> bool:
     """Whether the message contains a word of agreement.
 
@@ -1113,6 +1152,7 @@ __all__ = [
     "refers_back",
     "says_affirmative",
     "says_decline",
+    "says_keep_it",
     "says_only_withdrawal",
     "says_withdrawal",
     "shows_no_difference",

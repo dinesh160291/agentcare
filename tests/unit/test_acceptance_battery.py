@@ -204,6 +204,33 @@ class DecliningLlm(MockLlm):
         )
 
 
+class SlotQuestioningLlm(MockLlm):
+    """A model that reads every unread answer as a request for other times.
+
+    The other half of :class:`DecliningLlm`'s failure, and the one the veto did
+    not cover: live, "yes yes go ahead please!!" came back as ``slot_question``
+    and the patient who had said yes three times was handed a fresh list to
+    choose from.
+    """
+
+    model: str = "battery-slot-question-stub"
+
+    def _classify(self, llm_request, available, done, task):  # noqa: ANN001
+        if (
+            "submit_confirmation_verdict" in available
+            and "submit_confirmation_verdict" not in done
+        ):
+            return function_call_response(
+                "submit_confirmation_verdict",
+                {"verdict": "slot_question", "reason": "asking about times",
+                 "phrase": "next week"},
+            )
+        return function_call_response(
+            "classify_message",
+            {"message_class": "continuation", "incoming_steps": []},
+        )
+
+
 class WindowProposingLlm(MockLlm):
     """A model that answers an unreadable timing phrase with two dates.
 
@@ -671,6 +698,39 @@ class TestGReadingTheAnswer:
         assert _run(first.run_id).proposed_slot_id == held
         assert result.author is TraceAuthor.TEMPLATE
         assert "exact" in result.reply
+
+    def test_an_affirmative_with_extras_is_not_answered_with_more_times(
+        self, patient, monkeypatch
+    ):
+        """Round 11b item 4c. The same cue, the other direction: a word of
+        agreement is not a request for alternatives either. Live, "yes yes go
+        ahead please!!" was classified a slot question and drew a window list —
+        a patient who had said yes three times, asked to choose again.
+
+        The held slot is the pin, not the wording: an answer that moved or
+        re-drew the offer is the failure, whatever sentence came with it."""
+        first = turn(patient, "I need a cardiology appointment", "bat-g8")
+        held = _run(first.run_id).proposed_slot_id
+        assert held is not None
+
+        _provider(monkeypatch, SlotQuestioningLlm())
+        result = turn(patient, "yes yes go ahead please!!", "bat-g8")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert _run(first.run_id).proposed_slot_id == held
+        assert "Other times" not in result.reply
+        assert "exact" in result.reply
+
+    def test_a_real_question_about_times_is_still_answered(self, patient, monkeypatch):
+        """The control that keeps the veto a veto. The same stub, the same
+        state, a message with no word of agreement in it — and the list is the
+        right answer."""
+        turn(patient, "I need a cardiology appointment", "bat-g9")
+
+        _provider(monkeypatch, SlotQuestioningLlm())
+        result = turn(patient, "what else have you got?", "bat-g9")
+
+        assert "Other times" in result.reply
 
     def test_a_genuine_decline_still_declines(self, patient, monkeypatch):
         first = turn(patient, "I need a cardiology appointment", "bat-g3")

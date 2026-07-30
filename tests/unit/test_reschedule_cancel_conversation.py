@@ -273,6 +273,80 @@ class TestTheCancelTokenCollision:
         )
 
 
+class TestKeepingTheAppointmentIsNotWithdrawingTheRequest:
+    """Round 11b item 4a and 4b — the fourth reading of "cancel".
+
+    "Never mind", said to a held *cancellation*, means "don't cancel it". It
+    reached the withdrawal path instead: the run closed and the patient was
+    told "I've closed that request" — a sentence that says nothing about
+    whether their appointment survived. It had. And the decline template that
+    should have answered them said "tell me what time would suit you better",
+    which is the wrong question about the wrong verb.
+    """
+
+    def _held(self, patient, session_id: str):
+        offered = turn(patient, "I want to cancel my appointment", session_id)
+        assert offered.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        return offered
+
+    @pytest.mark.parametrize(
+        "phrase", ["never mind", "actually, keep it", "leave it as it is"]
+    )
+    def test_a_keep_it_cue_drops_the_proposal_and_says_so(
+        self, patient, seeded_db, phrase
+    ):
+        first = self._held(patient, f"s-keep-{abs(hash(phrase)) % 997}")
+
+        result = turn(patient, phrase, f"s-keep-{abs(hash(phrase)) % 997}")
+
+        assert result.reply == (
+            "Okay — nothing has been cancelled; your appointment stands."
+        )
+        assert result.author is TraceAuthor.TEMPLATE
+        assert result.status == WorkflowStatus.IN_PROGRESS.value
+        assert result.run_id == first.run_id, "the request was closed, not the offer"
+
+        seeded_db.expire_all()
+        assert (
+            seeded_db.get(Appointment, SEEDED_APPOINTMENT_ID).status
+            is AppointmentStatus.CONFIRMED
+        )
+        assert seeded_db.get(WorkflowRun, first.run_id).proposed_action is None
+
+    def test_a_declined_cancellation_does_not_ask_for_a_time(self, patient):
+        """Item 4b, through the *token* path rather than the cue path — one
+        template, and both doors into it have to be right."""
+        self._held(patient, "s-keep-token")
+
+        result = turn(patient, "no", "s-keep-token")
+
+        assert "what time would suit you better" not in result.reply
+        assert "nothing has been cancelled" in result.reply
+
+    def test_a_declined_booking_still_asks_for_a_time(self, patient):
+        """The control that keeps the flavour a flavour. Turning down a *time*
+        leaves a booking to finish, and the next step really is another time."""
+        turn(patient, "I need a dermatology appointment for a rash", "s-keep-book")
+
+        result = turn(patient, "no", "s-keep-book")
+
+        assert "what time would suit you better" in result.reply
+
+    def test_a_real_withdrawal_still_closes_the_run(self, patient, seeded_db):
+        """The negative control. "Cancel that request" is the third reading and
+        must still reach the third consequence — the cue list widening must not
+        have swallowed it."""
+        first = self._held(patient, "s-keep-withdraw")
+
+        result = turn(patient, "actually, cancel that request", "s-keep-withdraw")
+
+        assert result.status == WorkflowStatus.CANCELLED.value
+        seeded_db.expire_all()
+        assert (
+            seeded_db.get(WorkflowRun, first.run_id).status is WorkflowStatus.CANCELLED
+        )
+
+
 class DriftingLlm(MockLlm):
     """The mock, plus the sentence ``gpt-4o-mini`` actually produced.
 
