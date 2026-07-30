@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Notification, NotificationKind, Reminder
+from app.trace.redaction import redact_text
 
 logger = logging.getLogger("agentcare.reminders")
 
@@ -63,11 +64,16 @@ def deliver(session: Session, reminder: Reminder) -> Notification | None:
 
     # The simulated outbound channel. Deliberately a log line and deliberately
     # named: nothing here contacts anyone, and the demo says so.
+    #
+    # The third choke point. The notification *row* keeps the message intact —
+    # it is addressed to the patient, who may read their own contact details —
+    # but the log is read by operators and shipped wherever logs go, so it is
+    # redacted like a trace payload.
     logger.info(
         "SIMULATED NOTIFICATION patient=%s reminder=%s: %s",
         reminder.patient_id,
         reminder.id,
-        reminder.message,
+        redact_text(reminder.message or ""),
     )
     return notification
 

@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models import AuditEvent, User
+from app.trace.redaction import redact
 
 
 def write_audit(
@@ -42,7 +43,12 @@ def write_audit(
         action=action,
         entity_type=entity_type,
         entity_id=entity_id,
-        event_metadata=metadata or {},
+        # The second choke point. Most audit metadata is enums and ids, but not
+        # all of it: an escalation's reason, a staff note and a refusal's
+        # problem string all carry free text, and the audit ledger is read by
+        # the same wider audience the trace is. Redacting at the writer means a
+        # future caller cannot forget.
+        event_metadata=redact(metadata or {}),
     )
     session.add(event)
     if flush:
