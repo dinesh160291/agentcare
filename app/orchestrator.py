@@ -1247,6 +1247,66 @@ def _corrected_change_plan(
     return corrected
 
 
+def _corrected_book_plan(
+    session: Session,
+    plan: list[PlanStep] | None,
+    *,
+    message: str,
+    writer: TraceWriter,
+) -> list[PlanStep] | None:
+    """A booking the patient stated, added to a plan that forgot it.
+
+    The mirror of :func:`_corrected_change_plan`, for the verb that closes over
+    nothing existing. Live: "book an eye test appointment, my vision has been a
+    bit blurry lately" was planned as ``["route"]`` alone. Nothing was wrong with
+    that plan on its own terms — routing an eye request to Ophthalmology is
+    correct — so it was accepted, the step ran, the plan completed, and the run
+    transitioned to ``completed``. The patient asked to book and received a
+    routing notice.
+
+    ``book`` is *appended* rather than substituted, and the difference matters:
+    the model's own steps are kept and ``validate_plan``'s closure fills in the
+    rest, so a plan that already named ``documents`` keeps it. Everything
+    downstream is unchanged — routing still resolves the department from the
+    Department table, which is why this never has to guess one.
+
+    Narrow in the same two directions as its twin. The words must name exactly
+    one appointment verb and it must be ``book`` — two verbs is the one-verb
+    rule's business, and a change verb has an owner already. And a plan that
+    already names any appointment verb is left alone: this fills a hole, it does
+    not arbitrate.
+    """
+    # Standing aside returns the plan **unchanged**, not ``None``. Its twin
+    # `_plan_floor` uses ``None`` for "I have nothing to offer" and this one
+    # corrects an existing plan, so borrowing that convention here discarded
+    # every accepted plan in the system — caught immediately by the booking
+    # happy path, which is the argument for having one.
+    if plan is None:
+        return None
+    if names_appointment_verbs(message) != {PlanStep.BOOK}:
+        return plan
+
+    if set(plan) & APPOINTMENT_VERBS:
+        writer.validation(
+            "plan_book_verb",
+            accepted=True,
+            detail={"plan": [step.value for step in plan]},
+        )
+        return plan
+
+    corrected = validate_plan([step.value for step in plan] + [PlanStep.BOOK.value])
+    writer.validation(
+        "plan_book_verb",
+        accepted=False,
+        detail={
+            "proposed": [step.value for step in plan],
+            "applied": [step.value for step in corrected],
+            "problem": "the message asks to book and the plan names no verb",
+        },
+    )
+    return corrected
+
+
 def _plan_floor(
     session: Session,
     *,
@@ -2424,6 +2484,7 @@ async def _turn(
         patient_id=profile.id,
         writer=writer,
     )
+    plan = _corrected_book_plan(session, plan, message=message, writer=writer)
     if plan is None:
         plan = _plan_floor(
             session, message=message, belt=belt, writer=writer, user=user
@@ -2901,6 +2962,12 @@ async def _continue_run(
             message=message,
             patient_id=profile.id,
             writer=writer,
+        )
+        # Both doors, for the reason round 10 gave: a correction that guards one
+        # way into `create_run` guards half of them. "Lets book the 10am slot"
+        # came through this one as `[route, cancel]`.
+        corrected = _corrected_book_plan(
+            session, corrected, message=message, writer=writer
         )
         replacement = create_run(
             session,

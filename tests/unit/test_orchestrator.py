@@ -2215,6 +2215,166 @@ class TestTheClarifyLoopIsBounded:
             session.close()
 
 
+class RouteOnlyPlanningLlm(MockLlm):
+    """A Coordinator that plans ``["route"]`` for a message that says "book".
+
+    Live run #10, verbatim: "book an eye test appointment, my vision has been a
+    bit blurry lately" came back as a routing plan. Nothing was wrong with it on
+    its own terms — an eye request does belong to Ophthalmology — so it was
+    accepted, the step ran, the plan completed, and the run transitioned to
+    ``completed``. The patient asked to book and got a routing notice.
+
+    Only the *planning* half is replaced. Classification and every specialist
+    stay the mock's, so what the corrected plan then does is the real path.
+    """
+
+    model: str = "route-only-planning-stub"
+
+    def _plan(self, llm_request, done, text):  # noqa: ANN001
+        submitted = latest_tool_result(llm_request, "submit_plan")
+        if submitted is not None:
+            return self._from_plan(submitted.payload)
+        return function_call_response("submit_plan", {"steps": ["route"]})
+
+
+class TestABookMessageEarnsABookPlan:
+    """Round 11 item 5 — the mirror of the change-verb plan correction.
+
+    ``book`` closes over nothing that exists yet, so it had no equivalent of the
+    correction ``reschedule`` and ``cancel`` have had since round 5. A plan that
+    routes and stops is a plan that answers a different question from the one the
+    patient asked.
+    """
+
+    LIVE = "book an eye test appointment, my vision has been a bit blurry lately"
+
+    @pytest.fixture(autouse=True)
+    def _route_only(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: RouteOnlyPlanningLlm()
+        )
+
+    def test_the_live_sentence_reaches_a_proposal(self, patient):
+        result = turn(patient, self.LIVE, "s-book-plan-1")
+
+        assert "book" in result.plan
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+    def test_the_models_own_steps_are_kept(self, patient):
+        """Appended, not substituted. The route step the model asked for is
+        still there, and ``validate_plan``'s closure fills in the rest."""
+        result = turn(patient, self.LIVE, "s-book-plan-2")
+
+        assert result.plan == ["route", "book", "documents", "follow_up"]
+
+    def test_the_correction_is_traced(self, patient):
+        result = turn(patient, self.LIVE, "s-book-plan-3")
+
+        session = fresh()
+        try:
+            recorded = _validations(session, result.turn_id, "plan_book_verb")
+        finally:
+            session.close()
+
+        assert recorded
+        payload = recorded[0].payload
+        assert payload["accepted"] is False
+        assert payload["detail"]["proposed"] == ["route"]
+        assert "book" in payload["detail"]["applied"]
+
+    def test_a_question_about_departments_keeps_its_route_only_plan(self, patient):
+        """The negative control, and the thing that keeps this narrow.
+
+        "Which department handles eye tests?" names no appointment noun, so
+        ``names_appointment_verbs`` reads nothing and a routing answer is the
+        right answer. A correction that fired here would turn every question
+        about the hospital into a booking.
+        """
+        result = turn(
+            patient, "which department handles eye tests?", "s-book-plan-4"
+        )
+
+        # Asserted as "the plan is route-only", never as "book is absent": an
+        # empty plan satisfies the second, and an early version of this
+        # correction returned ``None`` on its stand-aside path — discarding every
+        # plan in the system while this test stayed green.
+        assert result.plan == ["route"]
+
+    def test_an_accepted_verb_is_never_second_guessed(self, patient, monkeypatch):
+        """A plan that already names an appointment verb is left alone — this
+        fills a hole, it does not arbitrate. Driven through the ordinary mock so
+        the agreement is recorded on a plan a real planner produced."""
+        monkeypatch.setattr("app.agents.base.get_provider", lambda name=None: MockLlm())
+        result = turn(
+            patient, "please book me a cardiology appointment next week", "s-book-plan-5"
+        )
+
+        session = fresh()
+        try:
+            recorded = _validations(session, result.turn_id, "plan_book_verb")
+        finally:
+            session.close()
+
+        assert recorded
+        assert recorded[0].payload["accepted"] is True
+        assert result.plan == ["route", "book", "documents", "follow_up"]
+
+    def test_a_change_verb_is_left_to_its_own_correction(self, patient):
+        """Two owners for one plan would be one too many. A message naming
+        ``reschedule`` is ``_corrected_change_plan``'s, and this must not read
+        it as a booking on the strength of the word "appointment"."""
+        result = turn(
+            patient, "please reschedule my appointment to next week", "s-book-plan-6"
+        )
+
+        assert result.plan == ["reschedule", "follow_up"]
+
+
+class RouteOnlySupersedingLlm(MockLlm):
+    """A classifier that replaces a run with a plan naming no verb.
+
+    The second door into ``create_run``. Round 10 learned that a correction
+    guarding one door guards half of them — a stated reschedule became a booking
+    run through the supersede path while the first-message path was already
+    fixed — so the book correction is pinned at both, against steps a model
+    actually got wrong rather than against the mock's own.
+    """
+
+    model: str = "route-only-superseding-stub"
+
+    def _classify(self, llm_request, available, done, text):  # noqa: ANN001
+        if latest_tool_result(llm_request, "classify_message") is None:
+            return function_call_response(
+                "classify_message",
+                {"message_class": "conflicting", "incoming_steps": ["route"]},
+            )
+        return super()._classify(llm_request, available, done, text)
+
+
+class TestTheBookCorrectionGuardsBothDoors:
+    """The supersede path gets the same plan check a first message gets."""
+
+    def test_a_superseding_book_message_gets_a_book_plan(self, patient, monkeypatch):
+        first = turn(patient, BOOKING, "s-book-door-1")
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert turn(patient, "no", "s-book-door-1").status == (
+            WorkflowStatus.IN_PROGRESS.value
+        )
+
+        monkeypatch.setattr(
+            "app.agents.base.get_provider",
+            lambda name=None: RouteOnlySupersedingLlm(),
+        )
+        result = turn(
+            patient,
+            "please book me a dermatology appointment instead",
+            "s-book-door-1",
+        )
+
+        assert result.run_id != first.run_id
+        assert "book" in result.plan
+
+
 class FollowUpPlanningLlm(MockLlm):
     """A Coordinator that answers anything at all with ``["follow_up"]``.
 
@@ -4806,14 +4966,40 @@ class TestASelectionMovesAHeldReschedule:
         finally:
             session.close()
 
-    def test_a_different_verb_mid_reschedule_still_goes_to_the_model(self, patient):
-        """The control. This reader answers "which of these times"; deciding
-        that a sentence means something else entirely is language."""
-        self._holding(patient, "s-rehold-4")
+    def test_a_different_verb_mid_reschedule_is_not_read_as_a_time(self, patient):
+        """The control. This reader answers "which of these times", and nothing
+        else — a sentence naming a different verb must not move the held slot.
 
-        result = turn(patient, "actually just cancel it instead", "s-rehold-4")
+        It used to assert that the turn reached ``classify_message``, using "the
+        model was consulted" as a proxy for "this reader stood aside". Round 11
+        item 3 broke the proxy without breaking the claim: ``_settle_verb_switch``
+        now reads "cancel it" in code, because the pronoun's referent is a column
+        on this very run. So the assertion is re-anchored on what it was always
+        about — the shortlist, the held slot, and the verb — which is the same
+        trap as "a condition equivalent to the rule today is not the rule".
+        """
+        run_id, shortlist = self._holding(patient, "s-rehold-4")
 
-        assert "classify_message" in _tools_called(result.turn_id)
+        turn(patient, "actually just cancel it instead", "s-rehold-4")
+
+        session = fresh()
+        try:
+            reschedule = session.get(WorkflowRun, run_id)
+            # The reschedule run was replaced rather than re-timed: the selection
+            # reader took nothing from the list.
+            assert reschedule.proposed_slot_id is None
+            assert reschedule.status is WorkflowStatus.CANCELLED
+            replacement = (
+                session.query(WorkflowRun)
+                .filter(WorkflowRun.session_id == "s-rehold-4")
+                .order_by(WorkflowRun.id.desc())
+                .first()
+            )
+            assert replacement.id != run_id
+            assert replacement.proposed_action is ProposedAction.CANCEL
+            assert replacement.proposed_slot_id not in shortlist
+        finally:
+            session.close()
 
 
 #: The sentence gpt-4o-mini wrote to go with a classification code refused.
