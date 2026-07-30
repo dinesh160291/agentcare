@@ -85,7 +85,7 @@ class Consequence(str, Enum):
     WITHDRAW = "withdraw"                # withdrawal
     #: Not a class of its own — what a *conflicting* message becomes when the
     #: run it would replace is waiting for staff and the message shows no
-    #: difference. See :func:`_shows_no_difference`.
+    #: difference. See :func:`shows_no_difference`.
     STATUS_REPLY = "status_reply"
     #: The same refusal, one state earlier. A message that carries the run's own
     #: intent and names no new subject is *refining* the request it arrived in,
@@ -717,7 +717,7 @@ def names_appointment_verbs(text: str) -> set[PlanStep]:
     return found
 
 
-def _shows_no_difference(
+def shows_no_difference(
     session: Session,
     run: WorkflowRun,
     *,
@@ -800,7 +800,7 @@ def _names_another_department(
 ) -> bool:
     """Does this message name a desk that is not the one the run already routed to?
 
-    The other half of :func:`_shows_no_difference`, and it exists because the
+    The other half of :func:`shows_no_difference`, and it exists because the
     subject check that function performs was only ever reachable through the
     *supersede* path. Live: a General Medicine proposal was declined, and the
     patient wrote "let me clarify — appointment for vision issues". The model
@@ -991,7 +991,7 @@ def apply_consequence(
     # is told its position and nothing moves; where the system holds it the
     # message is a refinement and gets answered with times. Superseding is
     # refused either way, and the refusal is traced either way.
-    if consequence is Consequence.SUPERSEDE and _shows_no_difference(
+    if consequence is Consequence.SUPERSEDE and shows_no_difference(
         session,
         run,
         message=message,
@@ -1083,5 +1083,6 @@ __all__ = [
     "says_decline",
     "says_only_withdrawal",
     "says_withdrawal",
+    "shows_no_difference",
     "validate_class",
 ]

@@ -18,14 +18,28 @@ prompting a wider search, is a sequence of perfectly good calls that never
 ends. ``before_tool`` refuses past the cap and records the exhaustion, which
 the orchestrator turns into a ``failed`` run and a graceful reply.
 
-They also carry the tighter bound the budget is too blunt for. A decision the
+They also carry the tighter bounds the budget is too blunt for. A decision the
 model has already had accepted is *settled*, and asking for it again is not a
-step toward anything. Two rules, one flag:
+step toward anything. Neither is asking a second time for something that was
+refused on identical terms. Three rules, one flag:
 
 * an **accepted repeat** — the same tool, the same arguments, already accepted
   this agent turn — is refused and ends the loop;
+* an **identical refusal** — the same tool, the same arguments, already refused
+  this agent turn — likewise. The answer is not going to change: the refusal is
+  a fact about the arguments, and the arguments are the ones that were refused;
 * a **terminal tool** — one whose acceptance is the agent's entire output —
   ends the loop the moment it is accepted, with no further call at all.
+
+The refusal rule is deliberately keyed on the arguments and not on the tool. A
+*corrected* retry is the retry ladder working — the model is meant to fix the
+argument and call again, and every proposal tool depends on that. What ends the
+loop is asking the identical question twice. Live, at an ``in_progress`` cancel
+run, "book me a cardiology appointment" produced eight ``list_other_slots``
+calls with the same argument and the same refusal each time ("no department has
+been decided"), blew the iteration budget, and tombstoned the run — the
+clearest sentence in the transcript, killed by a loop that never learned
+anything after its first call.
 
 Both matter because the budget's failure mode is expensive and misleading.
 Observed live on ``openai/gpt-4o-mini``: it re-called ``submit_safety_verdict``
@@ -55,6 +69,30 @@ from app.trace import TraceWriter
 def _signature(name: str, args: dict | None) -> str:
     """A call's identity: its tool and its arguments, order-independent."""
     return f"{name}({json.dumps(args or {}, sort_keys=True, default=str)})"
+
+
+def _refused(response: object) -> bool:
+    """Did this result say no, rather than answer?
+
+    Two shapes say it in this codebase, and both have to count. A validating
+    tool refuses with ``accepted: False``; a read-only tool has no verdict to
+    give and refuses with a bare ``problem`` — ``list_other_slots`` returns
+    ``{"slots": [], "problem": "No department has been decided yet."}``, which
+    is the exact dict the live loop received eight times.
+
+    An ordinary empty answer is **not** a refusal. A search that ran and found
+    nothing returns no ``problem``, and repeating it is a waste rather than a
+    loop — the accepted-repeat rule does not cover read tools either, and
+    widening this to "returned nothing useful" would stop a model legitimately
+    re-reading after something changed.
+    """
+    if not isinstance(response, dict):
+        return False
+    if response.get("accepted") is False:
+        return True
+    return "accepted" not in response and bool(
+        response.get("problem") or response.get("error")
+    )
 
 
 class TurnCallbacks:
@@ -88,6 +126,7 @@ class TurnCallbacks:
         self.settled = False
         self.terminal_tool: str | None = None
         self._accepted: set[str] = set()
+        self._refused: set[str] = set()
         #: The request awaiting a partner. Held here rather than in ADK session
         #: state so that a provider exception can still be paired: the
         #: orchestrator reads this and writes the ``llm_error`` itself.
@@ -106,9 +145,11 @@ class TurnCallbacks:
         request within one call of its own budget. ``budget_exhausted`` is
         *not* reset — once a turn has blown a budget, it has failed.
 
-        ``settled`` and the accepted-call set *are* per agent, for the same
-        reason the counter is: the Coordinator having submitted its plan says
-        nothing about whether Routing has submitted a department.
+        ``settled`` and the accepted- and refused-call sets *are* per agent, for
+        the same reason the counter is: the Coordinator having submitted its plan
+        says nothing about whether Routing has submitted a department, and a
+        search the Coordinator could not run is not a search the Appointment
+        agent cannot run — by then a department may exist.
 
         ``terminal_tool`` names the one tool, if any, whose acceptance is this
         agent's whole output. Only the caller knows: the safety screen's
@@ -122,6 +163,34 @@ class TurnCallbacks:
         self.settled = False
         self.terminal_tool = terminal_tool
         self._accepted = set()
+        self._refused = set()
+
+    def release_budget(self, *, reason: str) -> None:
+        """Hand the turn a fresh budget because *code* now owns the decision.
+
+        Called from exactly one place — the orchestrator's recovery for a turn
+        whose Coordinator blew its budget on a message code can read for itself.
+        Without this the recovery is theatre: ``before_model`` short-circuits
+        every subsequent agent to "I couldn't complete this request", so the
+        specialists dispatched to route and propose would produce nothing.
+
+        It does not weaken the bound. The bound exists to stop an *automated
+        loop* spending without limit, and the caller is a straight line: it runs
+        at most once per turn, no model chose to reach it, and each agent it then
+        dispatches gets its own per-agent cap from :meth:`start_agent`. What is
+        released is the flag that says "this turn has already given up", on a
+        turn that has not.
+        """
+        if not self.budget_exhausted:
+            return
+        self.budget_exhausted = False
+        self.settled = False
+        self.tool_iterations = 0
+        self._accepted = set()
+        self._refused = set()
+        self.writer.validation(
+            "budget_released", accepted=True, detail={"reason": reason}
+        )
 
     def before_model(self, callback_context, llm_request):  # noqa: ANN001
         # Refusing the tool is not enough to stop a loop: the model would be
@@ -242,6 +311,31 @@ class TurnCallbacks:
                 )
             }
 
+        if signature in self._refused:
+            # The same question, already answered no. A refusal is a fact about
+            # these arguments, so running the tool again would produce the same
+            # dict and the model would be in the same position it was in two
+            # calls ago. Ends the loop for the reason the accepted-repeat rule
+            # does: refusing alone leaves the model being asked again, wanting
+            # the same thing again, until the budget fires.
+            self.settled = True
+            self.writer.validation(
+                "repeated_refusal",
+                accepted=False,
+                detail={
+                    "tool": tool.name,
+                    "args": dict(args or {}),
+                    "problem": "already refused this turn with these arguments",
+                },
+            )
+            return {
+                "error": (
+                    f"{tool.name} has already refused these exact arguments this "
+                    "turn. Calling it again will not change the answer; say what "
+                    "you can with what you have."
+                )
+            }
+
         correlation = self.writer.tool_call(
             tool.name, args=dict(args or {}), agent_name=tool_context.agent_name
         )
@@ -269,6 +363,11 @@ class TurnCallbacks:
             isinstance(tool_response, dict) and tool_response.get("accepted") is True
         )
         if not accepted:
+            if _refused(tool_response):
+                # Recorded, not acted on. The ladder is untouched: the model may
+                # correct the argument and be heard, and only an identical retry
+                # meets the bound in ``before_tool``.
+                self._refused.add(_signature(tool.name, dict(args or {})))
             return None
 
         self._accepted.add(_signature(tool.name, dict(args or {})))

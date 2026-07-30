@@ -6,7 +6,7 @@ conversation, and it exists because that step had no reader at all.
 **The hole.** A run at ``pending_confirmation`` holds a slot, and "lets book the
 4pm one" moves the offer to 4pm — that machinery works and is not touched here.
 A run at ``in_progress`` holds nothing, and there the same sentence had nowhere
-to land: the Coordinator classified it as a new request, ``_shows_no_difference``
+to land: the Coordinator classified it as a new request, ``shows_no_difference``
 correctly refused to supersede the run with itself, and the refusal's consequence
 is to answer with *more times*. So the reply asked for a time, a time arrived,
 and the reply asked for a time again. Live, seven consecutive messages — "okay

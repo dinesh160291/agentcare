@@ -954,6 +954,337 @@ class TestTheTerminalExitKeepsTheVerdict:
         assert result.budget_exhausted is False
 
 
+class SearchLoopingLlm(MockLlm):
+    """A Coordinator that answers a live run with ``list_other_slots``, forever.
+
+    Live run #6, reduced. At an ``in_progress`` **cancel** run — one that had
+    asked which of two appointments the patient meant and not been told — "book
+    me a cardiology appointment" produced eight ``list_other_slots("next week")``
+    calls. The same argument every time, and the same refusal every time,
+    because a cancel run's department lives on the appointment nobody had picked
+    yet. The iteration budget fired and ``_fail_run`` tombstoned the run.
+
+    It keeps the mock's planning and safety screen, so the loop under test is the
+    classifier's — which is where it happened.
+    """
+
+    model: str = "search-looping-stub"
+
+    def _classify(self, llm_request, available, done, text):  # noqa: ANN001
+        if "list_other_slots" in available:
+            return function_call_response("list_other_slots", {"phrase": "next week"})
+        return super()._classify(llm_request, available, done, text)
+
+
+class WideningSearchLlm(SearchLoopingLlm):
+    """The same loop, correcting its argument every call.
+
+    The control for the identical-refusal bound. A model that *changes* its
+    argument is doing what the retry ladder is for — every proposal tool in the
+    system depends on being told no and trying again — so this one must run all
+    the way to the iteration budget exactly as it did before.
+    """
+
+    model: str = "widening-search-stub"
+
+    def _classify(self, llm_request, available, done, text):  # noqa: ANN001
+        if "list_other_slots" in available:
+            tried = len(
+                [
+                    result
+                    for result in tool_results(llm_request)
+                    if result.name == "list_other_slots"
+                ]
+            )
+            return function_call_response(
+                "list_other_slots", {"phrase": "week %d" % (tried + 1)}
+            )
+        return super(SearchLoopingLlm, self)._classify(
+            llm_request, available, done, text
+        )
+
+
+def _waiting_cancel_run(patient, session_id: str):
+    """A cancel run at ``in_progress``, still waiting to learn which appointment.
+
+    Two live appointments is what makes it that: the specialist has nothing to
+    propose, so the run asks and stays put — and the run therefore carries no
+    department, which is why the search refuses. One appointment auto-targets and
+    the run would be holding a proposal instead, which is a different state with
+    a different toolbelt.
+
+    Every turn here is readable by the looping stub without reaching its loop:
+    planning happens with no active run, and the confirmation is read in code
+    before any model call.
+    """
+    booked = turn(patient, BOOKING, session_id)
+    assert booked.status == WorkflowStatus.PENDING_CONFIRMATION.value
+    confirmed = turn(patient, "yes", session_id)
+    assert confirmed.status == WorkflowStatus.COMPLETED.value
+
+    started = turn(patient, "please cancel my appointment", session_id)
+    assert started.status == WorkflowStatus.IN_PROGRESS.value
+    return started
+
+
+class TestAnIdenticalRefusalEndsTheLoop:
+    """Round 11 item 2a — the refusal twin of the accepted-repeat bound.
+
+    An accepted decision is settled, and asking again is waste. A refusal is
+    narrower and just as final: it is a fact about *these arguments*, so the same
+    call returns the same dict, and eight of them is one call's worth of
+    information at eight calls' cost.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _loop(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: SearchLoopingLlm()
+        )
+
+    def test_the_search_runs_once_and_the_repeat_is_refused(self, patient, settings):
+        """One call runs; the second is refused before it runs and ends the loop.
+
+        The cap is eight, so a passing count of one could not have come from the
+        budget — which is the thing this has to be distinguishable from.
+        """
+        _waiting_cancel_run(patient, "s-refusal-1")
+        result = turn(patient, "book me a cardiology appointment", "s-refusal-1")
+
+        session = fresh()
+        try:
+            searches = [
+                event
+                for event in _tool_calls(session, result.turn_id)
+                if event.payload["tool"] == "list_other_slots"
+            ]
+            refusals = _validations(session, result.turn_id, "repeated_refusal")
+        finally:
+            session.close()
+
+        assert len(searches) == 1
+        assert refusals, "the bound must be in the trace, not merely happen"
+        assert settings.max_tool_iterations > 2
+
+    def test_the_budget_never_blows(self, patient):
+        """Asserted on the trace, not on ``budget_exhausted``.
+
+        Sabotage is how that distinction was found: with this bound removed the
+        loop reaches the cap, item 2b's recovery supersedes anyway, and the
+        replacement run's ``TurnResult`` reports ``budget_exhausted=False``. The
+        flag was describing the second half of the turn. The absence of the
+        exhaustion event is the claim this test is actually making.
+        """
+        _waiting_cancel_run(patient, "s-refusal-2")
+        result = turn(patient, "book me a cardiology appointment", "s-refusal-2")
+
+        session = fresh()
+        try:
+            exhausted = _validations(
+                session, result.turn_id, "tool_iteration_budget"
+            )
+        finally:
+            session.close()
+
+        assert exhausted == []
+
+
+class TestACorrectedRetryIsStillAllowed:
+    """The direction that would break the retry ladder rather than the loop.
+
+    Every proposal tool in this system is built on being refused and called again
+    with a better argument. The bound is keyed on the arguments for exactly that
+    reason, and this is what keeps the key honest: a widening search must still be
+    able to spend its whole budget.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _widen(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: WideningSearchLlm()
+        )
+
+    def test_a_differing_argument_is_never_refused_as_a_repeat(self, patient):
+        """The ladder runs all the way to the outer bound, refusing nothing.
+
+        Counted as "the budget is what stopped it" rather than as an exact number
+        of searches: the Coordinator legitimately spends one call loading the
+        patient's context first, and an assertion on the total would be pinning
+        that incidental call rather than this one.
+        """
+        _waiting_cancel_run(patient, "s-widen-1")
+        result = turn(patient, "the earliest the better", "s-widen-1")
+
+        session = fresh()
+        try:
+            searches = [
+                event
+                for event in _tool_calls(session, result.turn_id)
+                if event.payload["tool"] == "list_other_slots"
+            ]
+            refusals = _validations(session, result.turn_id, "repeated_refusal")
+            exhausted = _validations(
+                session, result.turn_id, "tool_iteration_budget"
+            )
+        finally:
+            session.close()
+
+        assert refusals == []
+        assert exhausted, "the outer bound is what must have stopped this"
+        assert len(searches) > 2, "and not the identical-refusal bound"
+
+    def test_an_unreadable_message_still_fails_as_a_last_resort(self, patient):
+        """The negative control for item 2b, and the reason ``_fail_run`` stays.
+
+        "The earliest the better" names no verb code can act on, so there is
+        nothing for the recovery to read and the honest answer is the failure
+        notice — with the queue item ``FAILED_REPLY`` promises behind it.
+        """
+        _waiting_cancel_run(patient, "s-widen-2")
+        result = turn(patient, "the earliest the better", "s-widen-2")
+
+        assert result.reply == FAILED_REPLY
+        session = fresh()
+        try:
+            assert (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.SYSTEM_FAILURE)
+                .count()
+                == 1
+            )
+        finally:
+            session.close()
+
+    def test_a_genuinely_blown_budget_still_reaches_a_proposal(self, patient):
+        """The one path ``release_budget`` is reachable on, and its whole point.
+
+        The identical-refusal bound means an identical loop no longer blows the
+        budget at all — so this is the shape that still can: a loop that corrects
+        its argument every call, on a turn whose message code *can* read. Without
+        the release every specialist dispatched after it short-circuits to "I
+        couldn't complete this request", and the recovery is a cancelled run with
+        an apology where the proposal should be.
+        """
+        _waiting_cancel_run(patient, "s-widen-3")
+        result = turn(patient, "book me a cardiology appointment", "s-widen-3")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            exhausted = _validations(
+                session, result.turn_id, "tool_iteration_budget"
+            )
+            released = _validations(session, result.turn_id, "budget_released")
+        finally:
+            session.close()
+
+        assert exhausted, "the budget must actually have blown for this to mean it"
+        assert released
+
+
+class TestABlownLoopIsNotAVerdict:
+    """Round 11 item 2b — the clearest sentence in the transcript killed a run.
+
+    "Book me a cardiology appointment", sent to an ``in_progress`` cancel run,
+    was never classified: the loop spent the budget, ``_fail_run`` transitioned
+    the run to ``failed``, a ``system_failure`` escalation was raised against
+    work nobody had failed at, and the patient got the apology template. A verb,
+    a department, and nothing ambiguous about it.
+
+    Whether the class is missing because the budget blew, because the
+    identical-refusal bound ended the loop, or because the model never called the
+    tool makes no difference to the message — so code reads it with the two
+    readers that answer this question everywhere else.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _loop(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: SearchLoopingLlm()
+        )
+
+    def test_a_different_verb_supersedes_instead_of_failing(self, patient):
+        started = _waiting_cancel_run(patient, "s-unclassified-1")
+        result = turn(patient, "book me a cardiology appointment", "s-unclassified-1")
+
+        assert result.run_id != started.run_id
+        session = fresh()
+        try:
+            old = session.get(WorkflowRun, started.run_id)
+            new = session.get(WorkflowRun, result.run_id)
+            assert old.status is WorkflowStatus.CANCELLED
+            assert new.plan[:2] == ["route", "book"]
+            assert (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.SYSTEM_FAILURE)
+                .count()
+                == 0
+            )
+        finally:
+            session.close()
+
+    def test_the_replacement_reaches_a_proposal(self, patient):
+        """The point of releasing the budget. Without it every specialist
+        dispatched here short-circuits to "I couldn't complete this request", and
+        the supersede leaves a cancelled run with nothing in its place."""
+        _waiting_cancel_run(patient, "s-unclassified-2")
+        result = turn(patient, "book me a cardiology appointment", "s-unclassified-2")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert run.proposed_slot_id is not None
+            assert run.state["department_name"] == "Cardiology"
+        finally:
+            session.close()
+
+    def test_the_decision_is_traced(self, patient):
+        _waiting_cancel_run(patient, "s-unclassified-3")
+        result = turn(patient, "book me a cardiology appointment", "s-unclassified-3")
+
+        session = fresh()
+        try:
+            verdict = _guard(session, result.turn_id, "unclassified_turn")
+        finally:
+            session.close()
+
+        assert verdict["detail"]["applied"] == "supersede"
+        assert verdict["detail"]["verb"] == "book"
+        assert verdict["detail"]["run_intent"] == "cancel"
+
+    def test_the_same_verb_is_a_refinement_and_the_run_stands(self, patient):
+        """Difference is what earns a supersede; sameness earns an answer.
+
+        A second cancellation request against a cancel run replaces nothing, so
+        the run survives — and it is still not failed, which is the half of the
+        item that is about ``_fail_run`` rather than about superseding. What it
+        gets back is the question it was already asking.
+        """
+        started = _waiting_cancel_run(patient, "s-unclassified-4")
+        result = turn(patient, "please cancel my appointment", "s-unclassified-4")
+
+        assert result.run_id == started.run_id
+        assert result.reply != FAILED_REPLY
+        assert "1." in result.reply
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, started.run_id)
+            assert run.status is WorkflowStatus.IN_PROGRESS
+        finally:
+            session.close()
+
+    def test_the_trace_is_still_well_formed(self, patient):
+        _waiting_cancel_run(patient, "s-unclassified-5")
+        turn(patient, "book me a cardiology appointment", "s-unclassified-5")
+
+        session = fresh()
+        try:
+            assert_well_formed(session)
+        finally:
+            session.close()
+
+
 RESTART_SCRIPT = """
 import asyncio, os, sys
 sys.path.insert(0, {root!r})
@@ -4280,7 +4611,7 @@ class RefusingCoordinatorLlm(MockLlm):
 
     The mock reads "2" correctly through the specialist, so it cannot show what
     happened live — the classifier path has to be forced. ``incoming_steps`` of
-    ``[cancel]`` against a cancel run is what makes ``_shows_no_difference``
+    ``[cancel]`` against a cancel run is what makes ``shows_no_difference``
     refuse the supersede, which is the branch that then had nothing to do.
     """
 

@@ -82,6 +82,7 @@ from app.workflow.mapping import (
     says_affirmative,
     says_decline,
     says_only_withdrawal,
+    shows_no_difference,
     validate_class,
 )
 from app.workflow.recall import (
@@ -807,7 +808,7 @@ def _review_wall(
 
     * a **genuine supersede** — a different intent or a different subject; it
       cancels the run and starts another, which is the patient's right and is
-      already gated by ``_shows_no_difference``;
+      already gated by ``shows_no_difference``;
     * a **withdrawal** — likewise theirs, and likewise already gated by the cue
       rule;
     * a **read-only status question** — "show my upcoming appointments" reads
@@ -1414,6 +1415,167 @@ async def _restart_remembered(
     )
 
 
+async def _settle_unclassified_turn(
+    session: Session,
+    *,
+    run: WorkflowRun | None,
+    belt: Toolbelt,
+    writer: TraceWriter,
+    callbacks: TurnCallbacks,
+    user: User,
+    profile: PatientProfile,
+    message: str,
+    conversation_id: str,
+    provider: str | None,
+    settings,
+    base: dict,
+) -> TurnResult | None:
+    """No class came back, and the message says plainly what it wants anyway.
+
+    ``None`` when there is nothing here code can read, which leaves everything
+    downstream exactly as it was — the failure path, and ``_continue_run``'s
+    default-to-side-question.
+
+    **The live failure.** At an ``in_progress`` cancel run, "book me a cardiology
+    appointment" was never classified at all: the model called
+    ``list_other_slots("next week")`` eight times, refused identically every
+    time because a cancel run carries no department, hit the iteration budget,
+    and ``_fail_run`` tombstoned the run. The single clearest sentence in the
+    transcript — a verb, a department, and nothing ambiguous about it — produced
+    a failure notice and a ``system_failure`` queue item.
+
+    The bound stopping that loop is round 11's other half, in
+    ``TurnCallbacks.before_tool``. This is the half about the *message*, and it
+    deliberately does not care *why* the class is missing — a blown budget, the
+    identical-refusal bound ending the loop, or a model that never called the
+    tool all leave the turn in the same position. The question "does this replace
+    the run or refine it?" is still answerable, by the two readers that answer it
+    everywhere else: ``names_appointment_verbs`` for the verb and
+    ``resolve_department`` (inside :func:`shows_no_difference`) for the subject.
+    A different verb or a different desk is a supersede, which is the patient's
+    right; the same one is a refinement, which gets the re-ask.
+
+    Deliberately narrow in three ways. It needs a live run, so it cannot invent
+    one. It stands aside the moment the model *did* classify, because then the
+    turn has a verdict and this would be second-guessing it. And it needs the
+    message to name exactly one appointment verb: two verbs is the one-verb rule's
+    business, and none means the words carry nothing to act on.
+    """
+    if run is None or belt.proposals.class_verdict is not None:
+        return None
+
+    verbs = names_appointment_verbs(message)
+    if len(verbs) != 1:
+        return None
+    verb = next(iter(verbs))
+
+    refinement = shows_no_difference(
+        session, run, message=message, incoming_steps=[verb], writer=writer
+    )
+    writer.guard_verdict(
+        "unclassified_turn",
+        passed=True,
+        detail={
+            "verb": verb.value,
+            "run_intent": (primary_intent(run.plan or []) or PlanStep.ROUTE).value,
+            "state": run.status.value,
+            "applied": "reask" if refinement else "supersede",
+        },
+    )
+
+    if refinement:
+        # The run stands and nothing is failed. At ``pending_review`` the wall's
+        # own answer is the right one — the request is with a person and this
+        # message did not ask for anything different. Otherwise the run's own
+        # outstanding question comes back, in the same precedence the refused
+        # supersede already uses: a change run still waiting to learn which
+        # appointment re-draws its numbered list, and everything else states what
+        # is held.
+        return TurnResult(
+            reply=(
+                AWAITING_REVIEW_REPLY
+                if run.status is WorkflowStatus.PENDING_REVIEW
+                else (_choice_reask(session, run) or render_reask(session, run))
+            ),
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            message_class=MessageClass.CONTINUATION,
+            **base,
+        )
+
+    transition(
+        session,
+        run,
+        to=WorkflowStatus.CANCELLED,
+        trigger="superseded_by_new_request",
+        writer=writer,
+        reason=CancellationReason.SUPERSEDED,
+        actor=user,
+    )
+    # The derivation invariant, in the transaction that killed the run: an open
+    # escalation is a queue item a human would work on for a request the patient
+    # has replaced, and a held slot on a cancelled row is a lie in the record.
+    close_escalations_for_run(
+        session,
+        workflow_run_id=run.id,
+        note="Superseded by a later request.",
+        actor=user,
+    )
+    run.clear_proposal()
+
+    # Code owns the rest of this turn, so the turn gets its budget back. See
+    # ``TurnCallbacks.release_budget`` for why that does not loosen the bound.
+    callbacks.release_budget(reason="unclassified_turn_superseded")
+
+    plan = _corrected_change_plan(
+        session,
+        validate_plan([verb.value]),
+        message=message,
+        patient_id=profile.id,
+        writer=writer,
+    )
+    replacement = create_run(
+        session,
+        patient_id=profile.id,
+        status=WorkflowStatus.IN_PROGRESS,
+        trigger="superseded_previous_request",
+        writer=writer,
+        request_text=message,
+        plan=[step.value for step in plan],
+        session_id=conversation_id,
+        actor=user,
+    )
+    belt.run = replacement
+    result = await _execute_plan(
+        session,
+        run=replacement,
+        belt=belt,
+        writer=writer,
+        callbacks=callbacks,
+        user=user,
+        message=message,
+        fallback_reply="",
+        provider=provider,
+        settings=settings,
+        base=base,
+    )
+    return TurnResult(
+        reply=(
+            "I've closed your earlier request and started this one instead. "
+            + result.reply
+        ),
+        author=result.author,
+        run_id=result.run_id,
+        status=result.status,
+        message_class=MessageClass.CONFLICTING,
+        plan=result.plan,
+        steps_run=result.steps_run,
+        budget_exhausted=result.budget_exhausted,
+        **base,
+    )
+
+
 def _budget_failure(
     session: Session,
     *,
@@ -1987,6 +2149,31 @@ async def _turn(
         # sessions; leaving the flag set would be harmless there and wrong to
         # rely on, and the turn envelope is the only place that knows.
         callbacks.plan_context_only = False
+
+    # Whatever the Coordinator spent, it may have come back with no class at all
+    # — because the budget blew, because the identical-refusal bound ended the
+    # loop, or because it simply never called the tool. That is a fact about the
+    # loop and not a verdict on the message, and where the message plainly names
+    # an appointment verb code can settle the turn itself. Ahead of the failure
+    # path below, and ahead of `_continue_run`'s default-to-side-question, which
+    # is the other place a turn quietly ends up answering nothing.
+    if run is not None and belt.proposals.class_verdict is None:
+        settled = await _settle_unclassified_turn(
+            session,
+            run=run,
+            belt=belt,
+            writer=writer,
+            callbacks=callbacks,
+            user=user,
+            profile=profile,
+            message=message,
+            conversation_id=conversation_id,
+            provider=provider,
+            settings=settings,
+            base=base,
+        )
+        if settled is not None:
+            return settled
 
     if callbacks.budget_exhausted:
         return _budget_failure(
