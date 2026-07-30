@@ -446,6 +446,60 @@ class TestOversight:
         assert events[0]["event_type"] == "inbound"
         assert events[-1]["event_type"] == "outbound"
 
+    def test_the_timeline_returns_whole_turns_including_the_prefix(
+        self, seeded_client, seeded_db
+    ):
+        """The seq-23 defect, stated as a test.
+
+        A turn opens *before* its run exists — inbound, safety screen,
+        classification — so those rows carry a null ``workflow_run_id`` by
+        design and ``bind_run`` only attaches what comes after. A timeline
+        selected with ``WHERE workflow_run_id = ?`` therefore drops exactly the
+        part a reviewer needs, and it looks complete because it is ordered and
+        non-empty. Two things are asserted together because either alone is
+        satisfiable by the broken version: that rows the run does not own are
+        present, and that every turn still starts at its own inbound.
+        """
+        run_id = paused_run(seeded_client, "api-trace-3")
+        # A second turn on the same run, so the "ordered by id, not by seq"
+        # rule has something to be wrong about: seq restarts at 1 per turn.
+        seeded_client.post(
+            "/workflow/messages",
+            headers=auth_header(ASHA),
+            json={"message": "any update on that?", "session_id": "api-trace-3"},
+        )
+
+        events = seeded_client.get(
+            f"/staff/runs/{run_id}/trace", headers=auth_header(STAFF, "staff")
+        ).json()
+        turns = {event["turn_id"] for event in events}
+        assert len(turns) >= 2, "the second turn is missing from the timeline"
+
+        unowned = (
+            SessionLocal()
+            .query(TraceEvent)
+            .filter(
+                TraceEvent.turn_id.in_(turns),
+                TraceEvent.workflow_run_id.is_(None),
+            )
+            .count()
+        )
+        assert unowned, "no turn has a pre-run prefix, so this proves nothing"
+        assert len(events) > (
+            SessionLocal()
+            .query(TraceEvent)
+            .filter(TraceEvent.workflow_run_id == run_id)
+            .count()
+        ), "the timeline returned only the events bound to the run"
+
+        for turn_id in turns:
+            in_turn = [event for event in events if event["turn_id"] == turn_id]
+            assert in_turn[0]["seq"] == 1
+            assert in_turn[0]["event_type"] == "inbound"
+            assert [event["seq"] for event in in_turn] == list(
+                range(1, len(in_turn) + 1)
+            )
+
     def test_a_patient_cannot_read_a_trace(self, seeded_client):
         run_id = paused_run(seeded_client, "api-trace-2")
         assert (
