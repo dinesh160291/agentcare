@@ -1,0 +1,32 @@
+{
+  "name": "verb-switch-at-a-held-proposal",
+  "pins": "\"Cancel\" is a verb the patient states, not a refusal of the offer on screen. Round 10 put it in the decline cues and it cost an appointment: the reschedule proposal died, the patient was told nothing had been booked, and the appointment they asked to cancel was still on the books. Where a proposal names the row, \"cancel it instead\" switches the verb onto that same appointment — and the switch is only readable through a pronoun, because a message naming an appointment noun has supplied its own referent and it may not be the held one.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "please reschedule my appointment to next week",
+      "expect": {
+        "status": "pending_confirmation",
+        "proposed_action": "reschedule",
+        "appointment_status": {"1": "confirmed"}
+      }
+    },
+    {
+      "message": "actually just cancel it instead",
+      "expect": {
+        "status": "pending_confirmation",
+        "proposed_action": "cancel",
+        "appointment_status": {"1": "confirmed"},
+        "appointments_created": 0
+      }
+    },
+    {
+      "action": "confirm",
+      "expect": {
+        "appointment_status": {"1": "cancelled"},
+        "proposed_action": null,
+        "audit_actions": {"appointment_rescheduled": 0}
+      }
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "name": "the-dropped-verb-is-remembered",
+  "pins": "One request confirms one thing, and the cost of that rule has to be said out loud: a sentence asking for two verbs gets one of them, and the other survives only in the words. The note promises the patient may ask about the other one right after — and a template that makes a promise is the thing that has to keep it. So a refusal consults the memory, and only an exact yes acts on it. The department is named by subtraction: two desks are named, the kept half acted on one, and exactly one candidate is left. With the friendlier one-department phrasing this whole defect stayed hidden for a round.",
+  "patient": "asha.patient@example.invalid",
+  "turns": [
+    {
+      "message": "book me a dermatology appointment and cancel my cardiology one",
+      "expect": {
+        "reply_contains": ["one change at a time"],
+        "appointments_created": 0,
+        "proposed_action": "cancel"
+      }
+    },
+    {
+      "action": "confirm",
+      "expect": {
+        "status": "completed",
+        "appointment_status": {"1": "cancelled"}
+      }
+    },
+    {
+      "message": "now do the other thing I asked",
+      "expect": {
+        "reply_contains": ["booking a Dermatology appointment", "shall I start it"],
+        "reply_author": "template",
+        "appointments_created": 0
+      }
+    },
+    {
+      "message": "yes",
+      "expect": {
+        "status": "pending_confirmation",
+        "same_run": false,
+        "reply_contains": ["Dermatology"]
+      }
+    }
+  ]
+}

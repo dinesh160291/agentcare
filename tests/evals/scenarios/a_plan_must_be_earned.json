@@ -1,0 +1,22 @@
+{
+  "name": "a-plan-must-be-earned",
+  "pins": "The *outcome* the round-11 defect produced: a message pointing at nothing must never reach a departmentless documents agent, whose internal refusal (\"no department has been decided\") shipped to the patient as an answer with a dump of their open tasks underneath. Note honestly what this scenario can and cannot catch. Under the mock the sentence is planned as nothing at all, so the refusal it gets comes from the empty plan rather than from the earned rule — sabotaging that rule leaves this green. The falsifiable twin is tests/unit/test_orchestrator.py::TestASubjectlessPlanMustBeEarned, which drives a provider that plans [documents, follow_up] the way the live model did. What this file adds is the end-to-end floor: whichever layer refuses, the patient is not handed an agent's internal refusal, and no run is completed for a message that asked for nothing.",
+  "patient": "rohan.patient@example.invalid",
+  "turns": [
+    {
+      "message": "now do the other thing I asked",
+      "expect": {
+        "reply_contains": ["hospital administration"],
+        "reply_excludes": ["no department has been decided", "open tasks"],
+        "appointments_created": 0,
+        "escalations": 0
+      }
+    },
+    {
+      "message": "what documents do I need to bring?",
+      "expect": {
+        "reply_excludes": ["hospital administration"]
+      }
+    }
+  ]
+}
