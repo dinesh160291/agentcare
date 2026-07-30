@@ -92,7 +92,12 @@ from app.workflow.recall import (
     remember_dropped_verb,
 )
 from app.workflow.selection import Offer, read_selection
-from app.workflow.queries import QueryKind, answer_query, detect_query
+from app.workflow.queries import (
+    QueryKind,
+    answer_query,
+    detect_query,
+    names_document_subject,
+)
 from app.workflow.plan import (
     advance_plan,
     is_plan_complete,
@@ -1159,23 +1164,32 @@ def _consecutive_clarifies(session: Session, *, session_id: str, turn_id: str) -
     return count
 
 
-def _earns_follow_up(message: str) -> bool:
-    """Whether a message has said enough to deserve a follow-up-only plan.
+#: The plan steps that name no subject of their own. Every other step is about
+#: something the message had to mention — a department, an appointment, a time —
+#: so a plan containing one of those *is* evidence about the request. These two
+#: are not: the follow-up agent can run on any patient at any time, and the
+#: documents agent reads whatever is on file.
+_SUBJECTLESS_STEPS = frozenset({PlanStep.DOCUMENTS, PlanStep.FOLLOW_UP})
 
-    Three ways, and they are all existing readers rather than a new opinion:
-    the domain subjects every guard here shares, the follow-up nouns that name
-    a patient's own outstanding business, and the listing detector that already
-    answers "what have I got" questions before planning is reached.
+
+def _earns_plan(message: str) -> bool:
+    """Whether a message has said enough to deserve a plan that names no verb.
+
+    Four ways, and they are all existing readers rather than a new opinion: the
+    domain subjects every guard here shares, the follow-up nouns that name a
+    patient's own outstanding business, the document words the listing detector
+    already owns, and the detector itself.
 
     The false-positive direction costs a run that reads the patient's own
     reminders back to them — mildly silly. The false-negative direction refuses
-    a real question about their own tasks, which is the expensive one, so the
-    test is deliberately generous and every one of its three limbs is a reader
-    that already existed.
+    a real question about their own tasks or paperwork, which is the expensive
+    one, so the test is deliberately generous and every one of its four limbs is
+    a reader that already existed.
     """
     return (
         mentions_domain_subject(message)
         or names_followup_subject(message)
+        or names_document_subject(message)
         or detect_query(message) is not None
     )
 
@@ -2010,13 +2024,26 @@ async def _turn(
         plan = _plan_floor(
             session, message=message, belt=belt, writer=writer, user=user
         )
-    unearned_follow_up = plan == [PlanStep.FOLLOW_UP] and not _earns_follow_up(message)
+    # A plan made entirely of subjectless steps has to be earned by the message.
+    # Round 9 closed this for ``["follow_up"]`` alone, and the hole was one door
+    # wide: live, "now do the other thing I asked" was planned as
+    # ``["documents", "follow_up"]`` — two valid steps, so the gate passed with
+    # ``domain_subject: false`` — and the documents agent ran departmentless,
+    # shipping its own internal refusal ("no department has been decided") to the
+    # patient as an answer, followed by a dump of their open tasks. The recall
+    # memory that exists for exactly that sentence never fired, because it is
+    # consulted only when the gate *refuses* and the model had planned around it.
+    unearned = (
+        plan is not None
+        and set(plan) <= _SUBJECTLESS_STEPS
+        and not _earns_plan(message)
+    )
 
     # Before any of the three refusals below, and only for a message that points
     # backwards: the patient may be asking for something they have already asked
     # for once. This changes what the refusal *offers* and nothing else — no run
     # is created here, and the offer is answerable only by an exact word.
-    if plan is None or unearned_follow_up:
+    if plan is None or unearned:
         offered = _offer_remembered(
             session,
             writer=writer,
@@ -2029,25 +2056,27 @@ async def _turn(
         if offered is not None:
             return offered
 
-    if unearned_follow_up:
-        # A plan of follow-up alone asserts nothing about the message, because
-        # the follow-up agent can run on any patient at any time. Every other
-        # step names something the request had to be about; this one does not,
+    if unearned:
+        # A plan of subjectless steps asserts nothing about the message. Every
+        # other step names something the request had to be about; these do not,
         # so the gate — which asks for a domain subject only when there is *no*
         # plan — had nothing to disagree with, and three off-topic questions
         # became three completed runs that listed the patient's reminders back
         # at them.
         writer.guard_verdict(
-            "follow_up_earned",
+            "plan_earned",
             passed=False,
-            detail={"problem": "follow-up plan for a message that names no subject"},
+            detail={
+                "steps": [step.value for step in plan],
+                "problem": "no appointment verb, and the message names no subject",
+            },
         )
         write_audit(
             session,
             action="scope_gate_refused",
             entity_type="workflow_run",
             actor=user,
-            metadata={"reason": "follow-up plan not earned by the message"},
+            metadata={"reason": "subjectless plan not earned by the message"},
         )
         return TurnResult(
             reply=UNSUPPORTED_TOPIC_REPLY, author=TraceAuthor.GUARD, **base

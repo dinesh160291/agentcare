@@ -77,10 +77,24 @@ _ASKING = (
 #: standing was "visit". So the stems are open-ended here, and the words a
 #: patient uses for *handing something over* — upload, submit, bring — count as
 #: naming the subject, which is what makes the precedence do any work.
+#: What a patient calls the things they hand over. Exported because the scope
+#: gate needs the same question answered — a plan of ``["documents"]`` names no
+#: verb, so it asserts nothing about the message and has to be earned by it —
+#: and a second list of document words is a second list to drift from this one.
+#: That is the mistake ``_TIMING_WORDS`` made twice against ``resolve_date``.
+DOCUMENT_SUBJECTS: tuple[str, ...] = (
+    r"\bdocument\w*\b",
+    r"\breports?\b",
+    r"\bpaperwork\b",
+    r"\brecords?\b",
+    r"\bfiles?\b",
+    r"\bupload\w*\b",
+    r"\bsubmit\w*\b",
+    r"\bbring\b",
+)
+
 _SUBJECTS: tuple[tuple[QueryKind, tuple[str, ...]], ...] = (
-    (QueryKind.DOCUMENTS, (r"\bdocument\w*\b", r"\breports?\b", r"\bpaperwork\b",
-                           r"\brecords?\b", r"\bfiles?\b", r"\bupload\w*\b",
-                           r"\bsubmit\w*\b", r"\bbring\b")),
+    (QueryKind.DOCUMENTS, DOCUMENT_SUBJECTS),
     (QueryKind.REMINDERS, (r"\breminders?\b",)),
     (QueryKind.APPOINTMENTS, (r"\bappointments?\b", r"\bbookings?\b", r"\bvisits?\b")),
 )
@@ -136,6 +150,22 @@ def detect_query(text: str) -> QueryKind | None:
             return None
 
     return subject
+
+
+def names_document_subject(text: str) -> bool:
+    """Whether a message is about paperwork at all.
+
+    The documents-side twin of
+    :func:`~app.workflow.mapping.names_followup_subject`, and it exists for the
+    same reason: the scope gate has to be able to ask whether a plan naming no
+    appointment verb was earned by the sentence, and ``documents`` names a
+    subject the domain vocabulary only half covers. It reads the *subject* list
+    without the "is this a question" and "is this an action" filters
+    :func:`detect_query` applies — "here is my referral letter, please file it"
+    is a documents request and not a listing question, and both must earn a
+    documents plan.
+    """
+    return _matches(DOCUMENT_SUBJECTS, (text or "").strip())
 
 
 # --- rendering ------------------------------------------------------------
@@ -270,4 +300,10 @@ def answer_query(
     return _documents(session, patient_id, message)
 
 
-__all__ = ["QueryKind", "answer_query", "detect_query"]
+__all__ = [
+    "DOCUMENT_SUBJECTS",
+    "QueryKind",
+    "answer_query",
+    "detect_query",
+    "names_document_subject",
+]

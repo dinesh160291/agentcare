@@ -1958,7 +1958,7 @@ class TestAFollowUpPlanMustBeEarned:
 
         session = fresh()
         try:
-            gate = _guard(session, result.turn_id, "follow_up_earned")
+            gate = _guard(session, result.turn_id, "plan_earned")
         finally:
             session.close()
 
@@ -1977,7 +1977,7 @@ class TestAFollowUpPlanMustBeEarned:
     def test_a_reminders_question_never_reaches_this_gate_at_all(self, patient):
         """Named for what it actually pins, which sabotage is how I found out.
 
-        With ``_earns_follow_up`` forced to refuse everything, this still
+        With ``_earns_plan`` forced to refuse everything, this still
         passed: a listing question is answered from the rows *before* the
         Coordinator runs, so the gate never sees it. That makes this a
         regression guard on the query router's precedence rather than on the
@@ -1988,7 +1988,7 @@ class TestAFollowUpPlanMustBeEarned:
         assert result.reply != UNSUPPORTED_TOPIC_REPLY
         session = fresh()
         try:
-            assert _guard_or_none(session, result.turn_id, "follow_up_earned") is None
+            assert _guard_or_none(session, result.turn_id, "plan_earned") is None
         finally:
             session.close()
 
@@ -2009,6 +2009,155 @@ class TestAFollowUpPlanMustBeEarned:
             assert PlanStep.FOLLOW_UP.value in run.plan
         finally:
             session.close()
+
+
+class SubjectlessPlanningLlm(MockLlm):
+    """A Coordinator that answers anything at all with ``["documents", "follow_up"]``.
+
+    Live run #5, and the reason round 9's fix was one door wide. "Now do the
+    other thing I asked" came back as exactly this plan — two real steps, so the
+    plan validator accepted it, and the gate asked for a domain subject only
+    when the plan was ``["follow_up"]`` *alone*. So the run was created, the
+    documents agent ran with no department to diff against and shipped its own
+    internal refusal ("no department has been decided") to the patient as an
+    answer, and the follow-up agent dumped their open tasks underneath it. The
+    recall memory that exists for that exact sentence never fired, because it is
+    consulted only when the gate refuses.
+
+    The mock cannot show this: it produces no plan for that sentence and lands
+    on the offer already. A stub that plans *around* the gate is the only thing
+    that can falsify a claim about the gate.
+    """
+
+    model: str = "subjectless-planning-stub"
+
+    def _plan(self, llm_request, done, text):  # noqa: ANN001
+        submitted = latest_tool_result(llm_request, "submit_plan")
+        if submitted is not None:
+            return self._from_plan(submitted.payload)
+        return function_call_response(
+            "submit_plan", {"steps": ["documents", "follow_up"]}
+        )
+
+
+class TestASubjectlessPlanMustBeEarned:
+    """Round 11 item 1 — the earned rule is about the *plan*, not about one step.
+
+    A plan made only of ``documents`` and ``follow_up`` names no appointment
+    verb, so nothing in it says what the message was about. Round 9 read that
+    rule off ``follow_up`` and wrote the condition for ``follow_up``; the model
+    then planned one step over.
+    """
+
+    @staticmethod
+    def subjectless(monkeypatch):
+        """Swap the provider *after* any setup the stub could not have planned.
+
+        Round 10's decline tests learned this the hard way as a fixture: a stub
+        that plans one thing for every sentence cannot also perform the setup,
+        and eleven tests failed on a run that was never created.
+        """
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: SubjectlessPlanningLlm()
+        )
+
+    def test_a_pointing_message_reaches_the_offer_instead_of_a_run(
+        self, patient, monkeypatch
+    ):
+        """The live sentence, with the memory the live session also had.
+
+        This is the whole item: the refusal is what consults the memory, so a
+        plan that walks past the refusal walks past the memory too.
+        """
+        first = turn(
+            patient,
+            "okay lets cancel that appointment and book a new one for cardiology",
+            "s-subjectless-1",
+        )
+        assert "One change at a time" in first.reply
+        done = turn(patient, "yes", "s-subjectless-1")
+        assert done.status == WorkflowStatus.COMPLETED.value
+
+        self.subjectless(monkeypatch)
+        result = turn(patient, "now do the other thing I asked", "s-subjectless-1")
+
+        assert "booking a Cardiology appointment" in result.reply
+        assert result.run_id is None
+
+        session = fresh()
+        try:
+            patient_id = session.get(WorkflowRun, done.run_id).patient_id
+            runs = (
+                session.query(WorkflowRun)
+                .filter(WorkflowRun.patient_id == patient_id)
+                .all()
+            )
+            assert [run.id for run in runs] == [done.run_id]
+        finally:
+            session.close()
+
+    def test_the_refusal_names_the_steps_it_refused(self, patient, monkeypatch):
+        self.subjectless(monkeypatch)
+        result = turn(patient, "who is the ceo of nvidia?", "s-subjectless-2")
+
+        assert result.reply == UNSUPPORTED_TOPIC_REPLY
+        session = fresh()
+        try:
+            gate = _guard(session, result.turn_id, "plan_earned")
+        finally:
+            session.close()
+        assert gate["passed"] is False
+        assert gate["detail"]["steps"] == ["documents", "follow_up"]
+
+    def test_a_documents_question_still_earns_its_plan(self, patient, monkeypatch):
+        """The direction that would break the feature rather than the gate.
+
+        "Bring" and "submit" are in the documents vocabulary because a patient
+        naming paperwork has named a subject — and the gate reads that list
+        rather than a second one of its own.
+        """
+        self.subjectless(monkeypatch)
+        result = turn(
+            patient, "what documents do I need to bring?", "s-subjectless-3"
+        )
+
+        assert result.reply != UNSUPPORTED_TOPIC_REPLY
+        assert result.run_id is not None
+
+    def test_handing_something_over_is_not_a_question_and_still_earns_it(
+        self, patient, monkeypatch
+    ):
+        """The one limb of ``_earns_plan`` the other three cannot cover.
+
+        "Please file this" names paperwork and asks nothing, so
+        ``mentions_domain_subject`` misses it (no "document"),
+        ``names_followup_subject`` misses it, and ``detect_query`` misses it —
+        it applies an "is this a question" filter this gate must not. Delete
+        ``names_document_subject`` from the gate and only this test goes red,
+        which is what makes that limb a guard rather than a decoration.
+        """
+        self.subjectless(monkeypatch)
+        result = turn(
+            patient, "please file this with my other paperwork", "s-subjectless-5"
+        )
+
+        assert result.reply != UNSUPPORTED_TOPIC_REPLY
+        assert result.run_id is not None
+
+    def test_a_message_with_nothing_behind_it_gets_the_generic_reply(
+        self, patient, monkeypatch
+    ):
+        """No memory, so the offer has nothing to name and the refusal stands.
+
+        The negative control for item 3 of round 10 as much as for this one: a
+        memory that answered every refusal would be a memory that answers
+        "who won the fifa final" with an offer to restart a booking.
+        """
+        self.subjectless(monkeypatch)
+        result = turn(patient, "now do the other thing", "s-subjectless-4")
+
+        assert result.reply == UNSUPPORTED_TOPIC_REPLY
+        assert result.run_id is None
 
 
 class HistoryReadingClassifierLlm(MockLlm):
