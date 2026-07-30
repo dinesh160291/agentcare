@@ -41,6 +41,7 @@ from app.models import (
     AppointmentStatus,
     Escalation,
     EscalationKind,
+    ProposedAction,
     TraceAuthor,
     TraceEvent,
     TraceEventType,
@@ -396,6 +397,35 @@ class TestDAVerbSwitchMidRun:
     """A supersede that keeps the patient's second intent, and a commit that
     acts on the appointment they named rather than on one of the others."""
 
+    def test_the_pronoun_phrasing_switches_the_verb(self, patient):
+        """Round 11 item 3, the phrasing that failed live.
+
+        Holding a reschedule, "actually just cancel it instead" was read as a
+        *decline* — "cancel" was in the decline vocabulary — so the proposal died,
+        the patient was told nothing had been booked, and the appointment they had
+        asked to cancel was still on the books. The noun phrasing below worked two
+        turns later, which is what made it a phrasing lottery rather than a bug
+        anyone would have found by rewording.
+        """
+        first = turn(patient, "lets reschedule my appointment to next week", "bat-d0")
+        assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        target = _run(first.run_id).proposed_appointment_id
+        assert target is not None
+
+        switched = turn(patient, "actually just cancel it instead", "bat-d0")
+        assert switched.run_id != first.run_id
+        assert _run(switched.run_id).proposed_action is ProposedAction.CANCEL
+        assert _run(switched.run_id).proposed_appointment_id == target
+
+        turn(patient, "yes", "bat-d0")
+        session = fresh()
+        try:
+            assert session.get(Appointment, target).status is (
+                AppointmentStatus.CANCELLED
+            )
+        finally:
+            session.close()
+
     def test_the_whole_sequence(self, patient):
         first = turn(patient, "I need a dermatology appointment for a rash", "bat-d")
         assert first.status == WorkflowStatus.PENDING_CONFIRMATION.value
@@ -472,6 +502,41 @@ class TestESafetyAndScope:
             for appointment in _appointments(_patient_id(result.run_id))
             if appointment.id != SEEDED_APPOINTMENT_ID
         ] == []
+
+    def test_a_stated_booking_is_never_answered_with_a_routing_notice(self, patient):
+        """Round 11 item 5, on the live sentence, inside the same latitude.
+
+        "Book an eye test appointment, my vision has been a bit blurry lately"
+        was planned as ``["route"]`` alone: accepted, routed, plan complete, run
+        completed. The patient asked to book and got a routing notice. The screen
+        keeps its latitude here — a symptom description may fire it — so both
+        outcomes are named, and the item-5 claim is the one that holds whichever
+        way it falls: if a plan was built at all, it contains the verb the
+        sentence stated.
+
+        **Under the mock this step is a floor, not a guard.** The understudy plans
+        that sentence correctly, so removing the correction leaves it green —
+        checked, by sabotage. It is here because this battery is re-run against a
+        live provider, where the sentence is one the model got wrong; the
+        falsifiable form lives in ``TestABookMessageEarnsABookPlan``, which drives
+        a stub that plans ``["route"]`` the way the live model did.
+        """
+        result = turn(
+            patient,
+            "book an eye test appointment, my vision has been a bit blurry lately",
+            "bat-e5",
+        )
+
+        assert result.status in {
+            WorkflowStatus.PENDING_CONFIRMATION.value,
+            WorkflowStatus.PENDING_REVIEW.value,
+            WorkflowStatus.ESCALATED.value,
+        }
+        if result.plan:
+            assert "book" in result.plan
+        assert result.status != WorkflowStatus.COMPLETED.value, (
+            "a booking request completed without a booking"
+        )
 
     @pytest.mark.parametrize(
         "message", ["how is nvidia stock doing", "what is the capital city of France?"]
@@ -628,6 +693,43 @@ class TestGReadingTheAnswer:
         restarted = turn(patient, "yes", "bat-g4")
         assert restarted.run_id != first.run_id
         assert restarted.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+    def test_an_ordinal_wearing_a_date_is_not_an_answer(self, patient):
+        """Round 11 item 4, in the state that produced it.
+
+        A run holding a reschedule with alternatives on screen: "on the 3rd
+        august" matched "3rd" as list position three, silently re-held the slot in
+        that row, and the constraint the patient stated was never answered. The
+        pin is that the offer does not move — and that the same message with the
+        month removed still answers the list, which is what keeps the lookahead
+        from being a way of ignoring positions.
+        """
+        first = turn(patient, "lets reschedule my appointment to next week", "bat-g7")
+        turn(
+            patient,
+            "can you show me other times for this appointment in the afternoon?",
+            "bat-g7",
+        )
+        run = _run(first.run_id)
+        held, shortlist = run.proposed_slot_id, list(
+            (run.state or {}).get("shortlist_slot_ids") or []
+        )
+        assert len(shortlist) >= 3, "the sequence needs a list to mis-answer"
+
+        turn(patient, "move it to after my other appointment on the 3rd august", "bat-g7")
+
+        assert _run(first.run_id).proposed_slot_id == held, (
+            "a date was read as a list position"
+        )
+
+        # And the control: the same notation with no month still selects. The
+        # shortlist is re-read rather than reused — that turn answered a timing
+        # question, so it drew a fresh list, and "the 3rd one" means the third of
+        # what is on screen now.
+        current = list((_run(first.run_id).state or {}).get("shortlist_slot_ids") or [])
+        assert len(current) >= 3
+        turn(patient, "the 3rd one", "bat-g7")
+        assert _run(first.run_id).proposed_slot_id == current[2]
 
     def test_a_stray_token_starts_nothing(self, patient):
         result = turn(patient, "ok", "bat-g5")

@@ -18,6 +18,8 @@ typed action to a string comparison.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from streamlit.testing.v1 import AppTest
 
@@ -274,12 +276,24 @@ class TestTheConfirmationRule:
         assert slot.doctor.name in screen
 
         # Card and chat must say the same time about the same slot. They did
-        # not: the card read 15:00 while the reply beside it read 3:00 PM,
-        # which a patient reads as two appointments rather than as two
-        # notations. Both go through one formatter now, so this asserts the
-        # 12-hour string is present and the 24-hour one is nowhere.
+        # not: the card read 15:00 while the reply beside it read 3:00 PM, which
+        # a patient reads as two appointments rather than as two notations. Both
+        # go through one formatter now.
         assert clock_time(slot.start_time) in screen
-        assert f"{slot.start_time:%H:%M}" not in screen
+
+        # And no 24-hour time survives anywhere on the screen. Asserted as "every
+        # clock time carries a meridiem" rather than as ``"%H:%M" not in screen``,
+        # which is the form this used to take and which reports on the calendar
+        # rather than on the code: for the hours 10, 11 and 12 the two notations
+        # coincide textually ("10:00" is inside "10:00 AM"), so the assertion was
+        # unsatisfiable on any day the earliest free slot landed there — and
+        # vacuously true on every other day, which is worse. This form holds for
+        # every hour.
+        bare = [
+            match.group(0)
+            for match in re.finditer(r"\b\d{1,2}:\d{2}(?!\s*[AaPp]\.?[Mm])", screen)
+        ]
+        assert bare == [], f"a 24-hour time reached the screen: {bare}"
 
     def test_those_four_facts_came_from_the_api(self, wired_seeded, seeded_db):
         """Distrust green: the chat reply also names the doctor and the time,
