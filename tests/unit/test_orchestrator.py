@@ -6186,6 +6186,164 @@ class TestTheChoiceListIsOneShot:
         assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
 
 
+class MisroutingLlm(MockLlm):
+    """Routes everything to General Medicine, hedged.
+
+    ``gpt-4o-mini`` on run #3: "my blood pressure has been high, book me in"
+    came back as General Medicine with low confidence, and a question the
+    synonym table had already answered went to a staff queue. The mock cannot
+    reproduce it — its Routing agent calls ``resolve_department`` and submits
+    whatever the table says, so under the mock the table and the model always
+    agree and the override is unreachable by construction.
+    """
+
+    model: str = "misrouting-stub"
+
+    def _route(self, llm_request, done, task):  # noqa: ANN001
+        if "submit_routing" not in done:
+            return function_call_response(
+                "submit_routing",
+                {"department_name": "General Medicine", "confidence": "low"},
+            )
+        return super()._route(llm_request, done, task)
+
+
+class TestTheSynonymTableOutranksTheModel:
+    """Round 11b item 3 — the last place a model proposal outranked a table.
+
+    ``submit_routing``'s validation has only ever asked "is this a real
+    department?". It is: General Medicine exists. What it never asked is
+    whether the patient's own words already named a different one — and
+    "blood pressure" is a seeded *Cardiology* synonym, matched by nothing else,
+    so ``resolve_department`` answers with one desk and no hedging.
+
+    Narrow on purpose, and the three controls are what keep it narrow. A
+    department is only overridden when the table resolves **uniquely**;
+    ambiguous or unmatched text leaves the model's answer exactly as it was,
+    which is what the model is there for.
+
+    **A note on the sentence that prompted this.** The live failure was "my
+    blood pressure has been high, book me in" routed to General Medicine with
+    low confidence — but the table does not resolve that phrase, and it is
+    seeded not to: "blood pressure" belongs to Cardiology and the bare word
+    "pressure" to General Medicine, deliberately, because
+    ``uq_department_synonym_term`` is global and two overlapping terms is the
+    only way to build a phrase that must *ask* rather than guess. So that
+    sentence going to a human is this system working, and it is the fourth test
+    below rather than the first. The rule itself is real and had no
+    enforcement; a phrase the table *does* answer uniquely is what pins it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _misrouting(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: MisroutingLlm()
+        )
+
+    def _routing(self, session, turn_id: str) -> list[dict]:
+        return [
+            event.payload
+            for event in session.query(TraceEvent)
+            .filter(TraceEvent.turn_id == turn_id)
+            .order_by(TraceEvent.seq)
+            .all()
+            if event.event_type is TraceEventType.VALIDATION
+            and event.payload.get("what") == "routing_overridden"
+        ]
+
+    UNIQUE = "my heart has been racing, book me in"
+
+    def test_a_unique_synonym_hit_wins(self, patient):
+        result = turn(patient, self.UNIQUE, "s-route-1")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, result.run_id)
+            assert run.state["department_name"] == "Cardiology"
+            rows = self._routing(session, result.turn_id)
+            assert rows and rows[-1]["accepted"] is False
+            assert rows[-1]["detail"]["proposed"] == "General Medicine"
+            assert rows[-1]["detail"]["resolved"] == "Cardiology"
+            assert (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.LOW_CONFIDENCE_ROUTING)
+                .count()
+                == 0
+            ), "the table answered it; nobody has to"
+        finally:
+            session.close()
+
+    def test_the_overruled_sentence_does_not_ship(self, patient):
+        """The model wrote "General Medicine handles this" believing that was
+        the answer. Both cannot be right, and the one that goes is the one code
+        overruled — the same rule an overruled *classification* has had since
+        round 8."""
+        result = turn(patient, self.UNIQUE, "s-route-2")
+
+        assert "General Medicine" not in result.reply
+        assert "Cardiology handles this." in result.reply
+        assert result.author is TraceAuthor.TEMPLATE
+
+    def test_a_department_the_table_agrees_with_is_not_overridden(self, patient):
+        """The false-positive control. Bare "pressure" is General Medicine's own
+        synonym, so the table and the model agree here and nothing is rewritten.
+        Traced as an agreement rather than not traced at all: "the check passed"
+        and "the check did not run" are different facts."""
+        result = turn(patient, "book me a checkup, feeling pressure at work", "s-route-3")
+
+        session = fresh()
+        try:
+            rows = self._routing(session, result.turn_id)
+            assert rows and rows[-1]["accepted"] is True
+            assert rows[-1]["detail"]["resolved"] == "General Medicine"
+        finally:
+            session.close()
+        assert "General Medicine" in result.reply
+
+    def test_an_ambiguous_phrase_is_still_a_human_decision(self, patient):
+        """The sentence the work order named, and the reason it is a control.
+
+        "Blood pressure" matches Cardiology's "blood pressure" *and* General
+        Medicine's bare "pressure" — two terms, two desks, by design, because a
+        global unique constraint on synonym terms means that is the only way to
+        build a phrase this system must ask about. The table refuses to choose,
+        so nothing is overridden and the request goes where it was already
+        going: to a person. A rule that "fixed" this one would have deleted the
+        seeded ambiguity the whole routing design rests on."""
+        result = turn(patient, "my blood pressure has been high, book me in", "s-route-4")
+
+        assert result.status == WorkflowStatus.PENDING_REVIEW.value
+        session = fresh()
+        try:
+            assert self._routing(session, result.turn_id) == []
+            assert (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.LOW_CONFIDENCE_ROUTING)
+                .count()
+                == 1
+            )
+        finally:
+            session.close()
+
+    def test_text_the_table_cannot_read_leaves_the_model_alone(self, patient):
+        """The other control, and the reason this is not a routing engine. With
+        nothing for the table to match, the model's department *and* its
+        confidence stand — low confidence, so the request goes to a human,
+        exactly as it did before any of this."""
+        result = turn(
+            patient, "book me an appointment, I need to sort out my visit", "s-route-5"
+        )
+
+        assert result.status == WorkflowStatus.PENDING_REVIEW.value
+        session = fresh()
+        try:
+            assert self._routing(session, result.turn_id) == []
+        finally:
+            session.close()
+        assert "General Medicine" in result.reply
+
+
 class TestABlownBudgetDoesNotEndAnAnsweredRun:
     """Round 11b item 1(d) — the budget floor, extended to list answers.
 

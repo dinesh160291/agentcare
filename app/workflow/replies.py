@@ -76,6 +76,12 @@ ONE_VERB_AT_A_TIME = (
 #: Orthopedics appointment sitting at 11:00 that day.
 TIME_CLASHES = "That time clashes with your {department} appointment that day."
 
+#: What the routing step says when the synonym table overruled the model's
+#: department. The Routing agent's own sentence names the department it chose,
+#: and that is now the wrong one — so the words go with the decision, exactly as
+#: they do for an overruled classification.
+ROUTED_REPLY = "{department} handles this."
+
 #: The plan step in the patient's own words, for the line above.
 VERB_WORDS = {
     "book": "the booking",
@@ -885,6 +891,7 @@ __all__ = [
     "MAX_OPTIONS",
     "ONE_VERB_AT_A_TIME",
     "REMINDER_LINE",
+    "ROUTED_REPLY",
     "TIME_CLASHES",
     "UPLOAD_POINTER",
     "VERB_WORDS",

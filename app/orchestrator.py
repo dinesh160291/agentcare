@@ -108,6 +108,7 @@ from app.workflow.plan import (
 )
 from app.workflow.replies import (
     ONE_VERB_AT_A_TIME,
+    ROUTED_REPLY,
     VERB_WORDS,
     claims_availability,
     offered_slot_ids,
@@ -3241,6 +3242,15 @@ async def _execute_plan(
         kept, _ = _guarded(
             step_reply, writer=writer, searched_slots=belt.proposals.searched_slots
         )
+        # An overruled routing proposal takes its prose with it, for the reason
+        # an overruled classification does: the model wrote its sentence
+        # believing its own answer, so the two cannot both be right. Live, "my
+        # blood pressure has been high" had the model on General Medicine and
+        # the synonym table on Cardiology; without this the run is Cardiology
+        # and the reply says General Medicine.
+        if step is PlanStep.ROUTE and belt.proposals.routing_overridden:
+            kept = ROUTED_REPLY.format(department=belt.proposals.department_name)
+            code_authored = True
         if kept:
             said.append(kept)
 

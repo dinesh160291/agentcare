@@ -117,6 +117,12 @@ class TurnProposals:
     department_id: int | None = None
     department_name: str | None = None
     routing_confidence: str | None = None
+    #: The synonym table disagreed with the model's department and won. Read by
+    #: ``_execute_plan``, which then replaces the Routing agent's sentence: the
+    #: model wrote "General Medicine handles this" believing that was the
+    #: answer, and shipping those words beside a Cardiology run would be the
+    #: trace vouching for a department nobody routed to.
+    routing_overridden: bool = False
     proposed_slot_id: int | None = None
     #: Set only by a reschedule or cancellation proposal — the appointment the
     #: patient is being asked about, never one the model picked for them.
@@ -222,6 +228,20 @@ class Toolbelt:
             return int(value)
         target = self._target_appointment()
         return target.department_id if target is not None else None
+
+    def _routed_text(self) -> str:
+        """The words routing is deciding about.
+
+        The run's own ``request_text`` rather than this turn's message, because
+        that is exactly what the Routing agent is handed and a run can be fed
+        more than one sentence before it routes. Reading a different string
+        from the one the model read would be comparing two answers to two
+        questions — and the accumulation is the safe direction anyway: two
+        departments in the text resolve to *ambiguous*, which overrides nothing.
+        """
+        if self.run is not None and self.run.request_text:
+            return self.run.request_text
+        return self.message or ""
 
     def _target_appointment(self) -> Appointment | None:
         """The appointment this run is changing, when that is already settled.
@@ -1148,15 +1168,50 @@ class Toolbelt:
                     ),
                 }
 
-            self.proposals.department_id = checked["department"]["id"]
-            self.proposals.department_name = checked["department"]["name"]
-            self.proposals.routing_confidence = (
+            department = checked["department"]
+            settled = (
                 "low" if str(confidence).lower().startswith("low") else "high"
             )
+
+            # **When the synonym table speaks, it is the answer.** Validation
+            # here has only ever asked "is this a real department?", which is
+            # the one remaining place a model proposal outranks a deterministic
+            # one. Live: "my blood pressure has been high, book me in" — and
+            # "blood pressure" is a seeded *Cardiology* synonym, so
+            # `resolve_department` names one desk and no other — came back as
+            # General Medicine with low confidence, and a question the table had
+            # already answered went to a staff queue.
+            #
+            # The same shape as `_settle_target`, including the trace
+            # convention: `accepted` describes the *model's* proposal, so True
+            # is an agreement and False is an override. Only a unique hit
+            # decides; ambiguous or nothing leaves the proposal exactly as it
+            # is, which is what the model is for.
+            resolved = resolve_department(self.session, self._routed_text())
+            if resolved.get("status") == "resolved":
+                table = resolved["department"]
+                agrees = table["id"] == department["id"]
+                self.writer.validation(
+                    "routing_overridden",
+                    accepted=agrees,
+                    detail={
+                        "proposed": department["name"],
+                        "resolved": table["name"],
+                        "confidence": confidence,
+                        "terms": resolved.get("matched_terms"),
+                    },
+                )
+                if not agrees:
+                    department, settled = table, "high"
+                    self.proposals.routing_overridden = True
+
+            self.proposals.department_id = department["id"]
+            self.proposals.department_name = department["name"]
+            self.proposals.routing_confidence = settled
             return {
                 "accepted": True,
-                "department": checked["department"],
-                "confidence": self.proposals.routing_confidence,
+                "department": department,
+                "confidence": settled,
             }
 
         resolve_department_tool.__name__ = "resolve_department"
