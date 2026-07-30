@@ -516,7 +516,18 @@ class Toolbelt:
             # phrase nobody anticipated. It cannot commit and cannot name a
             # slot, so the worst it can do is search the wrong fortnight.
             tools.append(propose_search_window)
-        elif self.run is not None and not self.run.is_terminal:
+        elif (
+            self.run is not None
+            and not self.run.is_terminal
+            # Not while a person holds the run. The wall in the orchestrator is
+            # what decides the turn, and this is the same rule stated where the
+            # capability lives: at ``pending_review`` a search has nothing to
+            # search — routing was the thing staff were asked about — and live
+            # the model called it **nine times** into the iteration budget for
+            # "the earliest the better". Absent rather than merely unused, on
+            # the reasoning that put ``submit_plan`` out of reach mid-run.
+            and self.run.status is not WorkflowStatus.PENDING_REVIEW
+        ):
             # Answering "what else is free?" is the other half of the mapping
             # table's answer-and-stay, and it needs data. Live, at
             # `in_progress`, the same question got "noted as a side question. I

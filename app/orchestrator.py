@@ -761,6 +761,88 @@ def _settle_confirmation(
     )
 
 
+def _review_wall(
+    session: Session,
+    *,
+    run: WorkflowRun,
+    writer: TraceWriter,
+    message: str,
+    outcome,
+    base: dict,
+) -> TurnResult:
+    """What a request waiting on a person may say back, and nothing else.
+
+    A run at ``pending_review`` is a queue item as well as a conversation, and
+    it is the one state where **the system is not the thing holding the work**.
+    Everything the run could otherwise do to itself — route again, propose a
+    time, search the schedule, let the model write a sentence — is a promise
+    only a person can keep, and the state cannot honour any of it.
+
+    Live, run 6 generated half a transcript out of that gap. "Book me a
+    cardiology appointment" was classified a *continuation*, so the plan carried
+    on **inside the queued run**: routing re-ran and was accepted, a slot was
+    proposed and accepted, and the model shipped "shall I book it?" — an offer
+    nothing could honour. The exact "yes" that followed then had no proposal
+    state to land in, so it fell to the classifier and leaked "it seems that
+    your response was not a confirmation…", twice. "The earliest the better"
+    looped ``list_other_slots`` nine times into the iteration budget and ended
+    in the apology template.
+
+    So code answers here, before any dispatch. Three things still get through,
+    and each is something only the patient can decide:
+
+    * a **genuine supersede** — a different intent or a different subject; it
+      cancels the run and starts another, which is the patient's right and is
+      already gated by ``_shows_no_difference``;
+    * a **withdrawal** — likewise theirs, and likewise already gated by the cue
+      rule;
+    * a **read-only status question** — "show my upcoming appointments" reads
+      rows and touches nothing, and it was answered correctly mid-review live.
+
+    The first two have already happened by the time this runs: both transition
+    the run off ``pending_review``, so this function never sees them. The third
+    is checked here rather than left to the class, because at this state the
+    class is exactly what went wrong — the same reasoning that keyed the timing
+    answer on the *destination* instead of the label.
+    """
+    query = detect_query(message)
+    if query is not None:
+        writer.guard_verdict(
+            "review_wall",
+            passed=True,
+            detail={"answered": "query", "kind": query.value},
+        )
+        return TurnResult(
+            reply=answer_query(
+                session, patient_id=run.patient_id, kind=query, message=message
+            ),
+            author=TraceAuthor.TEMPLATE,
+            run_id=run.id,
+            status=run.status.value,
+            message_class=outcome.message_class,
+            **base,
+        )
+
+    writer.guard_verdict(
+        "review_wall",
+        passed=False,
+        detail={
+            "answered": "wall",
+            "class": outcome.message_class.value,
+            "consequence": outcome.consequence.value,
+            "problem": "a run in front of staff may not route, propose or search",
+        },
+    )
+    return TurnResult(
+        reply=AWAITING_REVIEW_REPLY,
+        author=TraceAuthor.TEMPLATE,
+        run_id=run.id,
+        status=run.status.value,
+        message_class=outcome.message_class,
+        **base,
+    )
+
+
 def _guarded(
     text: str,
     *,
@@ -2017,6 +2099,22 @@ async def _continue_run(
             status=run.status.value,
             message_class=outcome.message_class,
             **base,
+        )
+
+    # Everything else, while a person holds the run. Placed after the three
+    # branches above rather than before them so each keeps its own answer: a
+    # withdrawal has already moved the run off this state, a refused supersede
+    # is told its position by the branch that refused it, and an off-topic
+    # message still gets the off-topic reply — walling that one would answer
+    # "who won the fifa final" with a note about a booking.
+    if run.status is WorkflowStatus.PENDING_REVIEW:
+        return _review_wall(
+            session,
+            run=run,
+            writer=writer,
+            message=message,
+            outcome=outcome,
+            base=base,
         )
 
     # A supersede the mapping refused because the message was refining the run

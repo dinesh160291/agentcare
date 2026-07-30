@@ -55,7 +55,9 @@ from app.models import (
     WorkflowRun,
     WorkflowStatus,
 )
+from app.agents.toolbelt import Toolbelt
 from app.orchestrator import (
+    AWAITING_REVIEW_REPLY,
     FAILED_REPLY,
     NO_PLAN_REPLY,
     SCOPE_REPLY,
@@ -77,7 +79,7 @@ from app.providers.base import (
     text_response,
     tool_results,
 )
-from app.trace import assert_well_formed
+from app.trace import TraceWriter, assert_well_formed
 
 PATIENT_EMAIL = "asha.patient@example.invalid"
 OTHER_EMAIL = "rohan.patient@example.invalid"
@@ -2745,6 +2747,226 @@ class TestRoutingDoesNotReRunOnAQueuedRun:
             )
         finally:
             session.close()
+
+
+class TestTheReviewWall:
+    """Round 10 item 2. A run in front of staff answers, and does nothing else.
+
+    Run 6 of the live transcript generated half its confusion here. A booking
+    message arriving at ``pending_review`` was classified a *continuation*, so
+    the plan carried on **inside the queued run**: routing re-ran and was
+    accepted, ``propose_appointment(slot_id=7)`` was accepted, and the model
+    shipped "shall I book it?" — an offer the state could not honour. The exact
+    "yes" that followed had no proposal to land in and leaked classifier prose
+    instead; "the earliest the better" looped ``list_other_slots`` nine times
+    into the iteration budget.
+
+    Reproduced under the mock before anything was changed, and it failed
+    *worse* than live: with the class forced to continuation, **every** message
+    re-dispatched the routing specialist and shipped its prose — including the
+    status question that live got right.
+
+    The three things that must still get through are pinned in
+    :class:`TestTheReviewWallLetsThePatientOut`, deliberately without the stub:
+    each one depends on the mock's own classification, and forcing continuation
+    would make them unreachable and the tests vacuous.
+    """
+
+    AMBIGUOUS = "book an appointment, my kid has ear pain"
+    SPECIALIST_TOOLS = {
+        "resolve_department",
+        "submit_routing",
+        "find_available_slots",
+        "propose_appointment",
+        "list_other_slots",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _queued(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: QueuedRoutingLlm()
+        )
+
+    def _queued_run(self, patient, session_id: str):
+        first = turn(patient, self.AMBIGUOUS, session_id)
+        assert first.status == WorkflowStatus.PENDING_REVIEW.value
+        return first
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "book me a cardiology appointment",
+            "yes",
+            "option 3",
+            "the earliest the better",
+        ],
+    )
+    def test_all_four_live_shapes_get_the_wall(self, patient, message):
+        session_id = f"s-wall-{abs(hash(message))}"
+        first = self._queued_run(patient, session_id)
+
+        result = turn(patient, message, session_id)
+
+        assert result.reply == AWAITING_REVIEW_REPLY
+        assert result.run_id == first.run_id
+        assert result.status == WorkflowStatus.PENDING_REVIEW.value
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "book me a cardiology appointment",
+            "yes",
+            "option 3",
+            "the earliest the better",
+        ],
+    )
+    def test_no_specialist_runs_behind_the_wall(self, patient, message):
+        """The Coordinator still classifies — a supersede has to be *heard* to
+        be honoured. What may not happen is anything downstream of it."""
+        session_id = f"s-wall-tools-{abs(hash(message))}"
+        self._queued_run(patient, session_id)
+
+        result = turn(patient, message, session_id)
+
+        assert self.SPECIALIST_TOOLS.isdisjoint(_tools_called(result.turn_id))
+
+    def test_nothing_the_model_wrote_reaches_the_patient(self, patient):
+        """Zero ``author: llm`` outbounds at this state, ever. The live leak was
+        "It seems that your response was not a confirmation…" — true, useless,
+        and about a proposal that should never have existed."""
+        self._queued_run(patient, "s-wall-author")
+        result = turn(patient, "book me a cardiology appointment", "s-wall-author")
+
+        session = fresh()
+        try:
+            outbound = [
+                event
+                for event in session.query(TraceEvent)
+                .filter(TraceEvent.turn_id == result.turn_id)
+                .all()
+                if event.event_type is TraceEventType.OUTBOUND
+            ]
+        finally:
+            session.close()
+
+        assert [event.author for event in outbound] == [TraceAuthor.TEMPLATE]
+
+    def test_the_queued_run_keeps_its_one_queue_item(self, patient):
+        self._queued_run(patient, "s-wall-queue")
+        turn(patient, "book me a cardiology appointment", "s-wall-queue")
+
+        session = fresh()
+        try:
+            assert (
+                session.query(Escalation)
+                .filter(Escalation.kind == EscalationKind.LOW_CONFIDENCE_ROUTING)
+                .count()
+                == 1
+            )
+        finally:
+            session.close()
+
+    def test_a_status_question_is_answered_from_the_rows(self, patient):
+        """Read-only, so it touches the queue item as little as any other side
+        question — and it is detected here rather than trusted to the class,
+        because at this state the class is exactly what went wrong. Under the
+        stub it *is* a continuation, which is why this test needs the stub."""
+        self._queued_run(patient, "s-wall-query")
+        result = turn(patient, "show my upcoming appointments", "s-wall-query")
+
+        assert "AC-000001" in result.reply
+        assert result.reply != AWAITING_REVIEW_REPLY
+        assert result.author is TraceAuthor.TEMPLATE
+
+    def test_the_wall_is_recorded_as_a_guard_verdict(self, patient):
+        self._queued_run(patient, "s-wall-trace")
+        result = turn(patient, "book me a cardiology appointment", "s-wall-trace")
+
+        session = fresh()
+        try:
+            wall = _guard(session, result.turn_id, "review_wall")
+        finally:
+            session.close()
+
+        assert wall["passed"] is False
+        assert wall["detail"]["answered"] == "wall"
+
+    def test_no_slot_search_is_even_offered_to_the_model(self, patient):
+        """Absent from the toolbelt, not merely unused — the rule that put
+        ``submit_plan`` out of reach mid-run. A capability the state cannot
+        honour is a capability the model will spend the budget on."""
+        first = self._queued_run(patient, "s-wall-toolset")
+
+        session = fresh()
+        try:
+            run = session.get(WorkflowRun, first.run_id)
+            belt = Toolbelt(
+                session,
+                user=session.get(User, patient.id),
+                patient_id=run.patient_id,
+                writer=TraceWriter(session, session_id="s-wall-toolset"),
+                run=run,
+                message="the earliest the better",
+            )
+            names = {tool.__name__ for tool in belt.coordinator_tools()}
+        finally:
+            session.close()
+
+        assert "list_other_slots" not in names
+        assert "classify_message" in names
+
+
+class TestTheReviewWallLetsThePatientOut:
+    """The three exceptions, under the mock's own judgement.
+
+    Deliberately without ``QueuedRoutingLlm``: each of these depends on the
+    classification being something other than continuation, so forcing
+    continuation would make every one of them unreachable and the tests would
+    pass while proving nothing.
+    """
+
+    AMBIGUOUS = "book an appointment, my kid has ear pain"
+
+    def _queued_run(self, patient, session_id: str):
+        first = turn(patient, self.AMBIGUOUS, session_id)
+        assert first.status == WorkflowStatus.PENDING_REVIEW.value
+        return first
+
+    def test_a_new_subject_still_supersedes(self, patient):
+        """The eye-test supersede from the same live transcript. A patient may
+        always replace a request that is waiting, and naming another department
+        is what makes it a replacement rather than a nag."""
+        first = self._queued_run(patient, "s-wall-out-1")
+
+        result = turn(
+            patient, "book me a dermatology appointment instead", "s-wall-out-1"
+        )
+
+        assert result.run_id != first.run_id
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+
+    def test_a_withdrawal_still_closes_the_run(self, patient):
+        first = self._queued_run(patient, "s-wall-out-2")
+
+        turn(patient, "actually never mind", "s-wall-out-2")
+
+        session = fresh()
+        try:
+            assert session.get(WorkflowRun, first.run_id).status is (
+                WorkflowStatus.CANCELLED
+            )
+        finally:
+            session.close()
+
+    def test_off_topic_still_gets_the_off_topic_reply(self, patient):
+        """Walling this one would answer "who won the fifa final" with a note
+        about a booking. The off-topic branch keeps its own answer, which is why
+        the wall sits *after* it rather than in front of it."""
+        self._queued_run(patient, "s-wall-out-3")
+
+        result = turn(patient, "who won the fifa final", "s-wall-out-3")
+
+        assert result.reply == SCOPE_REPLY
 
 
 class TestClarifyingIntoAnotherDepartment:
