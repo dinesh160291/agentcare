@@ -55,6 +55,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
+from app.tools.dates import MONTHS
 from app.workflow.confirmation import normalise
 from app.workflow.mapping import says_withdrawal
 
@@ -83,14 +84,35 @@ _TWENTY_FOUR = re.compile(r"\b([01]?[0-9]|2[0-3]):([0-5][0-9])\b")
 #: appear in a longer sentence and that one may not.
 _NUMBERED = re.compile(r"\b(?:option|number|no\.?|choice|#)\s*(\d{1,2})\b", re.IGNORECASE)
 
-#: "the 2nd one", "the 3rd please".
-_ORDINAL_DIGIT = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\b", re.IGNORECASE)
+#: "the 2nd one", "the 3rd please" — but never "the 3rd august".
+#:
+#: The lookahead is the whole of round 11 item 4. Live, at
+#: ``pending_confirmation`` holding a reschedule: "move it to after my other
+#: Ophthalmology appointment on the 3rd august" matched "3rd" as list position 3,
+#: silently re-held the 11:00 AM in that row, and the constraint the patient
+#: actually stated was never answered. An ordinal followed by a month is half of a
+#: date, and a date is not a position.
+#:
+#: Built from ``resolve_date``'s own ``MONTHS`` table rather than a month list of
+#: its own, for the reason ``WEEKDAY_PATTERN`` was exported in round 9: the third
+#: regex over one vocabulary drifts exactly as the second one did. "Of" is
+#: optional because patients write both "the 3rd August" and "the 3rd of August".
+_MONTH_AHEAD = r"(?!\s*(?:of\s+)?(?:" + "|".join(MONTHS) + r")\b)"
+
+_ORDINAL_DIGIT = re.compile(
+    r"\b(\d{1,2})(?:st|nd|rd|th)\b" + _MONTH_AHEAD, re.IGNORECASE
+)
 
 _ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3}
 
 #: A message that is *only* a number. "2" answering a numbered list is the whole
 #: message; a "2" inside a sentence is far more likely to be a date, a count or
 #: a reference than a position, so it is not read here.
+#:
+#: Deliberately without the month lookahead above. Anchored at both ends, the
+#: whole message is the digit, so there is nothing for a month to follow — a
+#: lookahead here could never fail, and a line that cannot fail vouches for
+#: nothing.
 _BARE_NUMBER = re.compile(r"^(\d{1,2})$")
 
 

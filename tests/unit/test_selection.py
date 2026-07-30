@@ -137,6 +137,53 @@ class TestAListNumber:
         assert read("book the 2pm one", shortlist=shortlist, offered=shortlist) == 503
 
 
+class TestAnOrdinalWearingADate:
+    """Round 11 item 4 — "the 3rd august" is half a date, not row three.
+
+    Live, at ``pending_confirmation`` holding a reschedule: "move it to after my
+    other Ophthalmology appointment on the 3rd august" matched "3rd" as a
+    position, silently re-held the 11:00 AM sitting in that row, and the
+    constraint the patient had actually stated was never answered at all. The
+    reply looked like an answer, which is what made it worse than a refusal.
+    """
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "on the 3rd august",
+            "move it to after my other Ophthalmology appointment on the 3rd august",
+            "the 3rd of August please",
+            "anything on the 2nd September?",
+        ],
+    )
+    def test_a_month_after_the_ordinal_is_never_a_position(self, message):
+        assert read(message) is None
+
+    @pytest.mark.parametrize(
+        "message, expected",
+        [
+            ("3", 103),
+            ("option 3", 103),
+            ("the 3rd one", 103),
+            ("the 3rd", 103),
+            ("the 3rd please", 103),
+        ],
+    )
+    def test_an_ordinal_with_no_month_still_selects(self, message, expected):
+        """The direction that would break the reader rather than fix it. "The
+        3rd" answers a list; only a month turns it into a date."""
+        assert read(message) == expected
+
+    def test_the_month_vocabulary_is_resolve_dates_own(self):
+        """Every month, not the three a test author thought of — the list is
+        imported, so this is a check that the import is being used rather than a
+        second list agreeing with the first by luck."""
+        from app.tools.dates import MONTHS
+
+        for month in MONTHS:
+            assert read(f"the 3rd {month}") is None, month
+
+
 class TestWhatIsNeverASelection:
     """The false-positive direction, one named case per way in."""
 
