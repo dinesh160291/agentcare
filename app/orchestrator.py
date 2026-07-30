@@ -78,6 +78,8 @@ from app.workflow.mapping import (
     names_followup_subject,
     names_timing,
     primary_intent,
+    says_affirmative,
+    says_decline,
     says_only_withdrawal,
     validate_class,
 )
@@ -653,6 +655,7 @@ def _settle_confirmation(
     belt: Toolbelt,
     writer: TraceWriter,
     user: User,
+    message: str,
     coordinator_reply: str,
     outcome,
     base: dict,
@@ -671,10 +674,55 @@ def _settle_confirmation(
     settings = get_settings()
 
     if belt.proposals.confirmation_verdict == "decline":
-        return _decline_proposal(
-            session, run=run, writer=writer, user=user,
-            trigger="model_read_decline", base=base,
+        # **A decline needs a decline cue.** The class name was in the enum and
+        # the argument was well-formed, so nothing had anything to object to:
+        # live, "yes lets confirm it" came back as ``decline`` — with that
+        # sentence quoted in the verdict's own ``reason`` — and code cleared the
+        # held slot and answered "that's fine, nothing has been booked". The
+        # patient's reschedule died and they were told they had ended it.
+        #
+        # The same guard withdrawal has had since round 6, for the same reason
+        # and with the same cost asymmetry: applying this destroys work the
+        # patient did, refusing it costs one more message. Two conditions, and
+        # together they cover the three cases — a cue is required, and a word of
+        # agreement vetoes regardless of what sits beside it, so "both cues" and
+        # "neither cue" both land on the re-ask below.
+        cue = says_decline(message)
+        agreement = says_affirmative(message)
+        permitted = cue and not agreement
+        writer.validation(
+            "decline_cue",
+            accepted=permitted,
+            detail={
+                "decline_cue": cue,
+                "affirmative_cue": agreement,
+                "applied": "decline" if permitted else "non_answer",
+                **(
+                    {}
+                    if permitted
+                    else {
+                        "problem": (
+                            "the message shows agreement"
+                            if agreement
+                            else "no decline cue in the message"
+                        )
+                    }
+                ),
+            },
         )
+        if permitted:
+            return _decline_proposal(
+                session, run=run, writer=writer, user=user,
+                trigger="model_read_decline", base=base,
+            )
+        # An overruled verdict takes its prose with it — the round-8 rule, which
+        # lives in ``_continue_run`` and reads ``MappingOutcome.overruled``. It
+        # cannot fire for this: the confirmation verdict is a different axis from
+        # the message class, and the class here ("continuation", usually) was
+        # applied exactly as the model proposed. So the drop happens here, at the
+        # point where the reply is still the model's to lose. The sentence was
+        # written believing the proposal was about to be cleared, and it is not.
+        coordinator_reply = ""
 
     cap = settings.max_confirmation_non_answers
     stalled = run.non_answer_count >= cap
@@ -2027,6 +2075,7 @@ async def _continue_run(
             belt=belt,
             writer=writer,
             user=user,
+            message=message,
             coordinator_reply=coordinator_reply,
             outcome=outcome,
             base=base,

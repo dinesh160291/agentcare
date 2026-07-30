@@ -371,6 +371,95 @@ def says_only_withdrawal(text: str) -> bool:
     return bool(token) and token in {normalise(cue) for cue in WITHDRAWAL_CUES}
 
 
+#: What turning down an offered time actually sounds like. The decline half of
+#: the confirmation read, and the exact counterpart of ``WITHDRAWAL_CUES``:
+#: **the model proposes the verdict, and this is what code will apply it on.**
+#:
+#: The asymmetry that forced it. A withdrawal verdict has had a cue guard since
+#: round 6 because applying one destroys the patient's work — and a *decline*
+#: clears a held proposal, which is the same kind of destruction one step
+#: smaller, and had no guard at all. Live, at ``pending_confirmation`` holding a
+#: 2:00 PM slot: "yes lets confirm it" reached the model, came back
+#: ``decline`` with the affirmative sentence quoted in its own ``reason`` field,
+#: and code applied it unread. The proposal was cleared, the reply said "that's
+#: fine, nothing has been booked", and the patient's reschedule died silently.
+#:
+#: Word-boundary matched, never containment: "no" lives inside "now" and
+#: "know", and this list is exactly the kind of short vocabulary that put "erm"
+#: inside *derm*atology.
+_DECLINE_CUES = (
+    r"no",
+    r"nope",
+    r"nah",
+    r"not",
+    r"don[’']?t",
+    r"won[’']?t",
+    r"can[’']?t make",
+    r"cannot make",
+    r"rather not",
+    r"different (?:time|day|slot)",
+    r"another (?:time|day|slot)",
+    r"something else",
+    r"cancel",
+)
+
+_DECLINE_PATTERN = re.compile(
+    r"\b(?:" + "|".join(_DECLINE_CUES) + r")\b", re.IGNORECASE
+)
+
+#: What agreement sounds like. Not a confirmation reader — that is
+#: :func:`~app.workflow.confirmation.read_confirmation`, it is exact-match only,
+#: and nothing here may ever commit anything. This is a **veto**: a message
+#: carrying one of these words is not a message code may treat as a refusal,
+#: whatever else it contains and whatever the model called it.
+#:
+#: The direction is what makes it safe. Refusing to apply a decline costs the
+#: patient one more message — the re-ask states what is held and what would
+#: settle it. Applying one wrongly throws away a time they had just accepted.
+_AFFIRMATIVE_CUES = (
+    r"yes",
+    r"yeah",
+    r"yep",
+    r"yup",
+    r"sure",
+    r"ok",
+    r"okay",
+    r"confirm(?:ed|ing|s)?",
+    r"sounds good",
+    r"go ahead",
+    r"book it",
+    r"do it",
+    r"lets do",
+    r"let[’']?s do",
+)
+
+_AFFIRMATIVE_PATTERN = re.compile(
+    r"\b(?:" + "|".join(_AFFIRMATIVE_CUES) + r")\b", re.IGNORECASE
+)
+
+
+def says_decline(text: str) -> bool:
+    """Whether the message actually contains a cue for turning an offer down.
+
+    A necessary condition on a verdict the model proposed, in the same family as
+    :func:`says_withdrawal` and read the same way: it decides nothing on its
+    own, and the caller may only use it to check a decline the model already
+    submitted.
+    """
+    return bool(_DECLINE_PATTERN.search(text or ""))
+
+
+def says_affirmative(text: str) -> bool:
+    """Whether the message contains a word of agreement.
+
+    Only ever consulted to *refuse* a decline. "Yes lets confirm it" is not a
+    confirmation — the tokens are exact and this is not one of them — but it is
+    certainly not a refusal, and the honest answer to a yes the reader cannot
+    read is to ask again rather than to guess in the expensive direction.
+    """
+    return bool(_AFFIRMATIVE_PATTERN.search(text or ""))
+
+
 #: Things this system owns. A message naming one of them is asking about this
 #: system's business, whatever else it does or fails to do.
 #:
@@ -934,6 +1023,8 @@ __all__ = [
     "names_change_verb",
     "names_timing",
     "primary_intent",
+    "says_affirmative",
+    "says_decline",
     "says_only_withdrawal",
     "says_withdrawal",
     "validate_class",

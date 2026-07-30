@@ -45,6 +45,8 @@ from app.workflow.mapping import (
     names_appointment_verbs,
     names_timing,
     primary_intent,
+    says_affirmative,
+    says_decline,
     says_withdrawal,
     validate_class,
 )
@@ -1031,6 +1033,50 @@ class TestWithdrawalNeedsTheWordsForIt:
         assert says_withdrawal("the second one") is False
         assert says_withdrawal("") is False
         assert says_withdrawal(None) is False
+
+
+class TestTheDeclineVocabulary:
+    """Round 10 item 1's word lists, on their own.
+
+    Both are short-word vocabularies, which is the family that produced "erm"
+    inside *derm*atology and "today" inside "what's the weather like today". So
+    the traps are pinned as first-class cases rather than left to the
+    conversation tests to trip over: "no" lives inside "now" and "know", "ok"
+    lives inside "book", and "yes" lives inside "yesterday".
+    """
+
+    def test_a_decline_cue_is_read_as_a_word(self):
+        assert says_decline("no thanks") is True
+        assert says_decline("nope, not that one") is True
+        assert says_decline("a different day would be better") is True
+        assert says_decline("I'd rather not") is True
+        assert says_decline("can't make that") is True
+
+    def test_a_decline_cue_is_never_a_substring(self):
+        assert says_decline("now would be good") is False
+        assert says_decline("I know that time works") is False
+        assert says_decline("nothing else needed") is False
+        assert says_decline("") is False
+        assert says_decline(None) is False
+
+    def test_agreement_is_read_as_a_word(self):
+        assert says_affirmative("yes lets confirm it") is True
+        assert says_affirmative("yes please, sounds good!") is True
+        assert says_affirmative("sure go ahead") is True
+        assert says_affirmative("ok, do it") is True
+
+    def test_agreement_is_never_a_substring(self):
+        assert says_affirmative("yesterday was better") is False
+        assert says_affirmative("can you rebook me") is False
+        assert says_affirmative("no thanks") is False
+        assert says_affirmative("") is False
+        assert says_affirmative(None) is False
+
+    def test_a_message_can_carry_both(self):
+        """Which is exactly why the guard needs two questions rather than one:
+        "actually no wait yes" is not a refusal code may act on."""
+        assert says_decline("actually no wait yes") is True
+        assert says_affirmative("actually no wait yes") is True
 
 
 class TestARunWaitingForAChoiceKeepsTheAnswer:

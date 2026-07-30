@@ -53,6 +53,11 @@ from app.providers.base import (
 from app.trace import assert_well_formed
 from app.workflow.replies import render_reask
 
+#: What a model writes once it has decided the patient said no. Module-level
+#: rather than a class attribute because ``AgentCareLlm`` is a pydantic model
+#: and an unannotated attribute there is a field.
+DECLINING_PROSE = "That's fine — I won't book anything."
+
 PATIENT_EMAIL = "asha.patient@example.invalid"
 BOOKING = "I need a cardiology appointment next week"
 SEEDED_APPOINTMENT_ID = 1
@@ -84,6 +89,27 @@ def booked_for(session, run_id: int) -> list[Appointment]:
         .filter(Appointment.id != SEEDED_APPOINTMENT_ID)
         .all()
     )
+
+
+def _held_slot(run_id: int) -> int | None:
+    session = fresh()
+    try:
+        return session.get(WorkflowRun, run_id).proposed_slot_id
+    finally:
+        session.close()
+
+
+def _validation(session, turn_id, what):
+    for event in (
+        session.query(TraceEvent)
+        .filter(TraceEvent.turn_id == turn_id)
+        .order_by(TraceEvent.seq)
+        .all()
+    ):
+        if event.event_type is TraceEventType.VALIDATION:
+            if (event.payload or {}).get("what") == what:
+                return event.payload
+    raise AssertionError(f"no {what!r} validation in turn {turn_id}")
 
 
 def _guard(session, turn_id, name):
@@ -290,6 +316,151 @@ class TestTheModelMayNeverConfirm:
         assert all(r["accepted"] is False for r in rejections)
 
 
+class TestADeclineNeedsADeclineCue:
+    """The other half of "the model may never confirm".
+
+    A decline is not the harmless verdict it looks like beside ``confirm``: it
+    clears a held proposal, which is the patient's decision thrown away. Live,
+    at ``pending_confirmation`` holding a 2:00 PM slot, "yes lets confirm it"
+    came back as ``decline`` — the affirmative sentence quoted in the verdict's
+    own ``reason`` — and the reschedule died silently.
+
+    Every test here drives :class:`AlwaysDeclines`, which submits that verdict
+    whatever the patient said. That is the point: the guard's whole job is to be
+    the thing standing between a wrong verdict and the row it would clear, so
+    the provider has to be wrong on purpose.
+    """
+
+    @staticmethod
+    def declining(monkeypatch):
+        """Swap the provider *after* the setup booking.
+
+        Not a fixture: this stub plans nothing, so a patch applied for the whole
+        test would leave the run that is supposed to be holding a slot
+        un-created — and every assertion here would then pass or fail for a
+        reason that has nothing to do with the guard.
+        """
+        monkeypatch.setattr(
+            "app.agents.base.get_provider", lambda name=None: AlwaysDeclines()
+        )
+
+    @pytest.mark.parametrize(
+        "reply",
+        ["yes lets confirm it", "yes please, sounds good!", "sure go ahead"],
+    )
+    def test_an_affirmative_is_never_applied_as_a_decline(
+        self, patient, monkeypatch, reply
+    ):
+        session_id = f"s-cue-{abs(hash(reply))}"
+        first = turn(patient, BOOKING, session_id)
+        held = _held_slot(first.run_id)
+
+        self.declining(monkeypatch)
+        result = turn(patient, reply, session_id)
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert _held_slot(first.run_id) == held
+
+    def test_the_affirmative_lands_on_the_exact_token_re_ask(
+        self, patient, monkeypatch
+    ):
+        """Round 6 built this reply for exactly this case: a yes the tokens
+        cannot read is answered by naming what is held and what would settle
+        it."""
+        first = turn(patient, BOOKING, "s-cue-reask")
+        self.declining(monkeypatch)
+        result = turn(patient, "yes lets confirm it", "s-cue-reask")
+
+        session = fresh()
+        try:
+            expected = render_reask(session, session.get(WorkflowRun, first.run_id))
+        finally:
+            session.close()
+
+        assert result.reply == expected
+        assert result.author is TraceAuthor.TEMPLATE
+
+    def test_the_declining_models_prose_goes_with_its_verdict(
+        self, patient, monkeypatch
+    ):
+        """An overruled verdict takes its prose with it. The sentence was
+        written believing the proposal was about to be cleared, so shipping it
+        above a re-ask tells the patient two contradictory things about the same
+        slot."""
+        turn(patient, BOOKING, "s-cue-prose")
+        self.declining(monkeypatch)
+        result = turn(patient, "yes lets confirm it", "s-cue-prose")
+
+        assert DECLINING_PROSE not in result.reply
+
+    def test_neither_cue_is_a_re_ask_too(self, patient, monkeypatch):
+        """Rule (c). A cleared proposal has to be earned by the patient's own
+        words, and "hmm, maybe" is not those words either."""
+        first = turn(patient, BOOKING, "s-cue-neither")
+        held = _held_slot(first.run_id)
+
+        self.declining(monkeypatch)
+        result = turn(patient, "hmm, maybe", "s-cue-neither")
+
+        assert result.status == WorkflowStatus.PENDING_CONFIRMATION.value
+        assert _held_slot(first.run_id) == held
+
+    def test_both_cues_is_a_re_ask(self, patient, monkeypatch):
+        first = turn(patient, BOOKING, "s-cue-both")
+        held = _held_slot(first.run_id)
+
+        self.declining(monkeypatch)
+        turn(patient, "actually no wait yes", "s-cue-both")
+
+        assert _held_slot(first.run_id) == held
+
+    @pytest.mark.parametrize(
+        "reply", ["no thanks", "a different day would be better", "I'd rather not"]
+    )
+    def test_a_real_decline_still_declines(self, patient, monkeypatch, reply):
+        """The direction that must not break. The guard is a necessary
+        condition on the model's verdict, not a second opinion about it."""
+        session_id = f"s-cue-real-{abs(hash(reply))}"
+        first = turn(patient, BOOKING, session_id)
+
+        self.declining(monkeypatch)
+        result = turn(patient, reply, session_id)
+
+        assert result.reply == DECLINED_REPLY
+        assert _held_slot(first.run_id) is None
+
+    def test_the_refusal_is_traced(self, patient, monkeypatch):
+        """A refused decline leaves no other mark: the run is where it was and
+        the reply is the one a non-answer would have got."""
+        turn(patient, BOOKING, "s-cue-trace")
+        self.declining(monkeypatch)
+        result = turn(patient, "yes lets confirm it", "s-cue-trace")
+
+        session = fresh()
+        try:
+            recorded = _validation(session, result.turn_id, "decline_cue")
+        finally:
+            session.close()
+
+        assert recorded["accepted"] is False
+        assert recorded["detail"]["affirmative_cue"] is True
+        assert recorded["detail"]["applied"] == "non_answer"
+
+    def test_an_applied_decline_is_traced_too(self, patient, monkeypatch):
+        turn(patient, BOOKING, "s-cue-trace-2")
+        self.declining(monkeypatch)
+        result = turn(patient, "no thanks", "s-cue-trace-2")
+
+        session = fresh()
+        try:
+            recorded = _validation(session, result.turn_id, "decline_cue")
+        finally:
+            session.close()
+
+        assert recorded["accepted"] is True
+        assert recorded["detail"]["decline_cue"] is True
+
+
 class TestStallContainment:
     """The re-ask loop is bounded. A stall never resolves implicitly in either
     direction — no auto-commit, no auto-decline."""
@@ -426,6 +597,51 @@ class TestStallContainment:
             assert run.non_answer_count == 0
         finally:
             session.close()
+
+
+class AlwaysDeclines(AgentCareLlm):
+    """A provider that reads every answer as a refusal.
+
+    Faithful to the live failure rather than adversarial for its own sake:
+    ``gpt-4o-mini`` submitted ``decline`` for "yes lets confirm it" and quoted
+    that sentence back in the ``reason`` field, so the verdict was well-formed,
+    in the enum, and about the opposite of what the patient said. Nothing except
+    a cue check could have caught it.
+
+    The prose matters as much as the verdict. A model that has just decided the
+    patient said no writes a sentence to match, and that sentence must not
+    survive a verdict code refused.
+    """
+
+    model: str = "always-declines-stub"
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        available = available_tool_names(llm_request)
+        done = called_tools(llm_request)
+
+        if "submit_safety_verdict" in available:
+            if "submit_safety_verdict" in done:
+                yield text_response("screened")
+            else:
+                yield function_call_response(
+                    "submit_safety_verdict",
+                    {"category": "safe", "rationale": "stub"},
+                )
+            return
+
+        if "submit_confirmation_verdict" in available:
+            if "submit_confirmation_verdict" in done:
+                yield text_response(DECLINING_PROSE)
+            else:
+                yield function_call_response(
+                    "submit_confirmation_verdict",
+                    {"verdict": "decline", "reason": "they named another time"},
+                )
+            return
+
+        yield text_response("ok")
 
 
 class EagerConfirmer(AgentCareLlm):
