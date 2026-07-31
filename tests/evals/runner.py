@@ -110,6 +110,12 @@ class Failure:
 class ScenarioResult:
     name: str
     failures: list[Failure] = field(default_factory=list)
+    #: Every turn's outcome, in order. Layer 1 grades from ``expect`` blocks and
+    #: never reads this; Layer 2 needs the replies themselves, because the facts
+    #: it grades are compared against rows rather than against a literal in the
+    #: scenario file. Recording is free and keeps the two layers running the
+    #: same turns through the same function.
+    outcomes: list = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -205,6 +211,7 @@ def run_scenario(scenario: dict, *, session_prefix: str = "eval") -> ScenarioRes
             outcome = asyncio.run(run_workflow(user, turn["message"], session_id))
         prior_run_id = previous_run_id
         previous_run_id = outcome.run_id or previous_run_id
+        result.outcomes.append(outcome)
 
         session = SessionLocal()
         try:
