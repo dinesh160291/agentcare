@@ -42,13 +42,15 @@ Five agents, hub-and-spoke. Each has its own prompt module and its own bound too
 
 | Agent | Responsibility | Tools it is given |
 |---|---|---|
-| **Coordinator** | Reads the request, produces a validated plan, classifies follow-up messages against the active run, delegates, and reports completion or failure. The only agent with conversation history. | `load_patient_context`, plus **either** `submit_plan` or `classify_message` (see below) |
+| **Coordinator** | Reads the request, produces a validated plan, classifies follow-up messages against the active run, delegates, and reports completion or failure. The only agent with conversation history. | `load_patient_context`, plus **either** `submit_plan` or `classify_message`, plus — only while a time is being held — `submit_confirmation_verdict`, `list_other_slots`, `propose_another_slot`, `propose_search_window` (see below) |
 | **Department Routing** | Maps free text to a real department, reports its own confidence, and hands uncertainty to a human instead of guessing. | `resolve_department`, `list_departments`, `submit_routing` |
 | **Appointment** | Finds slots, checks conflicts, and *proposes* a booking, reschedule or cancellation. It cannot commit one. | `resolve_date`, `find_available_slots`, `find_slots_for_reschedule`, `propose_appointment`, `propose_reschedule`, `propose_cancellation`, `render_confirmation`, `list_my_appointments` |
 | **Document** | Verifies uploaded documents against their declared type, diffs what a department requires against what is on file, and records the shortfall. | `list_patient_documents`, `list_unverified_documents`, `read_document_text`, `submit_document_verification`, `diff_required_documents`, `record_missing_documents` |
 | **Follow-up** | Opens reminders and follow-up tasks, and reports what is still outstanding. | `list_patient_reminders`, `list_open_tasks` |
 
-**The Coordinator's toolset depends on the state of the run**, and that is a guard rather than a convenience: the wrong tool is *absent* rather than merely discouraged. With no active run it is given `submit_plan` and not `classify_message` — there is nothing to classify against. With one, the reverse — so it cannot quietly start a second run. `submit_confirmation_verdict` appears only while a proposal is actually pending, and `propose_another_slot` only when the thing being held is a booking, so there is exactly one place a held offer can be disturbed.
+**The Coordinator's toolset depends on the state of the run**, and that is a guard rather than a convenience: the wrong tool is *absent* rather than merely discouraged. With no active run it is given `submit_plan` and not `classify_message` — there is nothing to classify against. With one, the reverse — so it cannot quietly start a second run. `submit_confirmation_verdict` appears only while a proposal is actually pending, and `propose_another_slot` only when the thing being held is a booking, so there is exactly one place a held offer can be disturbed. When a run is queued for a staff decision the slot tools are absent altogether: at that state the *system* is not the thing holding the work, and a tool that is merely unused is one a model can still reach for.
+
+Note what these tools can and cannot do. Every one of them either **reads** or **holds** — none commits. Holding a time is reversible and costs a decline at worst, which is why the code that reads "the 2 PM one" is allowed to be generous where the code that reads "yes" is not.
 
 **Safety is a guardrail layer, not an agent.** It runs on every inbound message before any planning, in two layers that fail differently on purpose: a code-owned phrase list (deterministic, catches self-harm phrasing that no severity heuristic would) and an LLM pass (catches a worsening symptom that carries no listed phrase). Each layer has at least one pinned case that *only that layer* can catch — a second opinion that agrees with the first is not a check.
 
@@ -173,7 +175,7 @@ python -m pytest -q                                              # everything
 python -m pytest --cov=app --cov-branch --cov-report=term-missing # with coverage
 ```
 
-**1,423 tests**, organised by what they can falsify:
+**1,891 tests**, organised by what they can falsify:
 
 | Suite | What it holds |
 |---|---|
@@ -189,7 +191,37 @@ Three conventions do most of the work:
 - **Every guard is falsified individually.** Before a passing check is trusted, it is sabotaged to confirm it *could* have failed. This has repeatedly found guards that vouched for nothing — including lines written minutes earlier.
 - **Tests go through the six seams**, never through internals.
 
-`scripts/live_sweep.py` replays 25 scripted conversations against a real provider and diffs the result against a previous run. It is excluded from CI because it is billed.
+### Against a real model
+
+Two scripts run the same machinery against a live provider. Both are billed and
+excluded from CI, and both have a free rehearsal under the mock that must pass
+first — without it, "the model got it wrong" and "the expectation was never
+satisfiable" look identical in the report, and the second is far more common.
+
+```bash
+python scripts/live_sweep.py --provider mock     # rehearse
+python scripts/live_sweep.py --out before.json   # billed
+python scripts/live_evals.py --provider mock     # rehearse
+python scripts/live_evals.py --out layer2.json   # billed
+```
+
+**`live_sweep.py`** replays 38 scripted conversations and diffs the result
+against a previous run. Read the **diff**, never the score: the provider is
+nondeterministic, so a before/after pair moves on its own.
+
+**`live_evals.py`** is Layer 2 — the scenario suite again, with the four facts a
+patient acts on (doctor, weekday, clock time, reference code) graded exactly
+against the **database row** rather than against a literal in the scenario file.
+Each case runs five times. Fact cases must pass all five, because a receipt that
+is right four times in five is indistinguishable from a working system until
+somebody arrives on the wrong day; safety cases are graded against a pass-rate
+floor instead, because the model layer of the screen is *meant* to fire early
+and unanimity is the wrong bar for it.
+
+The reschedule and cancel cases carry the half that matters: not only that the
+reply names an appointment correctly, but that it names the **right** one — the
+other appointment's reference code must be absent. Every guard around an id asks
+whether it is usable; none of them asks whether it is the one the patient named.
 
 ---
 
@@ -216,6 +248,17 @@ failure mode is a re-ask, never a wrong commit.** Nothing is booked, moved or
 cancelled without an exact `yes` or the ✅ Confirm button, and that reader is
 code — no model output can reach it.
 
+- **The same sentence does not always take the same path.** Several entries
+  below say "may" or "has been" rather than "does", and that is precise
+  rather than evasive: classification is the model's half of the system, and a
+  live model asked the same question twice can answer it twice differently.
+  One phrasing has produced a held time, a staff review, and no plan at all
+  across three replays with nothing changed in between. This is why the
+  deterministic half keeps growing — reading a numbered answer, resolving a
+  date, choosing which appointment the patient named, and settling a stated
+  verb are all done in code now, precisely so they stop being a lottery.
+  *Floor: the variance is in which question you are asked, never in what gets
+  committed. Every path ends at the same confirmation reader.*
 - **Some phrasings get a clarifying question instead of an offer.** "Please
   reschedule my appointment to next week" goes straight to a held time. "Lets
   reschedule my appointment", with no date in it, is answered with "when would
@@ -278,12 +321,33 @@ code — no model output can reach it.
   wording rather than behaviour, and the conversational layer is frozen.
   *Floor: nothing about what the sentence describes is affected by how it
   reads.*
+- **A declined reschedule is told "nothing has been booked".** Turning down a
+  held *cancellation* has its own sentence — "nothing has been cancelled; your
+  appointment stands" — because the wrong one there would leave a patient
+  unsure whether their appointment survived. A declined reschedule still gets
+  the booking wording, which is inaccurate rather than misleading: no
+  appointment moved, and the question that follows ("what time would suit you
+  better?") is the right one for the verb. *Floor: the proposal is cleared
+  either way, and the run returns to choosing a time.*
+- **Duplicate document detection is exact-checksum only.** Two uploads are the
+  same document when their bytes are identical (SHA-256). A re-exported PDF
+  with identical content but different bytes files as a new document. Catching
+  that needs content comparison, which is out of scope here — and the
+  conservative direction is deliberate: the same form filled in twice really is
+  two documents, and merging them would lose one. *Floor: a miss costs a
+  duplicate row in a list. Nothing is overwritten and nothing is deleted.*
+- **A tool's refusal string is written for the model and read by the patient.**
+  When a proposal is refused, the reason travels out through the reply — "That
+  time is no longer available. Offer another." reads as an instruction because
+  its first reader is the agent. The facts in it are correct and drawn from the
+  row; the register is wrong. *Floor: these sentences appear only where
+  something was **not** done — the refusal is the guard working.*
 
 ---
 
 ## Specification
 
-The full design lives in **[`docs/prd-agentcare.md`](docs/prd-agentcare.md)** — user stories, the pinned workflow state machine, agent architecture, safety and confirmation flows, the data model, and the testing strategy. **[`CLAUDE.md`](CLAUDE.md)** holds the working rules, the layout, and a long list of traps found the hard way.
+The full design lives in **[`docs/prd-agentcare.md`](docs/prd-agentcare.md)** — user stories, the pinned workflow state machine, agent architecture, safety and confirmation flows, the data model, and the testing strategy. **[`docs/architecture.md`](docs/architecture.md)** is the map: the decision bins, the agent and tool map, a turn in order, the state machine, the trace, the six seams, and where A2A and MCP would apply if this were split into services. **[`CLAUDE.md`](CLAUDE.md)** holds the working rules, the layout, and a long list of traps found the hard way.
 
 ## Configuration
 
